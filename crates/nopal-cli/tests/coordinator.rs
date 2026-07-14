@@ -2009,7 +2009,10 @@ fn append_native_e2e_event(event: &str) -> Result<(), String> {
         .append(true)
         .open(&path)
         .map_err(|error| format!("open event log {path}: {error}"))?;
-    writeln!(events, "{event}").map_err(|error| format!("append event log {path}: {error}"))
+    let record = format!("{event}\n");
+    events
+        .write_all(record.as_bytes())
+        .map_err(|error| format!("append event log {path}: {error}"))
 }
 
 #[cfg(unix)]
