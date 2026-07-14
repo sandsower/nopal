@@ -11,17 +11,23 @@ import { loadNopalModule } from "./setup.ts";
 const {
 	MAX_JSONL_LINE_BYTES,
 	MAX_KNOWN_SESSION_CURSORS,
+	MAX_MODEL_REQUEST_CACHE,
 	MAX_SESSION_IDENTITY_BYTES,
+	MAX_SESSION_MODELS,
 	SESSION_COMMAND_KIND,
 	SESSION_ENDPOINT_KIND,
 	SESSION_EVENT_ENTRY,
 	SESSION_EVENT_KIND,
 	SESSION_FEED_ERROR_KIND,
+	SESSION_MODEL_ERROR_KIND,
+	SESSION_MODEL_REQUEST_KIND,
+	SESSION_MODEL_STATE_KIND,
 	SESSION_REPLAY_COMPLETE_KIND,
 	SESSION_SUBSCRIBE_KIND,
 	JsonlDecoder,
 	NopalSessionBridge,
 	SessionFeedConnection,
+	SessionModelController,
 	SessionProtocolEngine,
 	defaultSessionSocketPath,
 	parseCommand,
@@ -56,11 +62,13 @@ function feedHarness(
 	engine: InstanceType<typeof SessionProtocolEngine>,
 	replayYield?: () => void | Promise<void>,
 	sendOverride?: (frame: Record<string, any>) => void | Promise<void>,
+	modelController?: InstanceType<typeof SessionModelController>,
 ) {
 	const frames: Array<Record<string, any>> = [];
 	let closes = 0;
 	const feed = new SessionFeedConnection({
 		engine,
+		modelController,
 		send(frame) {
 			if (sendOverride) return sendOverride(frame);
 			frames.push(frame);
@@ -125,6 +133,180 @@ test("engine emits and persists one stable ready event", () => {
 	assert.deepEqual(entries, [{ customType: SESSION_EVENT_ENTRY, data: ready }]);
 	assert.equal(engine.start(), ready, "start must be idempotent");
 	assert.equal(entries.length, 1);
+});
+
+test("model controller refreshes Pi choices and confirms one exact idle switch", async () => {
+	const models = [
+		{ provider: "nopal-proof", id: "deterministic-a", name: "Model A" },
+		{ provider: "nopal-proof", id: "deterministic-b", name: "Model B" },
+	];
+	let current = models[0];
+	let idle = true;
+	let switches = 0;
+	const controller = new SessionModelController(binding, {
+		available: () => models,
+		current: () => current,
+		isIdle: () => idle,
+		async setModel(model) {
+			switches += 1;
+			current = model;
+			return true;
+		},
+	});
+
+	const refreshed = await controller.accept({
+		kind: SESSION_MODEL_REQUEST_KIND,
+		request_id: "refresh-01",
+		plot_id: binding.plotId,
+		session_id: binding.sessionId,
+		request: { type: "refresh" },
+	});
+	assert.equal(refreshed.kind, SESSION_MODEL_STATE_KIND);
+	assert.equal(refreshed.request_id, "refresh-01");
+	assert.equal(refreshed.available.length, 2);
+	assert.equal(refreshed.available_complete, true);
+	assert.equal(refreshed.available_total, 2);
+
+	const switched = await controller.accept({
+		kind: SESSION_MODEL_REQUEST_KIND,
+		request_id: "switch-01",
+		plot_id: binding.plotId,
+		session_id: binding.sessionId,
+		request: {
+			type: "switch",
+			model: { provider: "nopal-proof", id: "deterministic-b" },
+		},
+	});
+	assert.equal(switched.kind, SESSION_MODEL_STATE_KIND);
+	assert.equal(switched.current?.id, "deterministic-b");
+	const duplicate = await controller.accept({
+		kind: SESSION_MODEL_REQUEST_KIND,
+		request_id: "switch-01",
+		plot_id: binding.plotId,
+		session_id: binding.sessionId,
+		request: {
+			type: "switch",
+			model: { provider: "nopal-proof", id: "deterministic-b" },
+		},
+	});
+	assert.deepEqual(duplicate, switched);
+	assert.equal(switches, 1, "an exact duplicate must not call Pi again");
+	const conflict = await controller.accept({
+		kind: SESSION_MODEL_REQUEST_KIND,
+		request_id: "switch-01",
+		plot_id: binding.plotId,
+		session_id: binding.sessionId,
+		request: {
+			type: "switch",
+			model: { provider: "nopal-proof", id: "deterministic-a" },
+		},
+	});
+	assert.equal(conflict.kind, SESSION_MODEL_ERROR_KIND);
+	assert.equal(conflict.code, "conflict");
+	assert.equal(switches, 1);
+
+	idle = false;
+	const rejected = await controller.accept({
+		kind: SESSION_MODEL_REQUEST_KIND,
+		request_id: "switch-busy",
+		plot_id: binding.plotId,
+		session_id: binding.sessionId,
+		request: {
+			type: "switch",
+			model: { provider: "nopal-proof", id: "deterministic-a" },
+		},
+	});
+	assert.equal(rejected.kind, SESSION_MODEL_ERROR_KIND);
+	assert.equal(rejected.code, "busy");
+});
+
+test("model snapshots deduplicate and stay inside count and JSONL bounds", () => {
+	const longName = "x".repeat(MAX_SESSION_IDENTITY_BYTES);
+	const models = Array.from({ length: MAX_SESSION_MODELS + 2 }, (_, index) => ({
+		provider: "bounded-provider",
+		id: `model-${String(index).padStart(4, "0")}`,
+		name: longName,
+	}));
+	models.push({ ...models[0]! });
+	const controller = new SessionModelController(binding, {
+		available: () => models,
+		current: () => models[0],
+		isIdle: () => true,
+		async setModel() { return true; },
+	});
+
+	const state = controller.snapshot();
+	assert.equal(state.available_total, MAX_SESSION_MODELS + 2);
+	assert.equal(state.available_complete, false);
+	assert.ok(state.available.length <= MAX_SESSION_MODELS);
+	assert.ok(Buffer.byteLength(JSON.stringify(state), "utf8") <= MAX_JSONL_LINE_BYTES);
+	assert.equal(
+		new Set(state.available.map((model) => `${model.provider}\0${model.id}`)).size,
+		state.available.length,
+	);
+
+	const deterministic = new SessionModelController(binding, {
+		available: () => [
+			{ provider: "proof", id: "ring", name: "Ångstrom" },
+			{ provider: "proof", id: "ascii", name: "Zulu" },
+			{ provider: "proof", id: "umlaut", name: "Äther" },
+		],
+		current: () => undefined,
+		isIdle: () => true,
+		async setModel() { return true; },
+	});
+	assert.deepEqual(
+		deterministic.snapshot().available.map((model) => model.id),
+		["ascii", "umlaut", "ring"],
+		"the bounded prefix must not depend on the host locale",
+	);
+});
+
+test("the bounded request cache never evicts an in-flight switch", async () => {
+	const models = [
+		{ provider: "nopal-proof", id: "deterministic-a", name: "Model A" },
+		{ provider: "nopal-proof", id: "deterministic-b", name: "Model B" },
+	];
+	let current = models[0];
+	let switches = 0;
+	let releaseSwitch = () => {};
+	const blocked = new Promise<void>((resolve) => { releaseSwitch = resolve; });
+	const controller = new SessionModelController(binding, {
+		available: () => models,
+		current: () => current,
+		isIdle: () => true,
+		async setModel(model) {
+			switches += 1;
+			await blocked;
+			current = model;
+			return true;
+		},
+	});
+	const request = {
+		kind: SESSION_MODEL_REQUEST_KIND,
+		request_id: "switch-in-flight",
+		plot_id: binding.plotId,
+		session_id: binding.sessionId,
+		request: {
+			type: "switch",
+			model: { provider: "nopal-proof", id: "deterministic-b" },
+		},
+	};
+	const pending = controller.accept(request);
+	await Promise.all(Array.from({ length: MAX_MODEL_REQUEST_CACHE }, (_, index) =>
+		controller.accept({
+			kind: SESSION_MODEL_REQUEST_KIND,
+			request_id: `refresh-cache-${index}`,
+			plot_id: binding.plotId,
+			session_id: binding.sessionId,
+			request: { type: "refresh" },
+		}),
+	));
+	const duplicate = controller.accept(request);
+	assert.equal(duplicate, pending);
+	releaseSwitch();
+	assert.deepEqual(await duplicate, await pending);
+	assert.equal(switches, 1);
 });
 
 test("shared identity fixtures freeze the 4096-byte wire boundary before journal access", async () => {
@@ -894,7 +1076,7 @@ test("Unix bridge refuses to replace an unknown pre-existing path", async () => 
 	assert.equal(await readFile(path, "utf8"), "not ours");
 });
 
-test("endpoint descriptor advertises the frozen nopal.session/v3 shape", () => {
+test("endpoint descriptor advertises the unified nopal.session/v4 shape", () => {
 	const { engine } = harness();
 	const bridge = new NopalSessionBridge({ path: "/tmp/nopal-501/session.sock", engine });
 	assert.deepEqual(bridge.endpoint(), {
@@ -1494,6 +1676,137 @@ test("cold replay and cursor resume end at one exact snapshot completion", async
 	await resumed.feed.accept(subscribe(ready.cursor, 1));
 	assert.deepEqual(resumed.frames.slice(0, -1), snapshot.slice(1));
 	assert.equal(resumed.frames.at(-1)?.event_count, snapshot.length - 1);
+});
+
+test("v4 replay publishes Pi model state and one exact switch acknowledgement", async () => {
+	const { engine } = harness();
+	engine.start();
+	const models = [
+		{ provider: "nopal-proof", id: "deterministic-a", name: "Model A" },
+		{ provider: "nopal-proof", id: "deterministic-b", name: "Model B" },
+	];
+	let current = models[0];
+	const controller = new SessionModelController(binding, {
+		available: () => models,
+		current: () => current,
+		isIdle: () => true,
+		async setModel(model) {
+			current = model;
+			return true;
+		},
+	});
+	const state = feedHarness(engine, undefined, undefined, controller);
+	await state.feed.accept(subscribe());
+	assert.equal(state.frames.at(-2)?.kind, SESSION_REPLAY_COMPLETE_KIND);
+	assert.equal(state.frames.at(-1)?.kind, SESSION_MODEL_STATE_KIND);
+	assert.equal(state.frames.at(-1)?.current.id, "deterministic-a");
+
+	await state.feed.accept({
+		kind: SESSION_MODEL_REQUEST_KIND,
+		request_id: "switch-over-v4",
+		plot_id: binding.plotId,
+		session_id: binding.sessionId,
+		request: {
+			type: "switch",
+			model: { provider: "nopal-proof", id: "deterministic-b" },
+		},
+	});
+	assert.equal(state.frames.at(-1)?.kind, SESSION_MODEL_STATE_KIND);
+	assert.equal(state.frames.at(-1)?.request_id, "switch-over-v4");
+	assert.equal(state.frames.at(-1)?.current.id, "deterministic-b");
+});
+
+test("a prompt on another client waits for the preceding model switch acknowledgement", async () => {
+	const state = harness();
+	state.engine.start();
+	const models = [
+		{ provider: "nopal-proof", id: "deterministic-a", name: "Model A" },
+		{ provider: "nopal-proof", id: "deterministic-b", name: "Model B" },
+	];
+	let current = models[0];
+	let releaseSwitch = () => {};
+	const blocked = new Promise<void>((resolve) => { releaseSwitch = resolve; });
+	const controller = new SessionModelController(binding, {
+		available: () => models,
+		current: () => current,
+		isIdle: () => true,
+		async setModel(model) {
+			await blocked;
+			current = model;
+			return true;
+		},
+	});
+	const observed: string[] = [];
+	const observe = (frame: Record<string, any>) => {
+		if (frame.kind === SESSION_MODEL_STATE_KIND && frame.request_id === "switch-before-prompt") {
+			observed.push("acknowledgement");
+		}
+		if (frame.event?.type === "user_message") observed.push("user_message");
+	};
+	const switchingClient = feedHarness(state.engine, undefined, observe, controller);
+	const promptingClient = feedHarness(state.engine, undefined, observe, controller);
+	await switchingClient.feed.accept(subscribe());
+	await promptingClient.feed.accept(subscribe());
+	const switchOperation = switchingClient.feed.accept({
+		kind: SESSION_MODEL_REQUEST_KIND,
+		request_id: "switch-before-prompt",
+		plot_id: binding.plotId,
+		session_id: binding.sessionId,
+		request: {
+			type: "switch",
+			model: { provider: "nopal-proof", id: "deterministic-b" },
+		},
+	});
+	const promptOperation = promptingClient.feed.accept({
+		kind: SESSION_COMMAND_KIND,
+		command_id: "command-after-switch",
+		plot_id: binding.plotId,
+		session_id: binding.sessionId,
+		command: { type: "prompt", text: "use the selected model" },
+	});
+	await Promise.resolve();
+	assert.deepEqual(state.sent, []);
+	assert.equal(observed.includes("user_message"), false);
+
+	releaseSwitch();
+	await Promise.all([switchOperation, promptOperation]);
+	await state.flushDeferred();
+	assert.deepEqual(state.sent, ["use the selected model"]);
+	const acknowledgement = observed.indexOf("acknowledgement");
+	const userMessage = observed.indexOf("user_message");
+	assert.ok(acknowledgement >= 0 && userMessage > acknowledgement);
+});
+
+test("a failed model acknowledgement closes cleanly without rejecting record acceptance", async () => {
+	const state = harness();
+	state.engine.start();
+	const models = [{ provider: "nopal-proof", id: "deterministic-a", name: "Model A" }];
+	const controller = new SessionModelController(binding, {
+		available: () => models,
+		current: () => models[0],
+		isIdle: () => true,
+		async setModel() { return true; },
+	});
+	const observed: Array<Record<string, any>> = [];
+	const client = feedHarness(state.engine, undefined, (frame) => {
+		if (frame.kind === SESSION_MODEL_STATE_KIND && frame.request_id === "refresh-write-failure") {
+			throw new Error("injected acknowledgement failure");
+		}
+		observed.push(frame);
+	}, controller);
+	await client.feed.accept(subscribe());
+
+	await client.feed.accept({
+		kind: SESSION_MODEL_REQUEST_KIND,
+		request_id: "refresh-write-failure",
+		plot_id: binding.plotId,
+		session_id: binding.sessionId,
+		request: { type: "refresh" },
+	});
+
+	assert.equal(client.closeCount(), 1);
+	assert.equal(observed.at(-1)?.kind, SESSION_FEED_ERROR_KIND);
+	assert.equal(observed.at(-1)?.code, "unavailable");
 });
 
 test("subscribe snapshots replay, buffers later live events, and drains after completion", async () => {

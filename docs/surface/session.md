@@ -1,6 +1,6 @@
 # Nopal structured Session surface
 
-Status: durable replay and structured activity contract.
+Status: durable replay, structured activity, and live Pi model-control contract.
 
 The structured Session surface carries native Composer instructions to one explicitly identified Pi Session and returns typed events for the native timeline.
 It is an NDJSON transport contract and is independent from terminal output.
@@ -8,13 +8,16 @@ Terminal capture must never be promoted into semantic Session history.
 
 ## Endpoint capability
 
-Core defaults new durable Unix-socket endpoint descriptors to kind `nopal.session/v3`.
+Core defaults new durable Unix-socket endpoint descriptors to kind `nopal.session/v4`.
 The endpoint descriptor keeps the existing `kind`, `transport`, `address`, and `state` fields.
 An explicit `nopal.session/v2` endpoint remains readable and emits only v2 durable events.
 A v2 client must not silently accept v3 event variants.
 A v3 client accepts exact persisted v2 envelopes followed by new v3 envelopes on one continuous stream.
+The v4 endpoint preserves that exact durable v2 and v3 stream and adds ephemeral model request, state, and error frames.
+V4 model-control frames are never written to durable Session history.
 The consumer exposes separate v2-only and v3 server-frame types so exhaustive v2 consumers cannot accidentally begin accepting v3 activity.
 The v3 frame type has explicit exact-v2 and typed-v3 event variants plus the shared replay-complete and feed-error controls.
+The v4 frame type adds typed model state and model error variants to those durable frames.
 `nopal.session/v1` describes the earlier live-only walking skeleton and does not promise replay.
 A client must not bind durable replay behavior to a v1 endpoint.
 
@@ -62,7 +65,7 @@ A client begins cold replay or cursor resume with kind `nopal.session.subscribe/
 `after_cursor` is required and nullable.
 `null` requests the complete active-branch history.
 A non-null cursor requests events strictly after that verified cursor.
-On a v3 endpoint, the cursor may identify either a verified v2 envelope or a verified v3 envelope in the same stream.
+On a v3 or v4 endpoint, the cursor may identify either a verified v2 envelope or a verified v3 envelope in the same stream.
 An omitted `page_limit` defaults to 256.
 The allowed range is 1 through 1024 inclusive.
 Paging is an internal producer bound for one subscription and does not change the replay snapshot.
@@ -70,10 +73,76 @@ Paging is an internal producer bound for one subscription and does not change th
 The producer snapshots the active-branch head, starts buffering later live events, emits all replay events through that snapshot, emits one matching `replay_complete`, and only then drains buffered live events in order.
 No event may cross the replay-complete boundary out of order.
 
+## Model control
+
+A v4 client requests fresh Pi model state or an exact model switch with kind `nopal.session.model.request/v1`.
+
+```json
+{
+  "kind": "nopal.session.model.request/v1",
+  "request_id": "model-switch-01",
+  "plot_id": "plot-01",
+  "session_id": "session-01",
+  "request": {
+    "type": "switch",
+    "model": {
+      "provider": "openai",
+      "id": "gpt-example"
+    }
+  }
+}
+```
+
+The two request variants are `refresh` and `switch`.
+A switch target is the exact pair of Pi-reported provider and model ID.
+Display names are not routing identities.
+The producer accepts a switch only while Pi is idle and no other switch is pending.
+An exact duplicate `request_id` and payload is idempotent.
+Reusing a `request_id` for different content returns a conflict without calling Pi.
+The producer retains the 128 most recent completed model-request identities and never evicts an in-flight request.
+Requests older than that bounded window are new requests and clients must not retry them with a stale identity.
+Prompt records received after a switch request wait until its model acknowledgement has been sent, so the following turn cannot overtake the switch.
+
+After replay completion, and whenever Pi model authority changes, the producer emits kind `nopal.session.model.state/v1`.
+
+```json
+{
+  "kind": "nopal.session.model.state/v1",
+  "plot_id": "plot-01",
+  "session_id": "session-01",
+  "request_id": "model-switch-01",
+  "state_epoch": "8abdf460-6221-42ca-a30f-b9f580780c0e",
+  "revision": 4,
+  "agent_state": "idle",
+  "current": {
+    "provider": "openai",
+    "id": "gpt-example",
+    "name": "GPT Example"
+  },
+  "available": [],
+  "available_complete": true,
+  "available_total": 0
+}
+```
+
+Pi is the sole authority for `current`, `available`, and `agent_state`.
+The `available` list contains a deterministic prefix of at most 2048 unique provider and model-ID pairs and always fits the shared 1 MiB frame limit.
+`available_total` reports the number of unique valid models Pi provided before transport bounds were applied.
+`available_complete` is true exactly when `available_total` equals the emitted list length.
+`state_epoch` identifies one bridge authority lifetime and `revision` increases within it.
+`request_id` is nullable for unsolicited state and matches the request only when the response acknowledges that request.
+A desktop client confirms a switch only when a matching acknowledgement names the exact requested current model.
+Reconnect replaces prior model state from the new authoritative snapshot rather than replaying model frames from history.
+
+Rejected requests use kind `nopal.session.model.error/v1` with the exact request, Plot, and Session identities.
+Stable error codes are `busy`, `unknown_model`, `conflict`, `unavailable`, and `internal`.
+Busy and transient availability failures may be retried after Pi or transport state changes.
+An error never changes the last confirmed current model.
+
 ## Durable event
 
 Every replayed or live semantic event on a v2 endpoint has kind `nopal.session.event/v2`.
-A v3 endpoint replays persisted v2 envelopes exactly and uses kind `nopal.session.event/v3` for new events.
+A v3 or v4 endpoint replays persisted v2 envelopes exactly and uses kind `nopal.session.event/v3` for new events.
 
 ```json
 {
@@ -119,7 +188,7 @@ No migration rewrites a persisted v2 envelope as v3.
 
 ## Structured activity event
 
-New events on a v3 endpoint use `nopal.session.event/v3` and retain the same Plot, Session, stream, sequence, predecessor, cursor, event, and optional command identities.
+New durable events on a v3 or v4 endpoint use `nopal.session.event/v3` and retain the same Plot, Session, stream, sequence, predecessor, cursor, event, and optional command identities.
 The v3 payload enum includes the four existing Session event variants plus six typed activity variants.
 The four existing variants keep their v2 payload semantics inside v3, including multiline message text up to the shared frame bound.
 Activity-specific display bounds do not narrow `user_message`, `assistant_message`, or `session_error`.
@@ -224,7 +293,7 @@ A contract, identity, corruption, gap, or conflict failure is terminal until ext
 Consumers validate every frame against the selected Plot and Session before routing or rendering it.
 A structurally valid event for another context is foreign data and must not appear in the selected timeline.
 The next new event must have the same stream, sequence exactly one greater than the verified head, and `previous_cursor` exactly equal to the verified head cursor.
-Those continuity rules apply across the exact v2-to-v3 version boundary.
+Those continuity rules apply across the exact v2-to-v3 version boundary, including on a v4 endpoint.
 An exact duplicate with the same cursor, event identity, command identity, and payload is a no-op.
 Reusing a cursor or event identity for different content is a fatal conflict.
 An unknown cursor, skipped sequence, or predecessor mismatch is a visible gap and must never trigger implicit replay from zero.
@@ -244,7 +313,7 @@ Command, request, event, Plot, Session, stream, and cursor identities must not b
 Unknown additive fields are preserved at envelope and variant levels.
 Removing or changing required fields, changing variant meaning, or changing a frame kind requires a new version.
 
-A v3 endpoint may hydrate an exact persisted v2 prefix and a persisted v3 suffix repeatedly.
+A v3 or v4 endpoint may hydrate an exact persisted v2 prefix and a persisted v3 suffix repeatedly.
 Every restart must preserve event IDs, envelope kinds, stream identity, sequence, predecessor, cursor, command identity, payload, and additive fields.
 Restart must not duplicate v3 activity or convert a v2 cursor into a v3 cursor.
 
@@ -256,6 +325,10 @@ One active durable history is bounded at 100,000 events or 256 MiB.
 Exceeding the bound fails as `history_too_large` rather than truncating semantic history.
 The host retains at most 100,000 recently observed cursors per Plot and Session for abandoned-branch diagnostics, refreshing active-branch cursors before evicting the oldest retained cursor.
 An evicted abandoned cursor is intentionally indistinguishable from another unknown cursor and fails as `history_gap` rather than `branch_diverged`.
+
+The native model picker keeps at most 32 recently confirmed provider and model-ID pairs in a separate versioned private preference.
+That preference controls UI ordering only and never supplies current model or availability facts.
+Malformed, oversized, unreadable, or future-version preference files are preserved rather than overwritten.
 
 ## Persistence boundary
 

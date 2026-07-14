@@ -4,6 +4,7 @@ pub mod activation;
 pub mod application;
 pub mod current_field;
 pub mod instance;
+pub mod model_preferences;
 pub mod platform;
 pub mod preferences;
 pub mod reconcile;

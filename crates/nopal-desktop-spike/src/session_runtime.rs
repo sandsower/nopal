@@ -6,7 +6,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, TryRecvError};
-use nopal_feed_client::session::SessionEvent;
+use nopal_feed_client::session::{
+    SessionAgentState, SessionEvent, SessionModelDescriptor, SessionModelState,
+};
 use nopal_native_lifecycle::session_bindings::{
     SessionHostProcessIdentity, TerminalProcessIdentity,
 };
@@ -699,6 +701,13 @@ struct PendingPrompt {
     needs_send: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingModelSwitch {
+    request_id: String,
+    provider: String,
+    model_id: String,
+}
+
 type ConnectorReceiver<T> = Receiver<Result<T, String>>;
 type GenerationTask<T> = (u64, ConnectorReceiver<T>);
 
@@ -718,6 +727,10 @@ where
     terminal_error: Option<String>,
     forced_terminal: bool,
     pending_prompts: BTreeMap<SessionKey, PendingPrompt>,
+    model_state: Option<SessionModelState>,
+    pending_model_switch: Option<PendingModelSwitch>,
+    model_error: Option<String>,
+    confirmed_model_switch: Option<SessionModelDescriptor>,
     rejected_generation: Option<u64>,
     generation: u64,
     presentation: RuntimePresentation,
@@ -745,6 +758,10 @@ where
             terminal_error: None,
             forced_terminal: false,
             pending_prompts: BTreeMap::new(),
+            model_state: None,
+            pending_model_switch: None,
+            model_error: None,
+            confirmed_model_switch: None,
             rejected_generation: None,
             generation: 0,
             presentation: RuntimePresentation::default(),
@@ -821,9 +838,77 @@ where
         };
         self.feed.as_ref().is_some_and(SessionFeed::can_submit)
             && matches!(self.replay_state(), ReplayState::Live)
+            && self.pending_model_switch.is_none()
             && !self
                 .pending_prompts
                 .contains_key(&SessionKey::from(&context))
+    }
+
+    pub fn model_state(&self) -> Option<&SessionModelState> {
+        self.model_state.as_ref()
+    }
+
+    pub fn model_error(&self) -> Option<&str> {
+        self.model_error.as_deref()
+    }
+
+    pub fn model_switch_pending(&self) -> bool {
+        self.pending_model_switch.is_some()
+    }
+
+    pub fn take_confirmed_model_switch(&mut self) -> Option<SessionModelDescriptor> {
+        self.confirmed_model_switch.take()
+    }
+
+    pub fn can_switch_model(&self) -> bool {
+        self.feed.as_ref().is_some_and(SessionFeed::can_submit)
+            && self.pending_model_switch.is_none()
+            && self.model_state.as_ref().is_some_and(|state| {
+                state.agent_state == SessionAgentState::Idle && state.available.len() > 1
+            })
+    }
+
+    pub fn refresh_models(&mut self) -> Result<(), String> {
+        let request_id = format!("model-refresh-desktop-{}", Uuid::new_v4());
+        let now_ms = self.now_ms();
+        self.feed
+            .as_mut()
+            .ok_or_else(|| "Session model control is unavailable".to_owned())?
+            .request_models(request_id, now_ms)
+            .map_err(|error| error.message)
+    }
+
+    pub fn switch_model(&mut self, model: &SessionModelDescriptor) -> Result<String, String> {
+        if !self.can_switch_model() {
+            return Err("Session model control is not ready".to_owned());
+        }
+        let is_available = self.model_state.as_ref().is_some_and(|state| {
+            state
+                .available
+                .iter()
+                .any(|choice| choice.provider == model.provider && choice.id == model.id)
+        });
+        if !is_available {
+            return Err("Pi did not report that model as available".to_owned());
+        }
+        let request_id = format!("model-switch-desktop-{}", Uuid::new_v4());
+        self.pending_model_switch = Some(PendingModelSwitch {
+            request_id: request_id.clone(),
+            provider: model.provider.clone(),
+            model_id: model.id.clone(),
+        });
+        self.model_error = None;
+        let now_ms = self.now_ms();
+        let result = self
+            .feed
+            .as_mut()
+            .ok_or_else(|| "Session model control is unavailable".to_owned())?
+            .switch_model(&request_id, &model.provider, &model.id, now_ms)
+            .map_err(|error| error.message);
+        if result.is_err() {
+            self.pending_model_switch = None;
+        }
+        result.map(|()| request_id)
     }
 
     pub fn retry_now(&mut self) -> bool {
@@ -931,6 +1016,9 @@ where
         if text.trim().is_empty() {
             return self.restore(text, "instruction is empty");
         }
+        if self.pending_model_switch.is_some() {
+            return self.restore(text, "wait for Pi to confirm the model switch");
+        }
         if !self.feed.as_ref().is_some_and(SessionFeed::can_submit) {
             return self.restore(
                 text,
@@ -1015,6 +1103,13 @@ where
                 }
                 match &state {
                     FeedState::Restoring { after_cursor, .. } => {
+                        self.model_state = None;
+                        if self.pending_model_switch.take().is_some() {
+                            self.model_error = Some(
+                                "The Session reconnected before Pi confirmed the model switch"
+                                    .to_owned(),
+                            );
+                        }
                         if let Err(error) = self.timelines.begin_replay(after_cursor.as_deref()) {
                             self.fail_contract(format!(
                                 "cannot stage durable Session replay: {error:?}"
@@ -1025,11 +1120,20 @@ where
                     FeedState::Backoff {
                         attempt, reason, ..
                     } => {
+                        self.model_state = None;
+                        if self.pending_model_switch.take().is_some() {
+                            self.model_error = Some(
+                                "The connection closed before Pi confirmed the model switch"
+                                    .to_owned(),
+                            );
+                        }
                         self.timelines.mark_reconnecting(*attempt, reason);
                         self.mark_pending_for_retry();
                         self.force_terminal_fallback();
                     }
                     FeedState::Fatal { code, message } => {
+                        self.model_state = None;
+                        self.pending_model_switch = None;
                         self.timelines.fail_feed(code, message);
                         self.resolve_fatal_pending(code);
                         self.force_terminal_fallback();
@@ -1045,6 +1149,12 @@ where
                 retryable,
                 ..
             } => {
+                self.model_state = None;
+                if self.pending_model_switch.take().is_some() {
+                    self.model_error = Some(
+                        "The Session feed failed before Pi confirmed the model switch".to_owned(),
+                    );
+                }
                 if retryable {
                     self.mark_pending_for_retry();
                 } else {
@@ -1054,6 +1164,45 @@ where
                 }
                 self.force_terminal_fallback();
                 self.status = self.terminal_fallback_status(message);
+                true
+            }
+            FeedUpdate::ModelState { state, .. } => {
+                if let Some(previous) = &self.model_state
+                    && previous.state_epoch == state.state_epoch
+                    && previous.revision > state.revision
+                {
+                    return false;
+                }
+                self.model_error = None;
+                if let Some(pending) = &self.pending_model_switch
+                    && state.request_id.as_deref() == Some(&pending.request_id)
+                {
+                    let confirmed = state.current.as_ref().is_some_and(|current| {
+                        current.provider == pending.provider && current.id == pending.model_id
+                    });
+                    if confirmed {
+                        self.confirmed_model_switch = state.current.clone();
+                        self.pending_model_switch = None;
+                    } else {
+                        self.model_error = Some(
+                            "Pi acknowledged the model request without selecting its target"
+                                .to_owned(),
+                        );
+                        self.pending_model_switch = None;
+                    }
+                }
+                self.model_state = Some(state);
+                true
+            }
+            FeedUpdate::ModelError { error, .. } => {
+                if self
+                    .pending_model_switch
+                    .as_ref()
+                    .is_some_and(|pending| pending.request_id == error.request_id)
+                {
+                    self.pending_model_switch = None;
+                }
+                self.model_error = Some(error.message);
                 true
             }
         }
@@ -1156,6 +1305,10 @@ where
 
     fn bind_selected(&mut self) {
         let context = self.selected_session_context();
+        self.model_state = None;
+        self.pending_model_switch = None;
+        self.model_error = None;
+        self.confirmed_model_switch = None;
         self.timelines.select_session(context.as_ref());
         self.session_host_process = None;
         self.host_process_task = None;
@@ -1729,7 +1882,9 @@ fn update_generation(update: &FeedUpdate) -> u64 {
         FeedUpdate::State { generation, .. }
         | FeedUpdate::Event { generation, .. }
         | FeedUpdate::ReplayComplete { generation, .. }
-        | FeedUpdate::Error { generation, .. } => *generation,
+        | FeedUpdate::Error { generation, .. }
+        | FeedUpdate::ModelState { generation, .. }
+        | FeedUpdate::ModelError { generation, .. } => *generation,
     }
 }
 
@@ -2207,6 +2362,55 @@ mod tests {
         }
     }
 
+    fn field_v4() -> DesktopField {
+        let mut field = field();
+        for plot in &mut field.plots {
+            for activity in &mut plot.activities {
+                if let DesktopActivity::Session {
+                    protocol: Some(protocol),
+                    ..
+                } = activity
+                {
+                    protocol.kind = "nopal.session/v4".to_owned();
+                }
+            }
+        }
+        field
+    }
+
+    fn model(provider: &str, id: &str, name: &str) -> SessionModelDescriptor {
+        SessionModelDescriptor {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            name: name.to_owned(),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    fn model_state(
+        request_id: Option<&str>,
+        revision: u64,
+        current: SessionModelDescriptor,
+    ) -> SessionFeedServerFrame {
+        SessionFeedServerFrame::ModelState(SessionModelState {
+            kind: nopal_feed_client::session::SESSION_MODEL_STATE_KIND.to_owned(),
+            plot_id: "plot-a".to_owned(),
+            session_id: "session-a".to_owned(),
+            request_id: request_id.map(str::to_owned),
+            state_epoch: "model-epoch-a".to_owned(),
+            revision,
+            agent_state: SessionAgentState::Idle,
+            current: Some(current),
+            available: vec![
+                model("nopal-proof", "deterministic-a", "Model A"),
+                model("nopal-proof", "deterministic-b", "Model B"),
+            ],
+            available_complete: true,
+            available_total: 2,
+            extra: BTreeMap::new(),
+        })
+    }
+
     fn complete(
         plot: &str,
         session: &str,
@@ -2380,6 +2584,62 @@ mod tests {
     }
 
     #[test]
+    fn model_switch_requires_exact_ack_and_disconnect_clears_unconfirmed_intent() {
+        let harness = Rc::new(RefCell::new(Harness::default()));
+        harness.borrow_mut().incoming.extend([
+            complete("plot-a", "session-a", 0, None, 0),
+            model_state(None, 1, model("nopal-proof", "deterministic-a", "Model A")),
+        ]);
+        let mut runtime = SessionRuntime::new(field_v4(), connector(harness.clone()));
+        runtime.drain_at(0);
+        assert!(runtime.can_switch_model());
+
+        let target = model("nopal-proof", "deterministic-b", "Model B");
+        let request_id = runtime.switch_model(&target).expect("send model switch");
+        assert!(runtime.model_switch_pending());
+        assert!(!runtime.can_submit());
+        assert!(matches!(
+            runtime.submit_prompt("must wait for the selected model"),
+            SubmitOutcome::RestoreText { text, reason }
+                if text == "must wait for the selected model"
+                    && reason.contains("confirm the model switch")
+        ));
+        assert!(matches!(
+            harness.borrow().sent.last(),
+            Some(ClientFeedFrame::Model(request)) if request.request_id == request_id
+        ));
+
+        harness
+            .borrow_mut()
+            .incoming
+            .push_back(model_state(Some(&request_id), 2, target.clone()));
+        runtime.drain_at(1);
+        assert!(!runtime.model_switch_pending());
+        assert!(runtime.can_submit());
+        assert_eq!(runtime.take_confirmed_model_switch(), Some(target));
+
+        let unconfirmed = model("nopal-proof", "deterministic-a", "Model A");
+        runtime
+            .switch_model(&unconfirmed)
+            .expect("send second model switch");
+        let generation = runtime.generation();
+        runtime.apply_feed_update(
+            generation,
+            FeedUpdate::State {
+                generation,
+                state: FeedState::Backoff {
+                    attempt: 1,
+                    retry_at_ms: 10,
+                    reason: "connection interrupted".to_owned(),
+                },
+            },
+        );
+        assert!(!runtime.model_switch_pending());
+        assert!(runtime.model_state().is_none());
+        assert!(runtime.model_error().is_some());
+    }
+
+    #[test]
     fn v3_restore_counts_and_retains_exact_message_and_activity_envelopes() {
         let harness = Rc::new(RefCell::new(Harness::default()));
         harness.borrow_mut().incoming.extend([
@@ -2538,6 +2798,7 @@ mod tests {
             .filter_map(|frame| match frame {
                 ClientFeedFrame::Prompt(command) => Some(command.command_id.clone()),
                 ClientFeedFrame::Subscribe(_) => None,
+                ClientFeedFrame::Model(_) => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(prompt_ids, [command_id.clone(), command_id]);
@@ -2857,6 +3118,7 @@ mod tests {
             .filter_map(|frame| match frame {
                 ClientFeedFrame::Prompt(command) => Some(command.command_id.clone()),
                 ClientFeedFrame::Subscribe(_) => None,
+                ClientFeedFrame::Model(_) => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(command_ids.len(), 1);

@@ -3,15 +3,18 @@ use std::collections::VecDeque;
 use std::collections::BTreeMap;
 
 use nopal_feed_client::session::{
-    DEFAULT_REPLAY_PAGE_LIMIT, SESSION_COMMAND_KIND, SESSION_SUBSCRIBE_KIND, SessionCommand,
-    SessionCommandPayload, SessionFeedErrorCode, SessionReplayComplete, SessionServerFrame,
-    SessionSubscribe, SessionV3ServerFrame,
+    DEFAULT_REPLAY_PAGE_LIMIT, SESSION_COMMAND_KIND, SESSION_MODEL_REQUEST_KIND,
+    SESSION_SUBSCRIBE_KIND, SessionCommand, SessionCommandPayload, SessionFeedErrorCode,
+    SessionModelError, SessionModelReference, SessionModelRequest, SessionModelRequestPayload,
+    SessionModelState, SessionReplayComplete, SessionServerFrame, SessionSubscribe,
+    SessionV3ServerFrame, SessionV4ServerFrame,
 };
 
 use crate::activity::VerifiedSessionEvent;
 
 const V2_ENDPOINT_KIND: &str = "nopal.session/v2";
 const V3_ENDPOINT_KIND: &str = "nopal.session/v3";
+const V4_ENDPOINT_KIND: &str = "nopal.session/v4";
 const MAX_FRAMES_PER_POLL: usize = 256;
 const BACKOFF_MS: [u64; 6] = [100, 250, 500, 1_000, 2_000, 5_000];
 
@@ -43,6 +46,7 @@ pub struct SessionFeedContext {
 pub enum SessionEndpointVersion {
     V2,
     V3,
+    V4,
 }
 
 impl TryFrom<&str> for SessionEndpointVersion {
@@ -52,6 +56,7 @@ impl TryFrom<&str> for SessionEndpointVersion {
         match kind {
             V2_ENDPOINT_KIND => Ok(Self::V2),
             V3_ENDPOINT_KIND => Ok(Self::V3),
+            V4_ENDPOINT_KIND => Ok(Self::V4),
             _ => Err(FeedError::protocol(format!(
                 "unsupported Session endpoint kind {kind:?}"
             ))),
@@ -132,6 +137,7 @@ impl FeedError {
 pub enum ClientFeedFrame {
     Subscribe(SessionSubscribe),
     Prompt(SessionCommand),
+    Model(SessionModelRequest),
 }
 
 pub trait FeedConnection {
@@ -151,6 +157,8 @@ pub enum SessionFeedServerFrame {
     Event(Box<VerifiedSessionEvent>),
     ReplayComplete(SessionReplayComplete),
     FeedError(nopal_feed_client::session::SessionFeedError),
+    ModelState(SessionModelState),
+    ModelError(SessionModelError),
 }
 
 impl From<SessionServerFrame> for SessionFeedServerFrame {
@@ -176,6 +184,23 @@ impl From<SessionV3ServerFrame> for SessionFeedServerFrame {
             }
             SessionV3ServerFrame::ReplayComplete(complete) => Self::ReplayComplete(complete),
             SessionV3ServerFrame::FeedError(error) => Self::FeedError(error),
+        }
+    }
+}
+
+impl From<SessionV4ServerFrame> for SessionFeedServerFrame {
+    fn from(frame: SessionV4ServerFrame) -> Self {
+        match frame {
+            SessionV4ServerFrame::Event(event) => {
+                Self::Event(Box::new(VerifiedSessionEvent::V2(event)))
+            }
+            SessionV4ServerFrame::ActivityEvent(event) => {
+                Self::Event(Box::new(VerifiedSessionEvent::V3(event)))
+            }
+            SessionV4ServerFrame::ReplayComplete(complete) => Self::ReplayComplete(complete),
+            SessionV4ServerFrame::FeedError(error) => Self::FeedError(error),
+            SessionV4ServerFrame::ModelState(state) => Self::ModelState(state),
+            SessionV4ServerFrame::ModelError(error) => Self::ModelError(error),
         }
     }
 }
@@ -224,6 +249,14 @@ pub enum FeedUpdate {
         code: String,
         message: String,
         retryable: bool,
+    },
+    ModelState {
+        generation: u64,
+        state: SessionModelState,
+    },
+    ModelError {
+        generation: u64,
+        error: SessionModelError,
     },
 }
 
@@ -371,6 +404,68 @@ where
         result
     }
 
+    pub fn request_models(
+        &mut self,
+        request_id: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<(), FeedError> {
+        self.send_model_request(
+            request_id.into(),
+            SessionModelRequestPayload::Refresh {
+                extra: BTreeMap::new(),
+            },
+            now_ms,
+        )
+    }
+
+    pub fn switch_model(
+        &mut self,
+        request_id: impl Into<String>,
+        provider: impl Into<String>,
+        model_id: impl Into<String>,
+        now_ms: u64,
+    ) -> Result<(), FeedError> {
+        self.send_model_request(
+            request_id.into(),
+            SessionModelRequestPayload::Switch {
+                model: SessionModelReference {
+                    provider: provider.into(),
+                    id: model_id.into(),
+                    extra: BTreeMap::new(),
+                },
+                extra: BTreeMap::new(),
+            },
+            now_ms,
+        )
+    }
+
+    fn send_model_request(
+        &mut self,
+        request_id: String,
+        request: SessionModelRequestPayload,
+        now_ms: u64,
+    ) -> Result<(), FeedError> {
+        if !self.can_submit() || self.endpoint_version != Ok(SessionEndpointVersion::V4) {
+            return Err(FeedError::io("Session model control is not live"));
+        }
+        let frame = ClientFeedFrame::Model(SessionModelRequest {
+            kind: SESSION_MODEL_REQUEST_KIND.to_owned(),
+            request_id,
+            plot_id: self.context.plot_id.clone(),
+            session_id: self.context.session_id.clone(),
+            request,
+            extra: BTreeMap::new(),
+        });
+        let Some(connection) = self.connection.as_mut() else {
+            return Err(FeedError::io("structured Session feed lost its connection"));
+        };
+        let result = connection.send(frame);
+        if let Err(error) = &result {
+            self.handle_error(error.clone(), now_ms);
+        }
+        result
+    }
+
     pub fn take_updates(&mut self) -> Vec<FeedUpdate> {
         self.updates.drain(..).collect()
     }
@@ -454,6 +549,34 @@ where
                     );
                 }
                 false
+            }
+            SessionFeedServerFrame::ModelState(state) => {
+                if !matches!(self.state, FeedState::Live) {
+                    self.handle_error(
+                        FeedError::protocol("model state arrived before replay completion"),
+                        now_ms,
+                    );
+                    return false;
+                }
+                self.updates.push_back(FeedUpdate::ModelState {
+                    generation: self.generation,
+                    state,
+                });
+                true
+            }
+            SessionFeedServerFrame::ModelError(error) => {
+                if !matches!(self.state, FeedState::Live) {
+                    self.handle_error(
+                        FeedError::protocol("model error arrived before replay completion"),
+                        now_ms,
+                    );
+                    return false;
+                }
+                self.updates.push_back(FeedUpdate::ModelError {
+                    generation: self.generation,
+                    error,
+                });
+                true
             }
         }
     }
@@ -727,6 +850,7 @@ mod tests {
                         .unwrap_or(Ok(None))
                         .map(|frame| frame.map(SessionFeedServerFrame::from))
                 }
+                SessionEndpointVersion::V4 => Ok(None),
             }
         }
 
@@ -870,7 +994,7 @@ mod tests {
 
         let mismatch_transport = FakeTransport::default();
         let mut mismatch_context = context();
-        mismatch_context.endpoint_kind = "nopal.session/v4".to_owned();
+        mismatch_context.endpoint_kind = "nopal.session/v5".to_owned();
         let mut mismatch = SessionFeed::new(
             23,
             mismatch_context,
@@ -1128,6 +1252,7 @@ mod tests {
             .filter_map(|frame| match frame {
                 ClientFeedFrame::Subscribe(subscribe) => Some(subscribe.after_cursor.clone()),
                 ClientFeedFrame::Prompt(_) => None,
+                ClientFeedFrame::Model(_) => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1194,6 +1319,7 @@ mod tests {
             .filter_map(|frame| match frame {
                 ClientFeedFrame::Subscribe(subscribe) => Some(subscribe.after_cursor.clone()),
                 ClientFeedFrame::Prompt(_) => None,
+                ClientFeedFrame::Model(_) => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(

@@ -10,6 +10,7 @@ const SCOPE_FINGERPRINT_DOMAIN: &[u8] = b"nopal.native_instance_scope/v1";
 const NATIVE_STATE_DIRECTORY: &str = "native";
 const INSTANCE_LOCK_FILE: &str = "instance.lock";
 const RESTORE_PREFERENCE_FILE: &str = "restore.json";
+const MODEL_RECENTS_FILE: &str = "model-recents.json";
 const CONTROL_FINGERPRINT_HEX_BYTES: usize = 32;
 
 /// An existing, absolute state directory with filesystem aliases resolved.
@@ -159,6 +160,7 @@ pub struct NativeStatePaths {
     state_directory: PathBuf,
     instance_lock: PathBuf,
     restore_preference: PathBuf,
+    model_recents: PathBuf,
     activation_endpoint_name: String,
 }
 
@@ -173,6 +175,7 @@ impl NativeStatePaths {
         Self {
             instance_lock: state_directory.join(INSTANCE_LOCK_FILE),
             restore_preference: state_directory.join(RESTORE_PREFERENCE_FILE),
+            model_recents: state_directory.join(MODEL_RECENTS_FILE),
             state_directory,
             activation_endpoint_name: format!("nopal-{control_fingerprint}.sock"),
         }
@@ -188,6 +191,10 @@ impl NativeStatePaths {
 
     pub fn restore_preference(&self) -> &Path {
         &self.restore_preference
+    }
+
+    pub fn model_recents(&self) -> &Path {
+        &self.model_recents
     }
 
     /// A single bounded, separator-free component for a platform control root.
@@ -358,6 +365,11 @@ mod tests {
             paths.restore_preference(),
             paths.state_directory().join("restore.json")
         );
+        assert_eq!(
+            paths.model_recents(),
+            paths.state_directory().join("model-recents.json")
+        );
         assert_ne!(paths.instance_lock(), paths.restore_preference());
+        assert_ne!(paths.restore_preference(), paths.model_recents());
     }
 }
