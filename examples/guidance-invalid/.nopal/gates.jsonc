@@ -1,0 +1,14 @@
+{
+  // Flat gates without selectors: every stage-matching gate default-selects.
+  "version": "nopal.gates/v1",
+  "gates": [
+    {
+      "id": "fmt",
+      "stage": "pre_pr",
+      "command": "cargo fmt --all --check",
+      "autofix": "cargo fmt --all"
+    },
+    { "id": "clippy", "stage": "pre_pr", "command": "cargo clippy --workspace --all-targets" },
+    { "id": "test", "stage": "pre_pr", "command": "cargo test --workspace" }
+  ]
+}

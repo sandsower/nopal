@@ -1,0 +1,6 @@
+{
+  // Deliberately broken example: portable requires policy.jsonc, which is absent.
+  "version": "nopal.project/v1",
+  "project": { "name": "portable-missing-policy" },
+  "profile": "portable"
+}

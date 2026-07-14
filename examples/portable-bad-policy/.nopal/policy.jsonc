@@ -1,0 +1,21 @@
+{
+  // Deliberately broken: every nopal.policy/v1 schema diagnostic in one file.
+  "version": "nopal.policy/v1",
+  "modes": {
+    "yolo": {},
+    "rondo_afk": {
+      "default_decision": "maybe",
+      "default_placement": "moon",
+      "rules": [
+        { "id": "dup", "classes": ["git_remote"], "decision": "allow" },
+        { "id": "dup", "classes": ["warp_core"], "decision": "allow" },
+        { "classes": ["read"], "decision": "allow" },
+        { "id": "no-matcher", "decision": "deny" },
+        { "id": "no-effect", "classes": ["read"] }
+      ]
+    }
+  },
+  "env": [
+    { "name": "TOKEN" }
+  ]
+}

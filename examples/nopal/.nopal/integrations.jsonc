@@ -1,0 +1,79 @@
+{
+  // External connection surfaces. These are provider declarations and cache
+  // settings only; Nopal never contacts the tracker, PR host, model provider,
+  // Pi extension, browser, or signal sink.
+  "version": "nopal.integrations/v1",
+  "tracker": {
+    "ticket_source": {
+      "type": "mcp",
+      "tool": "mcp__tracker__get_issue",
+      "id_pattern": "^[A-Z]+-\\d+$",
+      "link_template": "https://tracker.example/issues/{id}"
+    },
+    "ticket_update": {
+      "type": "mcp",
+      "comment_tool": "mcp__tracker__add_comment",
+      "issue_tool": "mcp__tracker__update_issue"
+    }
+  },
+  "pr_reviews": {
+    "source": {
+      "type": "cli",
+      "summary_command": "gh pr view --json url,number,reviewDecision,reviews,comments",
+      "threads_command": "gh api repos/{owner}/{repo}/pulls/{number}/comments"
+    },
+    "update": {
+      "type": "cli",
+      "reply_command": "gh api repos/{owner}/{repo}/pulls/{number}/comments --method POST --input {json_file}",
+      "rerequest_command": "gh api repos/{owner}/{repo}/pulls/{number}/requested_reviewers --method POST --input {json_file}"
+    }
+  },
+  "pi_handoff": {
+    "enabled": true,
+    "events": "all",
+    "exclude": ["spec_approved", "blueprint_approved"]
+  },
+  "model_routing": {
+    "defaults": {
+      "models": ["sonnet"],
+      "mode": "prefer"
+    },
+    "overrides": [
+      {
+        "skills": ["spec", "blueprint", "poke-holes"],
+        "models": ["opus"],
+        "mode": "prefer"
+      }
+    ],
+    "tiers": {
+      "light": ["haiku"],
+      "standard": ["sonnet"],
+      "heavy": ["opus", "sonnet"],
+      "frontier": ["opus"]
+    },
+    "tier_mode": "prefer"
+  },
+  "visual_surfaces": {
+    "provider": "lavish-axi",
+    "mode": "suggest",
+    "artifact_root": ".lavish",
+    "artifact_retention": "local",
+    "workflows": {
+      "blueprint": "suggest",
+      "show-me": "auto"
+    }
+  },
+  "workflow_signals": {
+    "mode": "auto",
+    "sinks": [
+      { "type": "tmux-glance" }
+    ],
+    "skills": {
+      "ready-for-review": "auto",
+      "review-response": "auto"
+    }
+  },
+  "probe_cache": {
+    "ttl_hours": 24
+  }
+}

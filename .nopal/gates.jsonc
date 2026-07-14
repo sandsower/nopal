@@ -1,0 +1,31 @@
+{
+  "gates": [
+    {
+      "autofix": "cargo fmt --all",
+      "command": "cargo fmt --all --check",
+      "id": "fmt",
+      "stage": "pre_pr"
+    },
+    {
+      "command": "cargo clippy --workspace --all-targets -- -D warnings",
+      "id": "clippy",
+      "stage": "pre_pr"
+    },
+    {
+      "command": "cargo test --workspace",
+      "id": "test",
+      "stage": "pre_pr"
+    },
+    {
+      "command": "npm test",
+      "id": "ext-test",
+      "stage": "pre_pr"
+    },
+    {
+      "command": "scripts/check-public-tree.sh",
+      "id": "public-tree",
+      "stage": "pre_pr"
+    }
+  ],
+  "version": "nopal.gates/v1"
+}

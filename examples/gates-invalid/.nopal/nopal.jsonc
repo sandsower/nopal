@@ -1,0 +1,5 @@
+{
+  "version": "nopal.project/v1",
+  "project": { "name": "gates-invalid-example" },
+  "profile": "minimal"
+}

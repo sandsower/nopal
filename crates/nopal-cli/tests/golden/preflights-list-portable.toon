@@ -1,0 +1,5 @@
+kind: nopal.preflights.list/v1
+ok: true
+preflights[1]{id,stage,run,cwd}:
+  toolchain,run_start,rustup show,-
+diagnostics[0]{severity,code,path,position,message}:

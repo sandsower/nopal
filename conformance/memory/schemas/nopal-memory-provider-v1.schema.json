@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nopal-memory-provider-v1.schema.json",
+  "title": "nopal.memory_provider/v1 contract descriptor",
+  "description": "Descriptor for a MemoryProvider implementation consumable by nopal. Mirrors the execution contract's descriptor style: it names the operations, guarantees, and degraded shapes a provider must expose; per-operation payload validation lives in the conformance runner.",
+  "type": "object",
+  "required": ["kind", "surface", "status", "transport", "operations", "guarantees"],
+  "properties": {
+    "kind": { "const": "nopal.memory_provider.contract/v1" },
+    "surface": { "const": "nopal.memory_provider/v1" },
+    "status": { "enum": ["provisional", "v1"] },
+    "transport": {
+      "type": "object",
+      "required": ["style", "invocation"],
+      "properties": {
+        "style": {
+          "description": "Transport is not frozen; json_subprocess is the reference. Alternatives must expose the same concepts and pass the runner.",
+          "type": "string"
+        },
+        "invocation": { "type": "string" }
+      }
+    },
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["operation", "reference_command", "response_concepts"],
+        "properties": {
+          "operation": { "type": "string" },
+          "reference_command": { "type": "string" },
+          "request_concepts": { "type": "array", "items": { "type": "string" } },
+          "response_concepts": { "type": "array", "items": { "type": "string" } },
+          "degraded_shapes": {
+            "description": "Stable degraded responses (e.g. lock_unavailable skip, dead-letter) that consumers must handle.",
+            "type": "array",
+            "items": { "type": "string" }
+          }
+        }
+      }
+    },
+    "guarantees": {
+      "type": "object",
+      "required": ["capture_then_recall", "fail_closed_lock", "miss_envelope", "in_band_errors"],
+      "properties": {
+        "capture_then_recall": {
+          "description": "A run lesson ingested with run_id and ticket_id is findable by either identifier via memory.search immediately afterward.",
+          "type": "string"
+        },
+        "fail_closed_lock": {
+          "description": "Lock-unavailable degrades reads to a skipped shape and routes writes to dead-letter; never silent unlocked access.",
+          "type": "string"
+        },
+        "miss_envelope": {
+          "description": "Search misses carry miss.reason from an open vocabulary plus recovery hints.",
+          "type": "string"
+        },
+        "in_band_errors": {
+          "description": "Errors are JSON with stable reason codes; unknown codes are handled conservatively.",
+          "type": "string"
+        }
+      }
+    },
+    "reason_codes": {
+      "description": "Known stable reason codes. Open vocabulary: additive codes do not require a version bump.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "provider": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "min_version": { "type": "string" }
+      }
+    }
+  }
+}

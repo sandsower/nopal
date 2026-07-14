@@ -1,0 +1,15 @@
+{
+  // One of everything the validator must catch.
+  "version": "nopal.gates/v2",
+  "gates": [
+    { "id": "fmt", "stage": "someday", "command": "cargo fmt" },
+    { "id": "dup", "stage": "pre_pr", "command": "lint {typo}" },
+    { "id": "dup", "stage": "pre_pr", "command": "lint {broken" }
+  ],
+  "gate_sets": {
+    "fast": { "gates": ["dup", "missing"] }
+  },
+  "selectors": [
+    { "name": "all", "paths": ["**"], "gate_sets": ["fast", "nope"] }
+  ]
+}

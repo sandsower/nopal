@@ -1,0 +1,5 @@
+{
+  // Deliberately broken example: the line below is not valid JSONC.
+  "version" "nopal.project/v1",
+  "profile": "minimal"
+}

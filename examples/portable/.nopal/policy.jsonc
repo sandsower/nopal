@@ -1,0 +1,25 @@
+{
+  // nopal.policy/v1: action decisions and runtime placement per mode.
+  "version": "nopal.policy/v1",
+  "modes": {
+    "supervised_auto": {
+      "default_decision": "ask",
+      "rules": [
+        {
+          "id": "allow-local-dev",
+          "classes": ["read", "workspace_write", "git_local"],
+          "decision": "allow"
+        },
+        {
+          "id": "deny-destructive",
+          "classes": ["destructive"],
+          "decision": "deny",
+          "reason": "destructive actions need a human, not supervision"
+        }
+      ]
+    }
+  },
+  "env": [
+    { "name": "CI", "classes": [] }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "version": "nopal.gates/v1",
+  "gates": [
+    { "name": "test", "command": "cargo test --workspace" }
+  ]
+}

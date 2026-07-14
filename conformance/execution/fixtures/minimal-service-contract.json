@@ -1,0 +1,72 @@
+{
+  "kind": "rondo.core.service_contract/v1",
+  "surface": "rondo.core/v1",
+  "status": "active",
+  "placements": [
+    "shared_user_runtime",
+    "dedicated_repo_runtime",
+    "dedicated_run_runtime",
+    "blocked"
+  ],
+  "namespace": {
+    "repo": {
+      "field": "repo_id",
+      "description": "Stable opaque repository namespace chosen by the caller; Nopal uses an explicit id or a path-derived digest without sending the path."
+    },
+    "plot": {
+      "field": "plot_id",
+      "description": "Optional opaque caller namespace preserved by Rondo; required and echo-validated for Nopal-managed submissions."
+    },
+    "run": {
+      "field": "run_id",
+      "description": "Rondo Core run id scoped under repo_id; Nopal treats it as opaque."
+    }
+  },
+  "operations": {
+    "run.submit": {
+      "request": ["manifest_path", "manifest_sha256", "repo_id", "plot_id"],
+      "response": ["surface", "service_id", "repo_id", "plot_id", "run_id", "status", "event_cursor", "deduplicated"],
+      "notes": "POST /api/v1/execution-requests; plot_id is optional for standalone Rondo and required for Nopal; HTTP 202 for a new Plot-scoped run and 200 for an exact replay."
+    },
+    "run.status": {
+      "request": ["repo_id", "run_id"],
+      "response": ["surface", "repo_id", "plot_id", "run_id", "status", "last_event", "evidence_pointers", "event_cursor"],
+      "notes": "GET /api/v1/runs/{run_id}?repo_id={repo_id}."
+    },
+    "run.events": {
+      "request": ["repo_id", "run_id", "event_cursor"],
+      "response": ["surface", "repo_id", "plot_id", "run_id", "events", "next_event_cursor", "has_more"],
+      "notes": "GET /api/v1/runs/{run_id}/events with server-bounded paging."
+    }
+  },
+  "events": [
+    {
+      "type": "rondo.service.status_changed",
+      "required_fields": ["service_id", "status", "timestamp"]
+    },
+    {
+      "type": "rondo.run.status_changed",
+      "required_fields": ["repo_id", "plot_id", "run_id", "status", "timestamp"]
+    },
+    {
+      "type": "rondo.run.evidence_recorded",
+      "required_fields": ["repo_id", "plot_id", "run_id", "artifact_kind", "uri", "timestamp"]
+    }
+  ],
+  "ownership": {
+    "nopal_coordinates": [
+      "runtime placement decision",
+      "policy-gated run submission",
+      "explicit established Plot correlation",
+      "run status, event, and evidence rendering",
+      "opaque run handle preservation"
+    ],
+    "rondo_core_owns": [
+      "execution supervision",
+      "run ledger",
+      "workspaces",
+      "agent adapters",
+      "artifacts"
+    ]
+  }
+}

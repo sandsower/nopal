@@ -1,0 +1,1 @@
+placeholder Pi extension resource for the bundle-valid example

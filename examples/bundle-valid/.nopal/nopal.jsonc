@@ -1,0 +1,7 @@
+{
+  // A portable project with a resolvable nopal.bundle/v1: proves bare
+  // `nopal --dry-run` reports would_exec=true against a configured bundle.
+  "version": "nopal.project/v1",
+  "project": { "name": "bundle-valid-example" },
+  "profile": "portable"
+}

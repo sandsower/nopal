@@ -1,0 +1,10 @@
+{
+  "version": "nopal.policy/v1",
+  "modes": {
+    "nopal_tui": {
+      "default_decision": "ask",
+      "default_placement": "dedicated_repo_runtime",
+      "rules": []
+    }
+  }
+}

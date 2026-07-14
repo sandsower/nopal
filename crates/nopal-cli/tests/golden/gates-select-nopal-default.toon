@@ -1,0 +1,11 @@
+kind: nopal.gates.select/v1
+ok: true
+stage: pre_pr
+changed_files[0]:
+selectors[0]{name,matched,matched_files}:
+selected[3]{id,stage,run,parallel_safe,mutates,via}:
+  fmt,pre_pr,cargo fmt --all --check,-,-,default
+  clippy,pre_pr,cargo clippy --workspace --all-targets,-,-,default
+  test,pre_pr,cargo test --workspace,-,-,default
+skipped[0]{id,stage,reason,via}:
+diagnostics[0]{severity,code,path,position,message}:

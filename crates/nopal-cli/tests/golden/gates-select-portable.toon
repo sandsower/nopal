@@ -1,0 +1,14 @@
+kind: nopal.gates.select/v1
+ok: true
+stage: pre_pr
+changed_files[2]: README.md,crates/nopal-core/src/lib.rs
+selectors[2]{name,matched,matched_files}:
+  rust-files,true,crates/nopal-core/src/lib.rs
+  doc-files,true,README.md
+selected[3]{id,stage,run,parallel_safe,mutates,via}:
+  fmt,pre_pr,cargo fmt --all --check,-,-,"selector:rust-files set:rust"
+  clippy,pre_pr,cargo clippy --workspace --all-targets,-,-,"selector:rust-files set:rust"
+  test,pre_pr,cargo test --workspace,-,-,"selector:rust-files set:rust"
+skipped[1]{id,stage,reason,via}:
+  docs-lint,pre_commit,stage_mismatch,"selector:doc-files set:docs"
+diagnostics[0]{severity,code,path,position,message}:

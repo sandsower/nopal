@@ -1,0 +1,11 @@
+{
+  // nopal dogfood: this repo's own config, translated from .beislid/workflow.md.
+  "version": "nopal.project/v1",
+  "project": { "name": "nopal" },
+  "profile": "nopal",
+  "profiles": {
+    "nopal": {
+      "required_modules": ["gates", "policy", "workflow", "roots"]
+    }
+  }
+}

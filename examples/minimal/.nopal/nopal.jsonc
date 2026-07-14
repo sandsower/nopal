@@ -1,0 +1,6 @@
+{
+  // Nopal project manifest - the minimal profile needs nothing else.
+  "version": "nopal.project/v1",
+  "project": { "name": "minimal-example" },
+  "profile": "minimal"
+}

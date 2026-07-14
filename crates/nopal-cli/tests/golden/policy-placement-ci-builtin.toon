@@ -1,0 +1,11 @@
+kind: nopal.policy_placement/v1
+ok: true
+mode: ci
+action: git.push
+classes[0]:
+env[0]{name,known,classes}:
+placement: dedicated_run_runtime
+placement_source: builtin_default
+matched_rules[0]{id,via,decision,placement,reason}:
+diagnostics[0]{severity,code,path,position,message}:
+explanation[1]: "placement dedicated_run_runtime: built-in default for mode ci (no matched rule or configured default)"

@@ -1,0 +1,12 @@
+{
+  // The nopal profile: the full distro surface - gates, policy, workflow,
+  // roots, integrations, and guidance modules are all required.
+  "version": "nopal.project/v1",
+  "project": { "name": "nopal-example" },
+  "profile": "nopal",
+  "profiles": {
+    "nopal": {
+      "required_modules": ["gates", "policy", "workflow", "roots", "integrations", "guidance"]
+    }
+  }
+}

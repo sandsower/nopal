@@ -1,0 +1,125 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nopal.sh/schemas/rondo-core-service-v1.schema.json",
+  "title": "Rondo Core service contract descriptor v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "surface",
+    "status",
+    "placements",
+    "namespace",
+    "operations",
+    "events",
+    "ownership"
+  ],
+  "properties": {
+    "kind": { "const": "rondo.core.service_contract/v1" },
+    "surface": { "const": "rondo.core/v1" },
+    "status": { "enum": ["provisional", "active"] },
+    "placements": {
+      "type": "array",
+      "prefixItems": [
+        { "const": "shared_user_runtime" },
+        { "const": "dedicated_repo_runtime" },
+        { "const": "dedicated_run_runtime" },
+        { "const": "blocked" }
+      ],
+      "items": false,
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "namespace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repo", "plot", "run"],
+      "properties": {
+        "repo": { "$ref": "#/$defs/namespacePart" },
+        "plot": { "$ref": "#/$defs/namespacePart" },
+        "run": { "$ref": "#/$defs/namespacePart" }
+      }
+    },
+    "operations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run.submit",
+        "run.status",
+        "run.events"
+      ],
+      "properties": {
+        "run.submit": { "$ref": "#/$defs/operation" },
+        "run.status": { "$ref": "#/$defs/operation" },
+        "run.events": { "$ref": "#/$defs/operation" }
+      }
+    },
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/event" }
+    },
+    "ownership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["nopal_coordinates", "rondo_core_owns"],
+      "properties": {
+        "nopal_coordinates": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "rondo_core_owns": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    }
+  },
+  "$defs": {
+    "namespacePart": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["field", "description"],
+      "properties": {
+        "field": { "type": "string", "minLength": 1 },
+        "description": { "type": "string", "minLength": 1 }
+      }
+    },
+    "operation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["request", "response"],
+      "properties": {
+        "request": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "response": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        },
+        "notes": { "type": "string" }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "required_fields"],
+      "properties": {
+        "type": { "type": "string", "pattern": "^rondo\\." },
+        "required_fields": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

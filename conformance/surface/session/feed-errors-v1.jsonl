@@ -1,0 +1,4 @@
+{"kind":"nopal.session.feed_error/v1","request_id":"request-gap","plot_id":"plot-fixture","session_id":"session-fixture","code":"history_gap","retryable":false,"message":"The requested cursor is not on the active Session branch.","future_error_fact":true}
+{"kind":"nopal.session.feed_error/v1","request_id":null,"plot_id":null,"session_id":null,"code":"unavailable","retryable":true,"message":"The Session feed is temporarily unavailable."}
+{"kind":"nopal.session.feed_error/v1","request_id":"request-command-conflict","plot_id":"plot-fixture","session_id":"session-fixture","code":"command_conflict","retryable":false,"message":"The command identity was already committed with different prompt content."}
+{"kind":"nopal.session.feed_error/v1","request_id":"request-overflow","plot_id":"plot-fixture","session_id":"session-fixture","code":"replay_buffer_overflow","retryable":true,"message":"Reconnect from the last verified cursor after bounded replay buffering overflowed."}

@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nopal third-party Rust licenses</title>
+  <style>
+    body { font: 16px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 70rem; padding: 2rem; }
+    pre { border: 1px solid #ccc; overflow: auto; padding: 1rem; white-space: pre-wrap; }
+    li { margin-bottom: 0.25rem; }
+  </style>
+</head>
+<body>
+  <h1>Nopal third-party Rust licenses</h1>
+  <p>Generated from the release Cargo dependency graph by cargo-about.</p>
+  <h2>Overview</h2>
+  <ul>
+  {{#each overview}}
+    <li>{{name}} ({{count}} crates)</li>
+  {{/each}}
+  </ul>
+  {{#each licenses}}
+  <section>
+    <h2>{{name}}</h2>
+    <h3>Used by</h3>
+    <ul>
+    {{#each used_by}}
+      <li>{{crate.name}} {{crate.version}}</li>
+    {{/each}}
+    </ul>
+    <pre>{{text}}</pre>
+  </section>
+  {{/each}}
+</body>
+</html>

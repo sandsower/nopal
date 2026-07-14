@@ -1,0 +1,25 @@
+kind: nopal.review_risk/v1
+ok: true
+risk:
+  class: medium
+  max_auto_closeout_risk: low
+  agentic_reviewer_required: true
+fast_path:
+  eligible: false
+  reason: multi_scope_gates_not_parallel_safe
+  max_changed_lines: 100
+  changed_lines: 50
+scopes:
+  model: selectors
+  touched[2]: rust-files,doc-files
+  policy: exclusive
+  violation: true
+inputs:
+  changed_files: 2
+  total_changes: 50
+  base_fresh: true
+  needs_merge: false
+  existing_pr: false
+  stage: pre_pr
+diagnostics[0]{severity,code,path,position,message}:
+explanation[3]: "risk medium: no high-risk signal fired and low-risk conditions were not all satisfied","fast_path ineligible: multi_scope_gates_not_parallel_safe","scopes selectors: touched 2"

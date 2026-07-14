@@ -1,0 +1,202 @@
+{
+  "modes": {
+    "supervised_auto": {
+      "rules": [
+        {
+          "classes": [
+            "read"
+          ],
+          "decision": "allow",
+          "id": "class-read"
+        },
+        {
+          "classes": [
+            "network_read"
+          ],
+          "decision": "allow",
+          "id": "class-network-read"
+        },
+        {
+          "classes": [
+            "workspace_write"
+          ],
+          "decision": "allow",
+          "id": "class-workspace-write"
+        },
+        {
+          "classes": [
+            "git_local"
+          ],
+          "decision": "allow",
+          "id": "class-git-local"
+        },
+        {
+          "classes": [
+            "git_remote"
+          ],
+          "decision": "allow",
+          "id": "class-git-remote"
+        },
+        {
+          "actions": [
+            "gate.*"
+          ],
+          "decision": "allow",
+          "id": "action-gatewildcardwildcard"
+        },
+        {
+          "actions": [
+            "git.commit"
+          ],
+          "decision": "allow",
+          "id": "action-gitwildcardcommit"
+        },
+        {
+          "actions": [
+            "git.push"
+          ],
+          "decision": "allow",
+          "id": "action-gitwildcardpush"
+        },
+        {
+          "actions": [
+            "pr.review.reply"
+          ],
+          "decision": "allow",
+          "id": "action-prwildcardreviewwildcardreply"
+        },
+        {
+          "actions": [
+            "pr.review.rerequest"
+          ],
+          "decision": "allow",
+          "id": "action-prwildcardreviewwildcardrerequest"
+        },
+        {
+          "actions": [
+            "ticket.comment"
+          ],
+          "decision": "allow",
+          "id": "action-ticketwildcardcomment"
+        },
+        {
+          "actions": [
+            "ticket.issue"
+          ],
+          "decision": "allow",
+          "id": "action-ticketwildcardissue"
+        },
+        {
+          "actions": [
+            "memento.capture"
+          ],
+          "decision": "allow",
+          "id": "action-mementowildcardcapture"
+        },
+        {
+          "actions": [
+            "retro.run"
+          ],
+          "decision": "allow",
+          "id": "action-retrowildcardrun"
+        }
+      ]
+    },
+    "unattended_auto": {
+      "rules": [
+        {
+          "classes": [
+            "read"
+          ],
+          "decision": "allow",
+          "id": "class-read-2"
+        },
+        {
+          "classes": [
+            "network_read"
+          ],
+          "decision": "allow",
+          "id": "class-network-read-2"
+        },
+        {
+          "classes": [
+            "workspace_write"
+          ],
+          "decision": "allow",
+          "id": "class-workspace-write-2"
+        },
+        {
+          "classes": [
+            "git_local"
+          ],
+          "decision": "allow",
+          "id": "class-git-local-2"
+        },
+        {
+          "actions": [
+            "workspace.lifecycle.create"
+          ],
+          "decision": "allow",
+          "id": "action-workspacewildcardlifecyclewildcardcreate"
+        },
+        {
+          "actions": [
+            "workspace.lifecycle.cleanup_tmp"
+          ],
+          "decision": "allow",
+          "id": "action-workspacewildcardlifecyclewildcardcleanup-tmp"
+        },
+        {
+          "actions": [
+            "workspace.lifecycle.remove_stale_path"
+          ],
+          "decision": "allow",
+          "id": "action-workspacewildcardlifecyclewildcardremove-stale-path"
+        },
+        {
+          "actions": [
+            "workspace.lifecycle.remove"
+          ],
+          "decision": "allow",
+          "id": "action-workspacewildcardlifecyclewildcardremove"
+        },
+        {
+          "actions": [
+            "workspace.hook.after_create"
+          ],
+          "decision": "allow",
+          "id": "action-workspacewildcardhookwildcardafter-create"
+        },
+        {
+          "actions": [
+            "workspace.hook.before_run"
+          ],
+          "decision": "allow",
+          "id": "action-workspacewildcardhookwildcardbefore-run"
+        },
+        {
+          "actions": [
+            "workspace.hook.after_run"
+          ],
+          "decision": "allow",
+          "id": "action-workspacewildcardhookwildcardafter-run"
+        },
+        {
+          "actions": [
+            "gate.*"
+          ],
+          "decision": "allow",
+          "id": "action-gatewildcardwildcard-2"
+        },
+        {
+          "actions": [
+            "git.commit"
+          ],
+          "decision": "allow",
+          "id": "action-gitwildcardcommit-2"
+        }
+      ]
+    }
+  },
+  "version": "nopal.policy/v1"
+}

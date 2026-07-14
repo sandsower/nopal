@@ -1,0 +1,100 @@
+#!/bin/sh
+
+set -eu
+
+state_dir=${MOCK_GH_STATE:?MOCK_GH_STATE is required}
+state_file="$state_dir/release-state"
+remote_dir="$state_dir/remote-assets"
+log_file="$state_dir/gh.log"
+mkdir -p "$remote_dir"
+printf '%s\n' "$*" >> "$log_file"
+
+if [ "$1" != "release" ]; then
+  echo "unsupported mock gh command: $*" >&2
+  exit 2
+fi
+
+command=$2
+tag=$3
+shift 3
+
+case "$command" in
+  view)
+    state=$(cat "$state_file" 2>/dev/null || printf 'missing')
+    if [ "$state" = "missing" ]; then
+      exit 1
+    fi
+    case " $* " in
+      *" --json isDraft "*)
+        if [ "$state" = "draft" ]; then
+          printf 'true\n'
+        else
+          printf 'false\n'
+        fi
+        ;;
+      *" --json assets "*)
+        find "$remote_dir" -type f -maxdepth 1 -exec basename {} \; | LC_ALL=C sort
+        ;;
+      *)
+        echo "unsupported mock gh release view: $*" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  create)
+    if [ "${MOCK_GH_CREATE_RACE:-0}" = "1" ] \
+      && [ ! -f "$state_dir/create-race-fired" ]; then
+      : > "$state_dir/create-race-fired"
+      printf 'draft\n' > "$state_file"
+      exit 1
+    fi
+    printf 'draft\n' > "$state_file"
+    ;;
+  upload)
+    asset=$1
+    name=$(basename "$asset")
+    if [ "${MOCK_GH_UPLOAD_RACE_ASSET:-}" = "$name" ] \
+      && [ ! -f "$state_dir/upload-race-fired" ]; then
+      : > "$state_dir/upload-race-fired"
+      cp "$asset" "$remote_dir/$name"
+      exit 1
+    fi
+    cp "$asset" "$remote_dir/$name"
+    ;;
+  download)
+    pattern=
+    destination=
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --pattern)
+          pattern=$2
+          shift 2
+          ;;
+        --dir)
+          destination=$2
+          shift 2
+          ;;
+        --clobber)
+          shift
+          ;;
+        *)
+          echo "unsupported mock gh release download option: $1" >&2
+          exit 2
+          ;;
+      esac
+    done
+    mkdir -p "$destination"
+    cp "$remote_dir/$pattern" "$destination/$pattern"
+    ;;
+  edit)
+    if [ "$1" != "--draft=false" ]; then
+      echo "unsupported mock gh release edit: $*" >&2
+      exit 2
+    fi
+    printf 'published\n' > "$state_file"
+    ;;
+  *)
+    echo "unsupported mock gh release command for $tag: $command" >&2
+    exit 2
+    ;;
+esac

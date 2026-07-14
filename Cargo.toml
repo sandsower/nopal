@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/nopal-ledger-json",
+    "crates/nopal-core",
+    "crates/nopal-feed-client",
+    "crates/nopal-rondo-client",
+    "crates/nopal-rondo-lifecycle",
+    "crates/nopal-native-lifecycle",
+    "crates/nopal-field-presentation",
+    "crates/nopal-cli",
+    "crates/nopal-field",
+    "crates/nopal-desktop-spike",
+]
+
+[workspace.package]
+version = "0.2.9"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/sandsower/nopal"
+
+[workspace.dependencies]
+nopal-core = { path = "crates/nopal-core" }
+nopal-rondo-client = { path = "crates/nopal-rondo-client" }
+nopal-rondo-lifecycle = { path = "crates/nopal-rondo-lifecycle" }
+nopal-native-lifecycle = { path = "crates/nopal-native-lifecycle" }
+nopal-field-presentation = { path = "crates/nopal-field-presentation" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+jsonc-parser = { version = "0.26", features = ["serde"] }
+globset = "0.4"
+regex = "1"
+getrandom = "0.3"
+fs2 = "0.4"
+sha2 = "0.10"
+tempfile = "3"
+ureq = { version = "3", default-features = false, features = ["json"] }
+url = "2"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"

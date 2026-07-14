@@ -1,0 +1,12 @@
+kind: nopal.beislid_import/v1
+ok: true
+source: .beislid/workflow.md
+mode: check
+outputs[3]{module,path,action,bytes}:
+  integrations,.nopal/integrations.jsonc,checked,797
+  gates,.nopal/gates.jsonc,checked,287
+  policy,.nopal/policy.jsonc,checked,870
+diagnostics[3]{severity,code,path,position,message}:
+  warning,beislid_import_unsupported,.beislid/workflow.md,"38:1","block \"action_policy\": unsupported action_policy field \"sandbox\""
+  warning,beislid_import_unsupported,.beislid/workflow.md,"45:1","block \"action_policy\": wildcard action \"gate.*\" has no Nopal v1 wildcard semantics and is preserved literally"
+  warning,beislid_import_unsupported,.beislid/workflow.md,"53:1",branch patterns have no stable Nopal v1 module field
