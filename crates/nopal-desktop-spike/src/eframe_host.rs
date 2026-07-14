@@ -3,6 +3,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 
 use nopal_feed_client::field::FieldSnapshot;
+use nopal_feed_client::session::SessionModelReference;
 use nopal_field_presentation::composer::{ComposerAuthority, ComposerTarget};
 use nopal_field_presentation::coordinator::FieldPresentationCoordinator;
 use nopal_field_presentation::view_state::{FieldViewState, WorkspaceSubject};
@@ -11,6 +12,7 @@ use nopal_native_lifecycle::application::{
     OwnedResourceRecoveryReport, ResolvedNativeApplicationHostFactory, RestorePreferenceNotice,
 };
 use nopal_native_lifecycle::current_field::CurrentCoreFieldAuthority;
+use nopal_native_lifecycle::model_preferences::{ModelRecentsReadOutcome, ModelRecentsStore};
 use nopal_native_lifecycle::reconcile::{
     ExactSessionSelection, RestoreResolution, RestoreSelection,
 };
@@ -27,6 +29,8 @@ pub struct EframeAppSeed {
     pub composer: ComposerAuthority,
     pub runtime: Option<LiveSessionRuntime>,
     pub startup_diagnostics: Vec<String>,
+    pub recent_models: Vec<SessionModelReference>,
+    pub model_recents_store: Option<ModelRecentsStore>,
 }
 
 #[derive(Default)]
@@ -168,9 +172,17 @@ impl NativeApplicationHost for EframeNativeHost {
 pub struct EframeHostFactory {
     bridge: EframeUiBridge,
     seed: Arc<Mutex<Option<EframeAppSeed>>>,
+    model_recents_store: Option<ModelRecentsStore>,
 }
 
 impl EframeHostFactory {
+    pub fn with_model_recents(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            model_recents_store: Some(ModelRecentsStore::new(path)),
+            ..Self::default()
+        }
+    }
+
     pub fn bridge(&self) -> EframeUiBridge {
         self.bridge.clone()
     }
@@ -227,6 +239,26 @@ impl ResolvedNativeApplicationHostFactory for EframeHostFactory {
         if let Some(reason) = fallback_restore_notice(restore) {
             startup_diagnostics.push(reason);
         }
+        let recent_models = match self
+            .model_recents_store
+            .as_ref()
+            .map(ModelRecentsStore::read)
+        {
+            None | Some(Ok(ModelRecentsReadOutcome::Missing)) => Vec::new(),
+            Some(Ok(ModelRecentsReadOutcome::Ready(recents))) => recents,
+            Some(Ok(outcome)) => {
+                startup_diagnostics.push(format!(
+                    "Model recency preference was ignored and preserved: {outcome:?}"
+                ));
+                Vec::new()
+            }
+            Some(Err(error)) => {
+                startup_diagnostics.push(format!(
+                    "Model recency preference could not be read: {error}"
+                ));
+                Vec::new()
+            }
+        };
         let runtime = live_session
             .as_ref()
             .map(|selection| session_runtime(field.clone(), selection))
@@ -237,6 +269,8 @@ impl ResolvedNativeApplicationHostFactory for EframeHostFactory {
             composer: ComposerAuthority::new(composer_target),
             runtime,
             startup_diagnostics,
+            recent_models,
+            model_recents_store: self.model_recents_store.clone(),
         });
         Ok(EframeNativeHost {
             bridge: self.bridge.clone(),

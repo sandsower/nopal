@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::roots::RootDeclaration;
 
 pub const PLOT_KIND: &str = "nopal.plot/v1";
-pub const SESSION_PROTOCOL_KIND: &str = "nopal.session/v3";
+pub const SESSION_PROTOCOL_KIND: &str = "nopal.session/v4";
 pub const SESSION_PROTOCOL_V2_KIND: &str = "nopal.session/v2";
 pub const SESSION_PROTOCOL_TRANSPORT_UNIX: &str = "unix";
 
@@ -165,8 +165,8 @@ mod tests {
     fn unix_session_endpoint_defaults_to_the_durable_feed_capability() {
         let endpoint = SessionProtocolEndpoint::unix("/tmp/session.sock", "ready");
 
-        assert_eq!(SESSION_PROTOCOL_KIND, "nopal.session/v3");
-        assert_eq!(endpoint.kind, "nopal.session/v3");
+        assert_eq!(SESSION_PROTOCOL_KIND, "nopal.session/v4");
+        assert_eq!(endpoint.kind, "nopal.session/v4");
         assert_eq!(endpoint.transport, "unix");
     }
 

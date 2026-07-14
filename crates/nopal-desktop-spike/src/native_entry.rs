@@ -54,7 +54,9 @@ mod unix {
         let recovery = ScopedOwnedResourceRecovery::new(FailClosedRecoveryAdapter);
         let core =
             CliCoreFieldSnapshotSource::production(nopal_binary()).with_state_dir(core_state_dir);
-        let host_factory = EframeHostFactory::default();
+        let host_factory = EframeHostFactory::with_model_recents(
+            scope.state_paths().model_recents().to_path_buf(),
+        );
         let bridge = host_factory.bridge();
         let mut product = NativeFieldProduct::new(
             scope,

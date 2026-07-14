@@ -16,11 +16,15 @@ pub const DURABLE_SESSION_EVENT_KIND: &str = "nopal.session.event/v2";
 pub const SESSION_SUBSCRIBE_KIND: &str = "nopal.session.subscribe/v1";
 pub const SESSION_REPLAY_COMPLETE_KIND: &str = "nopal.session.replay_complete/v1";
 pub const SESSION_FEED_ERROR_KIND: &str = "nopal.session.feed_error/v1";
+pub const SESSION_MODEL_REQUEST_KIND: &str = "nopal.session.model.request/v1";
+pub const SESSION_MODEL_STATE_KIND: &str = "nopal.session.model.state/v1";
+pub const SESSION_MODEL_ERROR_KIND: &str = "nopal.session.model.error/v1";
 pub const MAX_SESSION_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_SESSION_IDENTITY_BYTES: usize = 4096;
 pub const DEFAULT_REPLAY_PAGE_LIMIT: u32 = 256;
 pub const MAX_REPLAY_PAGE_LIMIT: u32 = 1024;
 pub const MAX_FEED_ERROR_MESSAGE_BYTES: usize = 4096;
+pub const MAX_SESSION_MODELS: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionCommand {
@@ -165,6 +169,95 @@ pub struct SessionFeedError {
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModelReference {
+    pub provider: String,
+    pub id: String,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModelDescriptor {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SessionModelRequestPayload {
+    Refresh {
+        #[serde(flatten)]
+        extra: BTreeMap<String, serde_json::Value>,
+    },
+    Switch {
+        model: SessionModelReference,
+        #[serde(flatten)]
+        extra: BTreeMap<String, serde_json::Value>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModelRequest {
+    pub kind: String,
+    pub request_id: String,
+    pub plot_id: String,
+    pub session_id: String,
+    pub request: SessionModelRequestPayload,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionAgentState {
+    Idle,
+    Active,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModelState {
+    pub kind: String,
+    pub plot_id: String,
+    pub session_id: String,
+    pub request_id: Option<String>,
+    pub state_epoch: String,
+    pub revision: u64,
+    pub agent_state: SessionAgentState,
+    pub current: Option<SessionModelDescriptor>,
+    pub available: Vec<SessionModelDescriptor>,
+    pub available_complete: bool,
+    pub available_total: usize,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionModelErrorCode {
+    Busy,
+    UnknownModel,
+    Conflict,
+    Unavailable,
+    Internal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModelError {
+    pub kind: String,
+    pub request_id: String,
+    pub plot_id: String,
+    pub session_id: String,
+    pub code: SessionModelErrorCode,
+    pub retryable: bool,
+    pub message: String,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionServerFrame {
     Event(DurableSessionEvent),
@@ -178,6 +271,16 @@ pub enum SessionV3ServerFrame {
     ActivityEvent(DurableSessionActivityEvent),
     ReplayComplete(SessionReplayComplete),
     FeedError(SessionFeedError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionV4ServerFrame {
+    Event(DurableSessionEvent),
+    ActivityEvent(DurableSessionActivityEvent),
+    ReplayComplete(SessionReplayComplete),
+    FeedError(SessionFeedError),
+    ModelState(SessionModelState),
+    ModelError(SessionModelError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +510,20 @@ pub fn parse_session_feed_error(line: &str) -> Result<SessionFeedError, SessionC
     parse_session_feed_error_value(value)
 }
 
+pub fn parse_model_request(line: &str) -> Result<SessionModelRequest, SessionContractError> {
+    let value = parse_value(line)?;
+    validate_kind(&value, SESSION_MODEL_REQUEST_KIND)?;
+    let request: SessionModelRequest = serde_json::from_value(value)
+        .map_err(|error| SessionContractError::Json(error.to_string()))?;
+    validate_identity("request_id", &request.request_id)?;
+    validate_identity("plot_id", &request.plot_id)?;
+    validate_identity("session_id", &request.session_id)?;
+    if let SessionModelRequestPayload::Switch { model, .. } = &request.request {
+        validate_model_reference(model)?;
+    }
+    Ok(request)
+}
+
 pub fn parse_session_server_frame(line: &str) -> Result<SessionServerFrame, SessionContractError> {
     let value = parse_value(line)?;
     match value.get("kind").and_then(serde_json::Value::as_str) {
@@ -455,11 +572,67 @@ pub fn parse_session_v3_server_frame(
     }
 }
 
+/// Parse frames advertised by a `nopal.session/v4` endpoint.
+///
+/// V4 keeps the durable v2/v3 history contract exact and adds only ephemeral
+/// Pi-authoritative model control frames. Model state never enters replay or
+/// contributes to a durable cursor.
+pub fn parse_session_v4_server_frame(
+    line: &str,
+) -> Result<SessionV4ServerFrame, SessionContractError> {
+    let value = parse_value(line)?;
+    match value.get("kind").and_then(serde_json::Value::as_str) {
+        Some(DURABLE_SESSION_EVENT_KIND) => {
+            parse_durable_session_event_value(value).map(SessionV4ServerFrame::Event)
+        }
+        Some(DURABLE_SESSION_ACTIVITY_EVENT_KIND) => {
+            parse_session_activity_event_value(value).map(SessionV4ServerFrame::ActivityEvent)
+        }
+        Some(SESSION_REPLAY_COMPLETE_KIND) => {
+            parse_session_replay_complete_value(value).map(SessionV4ServerFrame::ReplayComplete)
+        }
+        Some(SESSION_FEED_ERROR_KIND) => {
+            parse_session_feed_error_value(value).map(SessionV4ServerFrame::FeedError)
+        }
+        Some(SESSION_MODEL_STATE_KIND) => {
+            parse_session_model_state_value(value).map(SessionV4ServerFrame::ModelState)
+        }
+        Some(SESSION_MODEL_ERROR_KIND) => {
+            parse_session_model_error_value(value).map(SessionV4ServerFrame::ModelError)
+        }
+        _ => Err(SessionContractError::Kind {
+            expected: "a v4 Session server frame kind",
+            actual: actual_kind(&value),
+        }),
+    }
+}
+
 pub fn validate_command_context(
     command: &SessionCommand,
     expected: &ExpectedSessionContext,
 ) -> Result<(), SessionContractError> {
     validate_context(&command.plot_id, &command.session_id, expected)
+}
+
+pub fn validate_model_request_context(
+    request: &SessionModelRequest,
+    expected: &ExpectedSessionContext,
+) -> Result<(), SessionContractError> {
+    validate_context(&request.plot_id, &request.session_id, expected)
+}
+
+pub fn validate_model_state_context(
+    state: &SessionModelState,
+    expected: &ExpectedSessionContext,
+) -> Result<(), SessionContractError> {
+    validate_context(&state.plot_id, &state.session_id, expected)
+}
+
+pub fn validate_model_error_context(
+    error: &SessionModelError,
+    expected: &ExpectedSessionContext,
+) -> Result<(), SessionContractError> {
+    validate_context(&error.plot_id, &error.session_id, expected)
 }
 
 pub fn validate_event_context(
@@ -615,6 +788,83 @@ fn parse_session_feed_error_value(
     Ok(error)
 }
 
+fn parse_session_model_state_value(
+    value: serde_json::Value,
+) -> Result<SessionModelState, SessionContractError> {
+    validate_kind(&value, SESSION_MODEL_STATE_KIND)?;
+    for field in ["request_id", "current"] {
+        require_field(&value, field)?;
+    }
+    let state: SessionModelState = serde_json::from_value(value)
+        .map_err(|error| SessionContractError::Json(error.to_string()))?;
+    validate_identity("plot_id", &state.plot_id)?;
+    validate_identity("session_id", &state.session_id)?;
+    validate_identity("state_epoch", &state.state_epoch)?;
+    if let Some(request_id) = &state.request_id {
+        validate_identity("request_id", request_id)?;
+    }
+    if state.revision == 0 {
+        return Err(SessionContractError::Sequence { actual: 0 });
+    }
+    if state.available.len() > MAX_SESSION_MODELS {
+        return Err(SessionContractError::Message {
+            reason: "available model list exceeds 2048 entries",
+        });
+    }
+    if state.available_total < state.available.len()
+        || state.available_complete != (state.available_total == state.available.len())
+    {
+        return Err(SessionContractError::Message {
+            reason: "available model completeness metadata is inconsistent",
+        });
+    }
+    if let Some(current) = &state.current {
+        validate_model_descriptor(current)?;
+    }
+    for model in &state.available {
+        validate_model_descriptor(model)?;
+    }
+    let mut identities = std::collections::BTreeSet::new();
+    if state
+        .available
+        .iter()
+        .any(|model| !identities.insert((&model.provider, &model.id)))
+    {
+        return Err(SessionContractError::Message {
+            reason: "available model identities are not unique",
+        });
+    }
+    Ok(state)
+}
+
+fn parse_session_model_error_value(
+    value: serde_json::Value,
+) -> Result<SessionModelError, SessionContractError> {
+    validate_kind(&value, SESSION_MODEL_ERROR_KIND)?;
+    let error: SessionModelError = serde_json::from_value(value)
+        .map_err(|decode| SessionContractError::Json(decode.to_string()))?;
+    validate_identity("request_id", &error.request_id)?;
+    validate_identity("plot_id", &error.plot_id)?;
+    validate_identity("session_id", &error.session_id)?;
+    if error.message.trim().is_empty() || error.message.len() > MAX_FEED_ERROR_MESSAGE_BYTES {
+        return Err(SessionContractError::Message {
+            reason: "model error message is empty or exceeds 4096 bytes",
+        });
+    }
+    Ok(error)
+}
+
+fn validate_model_reference(model: &SessionModelReference) -> Result<(), SessionContractError> {
+    validate_identity("model.provider", &model.provider)?;
+    validate_identity("model.id", &model.id)
+}
+
+fn validate_model_descriptor(model: &SessionModelDescriptor) -> Result<(), SessionContractError> {
+    validate_identity("model.provider", &model.provider)?;
+    validate_identity("model.id", &model.id)?;
+    validate_identity("model.name", &model.name)
+}
+
 const fn default_replay_page_limit() -> u32 {
     DEFAULT_REPLAY_PAGE_LIMIT
 }
@@ -702,12 +952,14 @@ mod tests {
 
     use super::{
         DEFAULT_REPLAY_PAGE_LIMIT, ExpectedSessionContext, MAX_REPLAY_PAGE_LIMIT,
-        MAX_SESSION_IDENTITY_BYTES, MAX_SESSION_LINE_BYTES, SessionCommandPayload,
-        SessionContractError, SessionEventPayload, SessionFeedErrorCode, SessionServerFrame,
-        SessionV3ServerFrame, parse_durable_session_event, parse_session_command,
+        MAX_SESSION_IDENTITY_BYTES, MAX_SESSION_LINE_BYTES, MAX_SESSION_MODELS,
+        SessionCommandPayload, SessionContractError, SessionEventPayload, SessionFeedErrorCode,
+        SessionServerFrame, SessionV3ServerFrame, SessionV4ServerFrame,
+        parse_durable_session_event, parse_model_request, parse_session_command,
         parse_session_event, parse_session_server_frame, parse_session_subscribe,
-        parse_session_v3_server_frame, validate_command_context, validate_durable_event_context,
-        validate_event_context, validate_session_activity_event_context,
+        parse_session_v3_server_frame, parse_session_v4_server_frame, validate_command_context,
+        validate_durable_event_context, validate_event_context,
+        validate_session_activity_event_context,
     };
 
     const PLOT_ID: &str = "plot-01";
@@ -1340,6 +1592,62 @@ mod tests {
         assert!(matches!(
             parse_session_server_frame(r#"{"kind":"a durable Session server frame kind"}"#),
             Err(SessionContractError::Kind { .. })
+        ));
+    }
+
+    #[test]
+    fn v4_model_control_frames_preserve_exact_identity_and_authoritative_state() {
+        let lines = include_str!("../../../conformance/surface/session/model-control-v1.jsonl")
+            .lines()
+            .collect::<Vec<_>>();
+        let refresh = parse_model_request(lines[0]).expect("valid refresh request");
+        assert_eq!(refresh.request_id, "model-refresh-01");
+        let switch = parse_model_request(lines[1]).expect("valid switch request");
+        assert_eq!(switch.request_id, "model-switch-01");
+
+        let state_line = lines[2];
+        let SessionV4ServerFrame::ModelState(state) =
+            parse_session_v4_server_frame(state_line).expect("valid model state")
+        else {
+            panic!("expected model state");
+        };
+        assert_eq!(state.current.expect("current model").id, "deterministic-b");
+        assert_eq!(state.available.len(), 2);
+        assert!(state.available_complete);
+        assert_eq!(state.available_total, 2);
+        assert!(matches!(
+            parse_session_v3_server_frame(state_line),
+            Err(SessionContractError::Kind { .. })
+        ));
+        assert!(matches!(
+            parse_session_v4_server_frame(lines[3]),
+            Ok(SessionV4ServerFrame::ModelError(_))
+        ));
+
+        let mut incomplete = serde_json::from_str::<serde_json::Value>(state_line).unwrap();
+        incomplete["available_complete"] = serde_json::json!(false);
+        assert!(matches!(
+            parse_session_v4_server_frame(&incomplete.to_string()),
+            Err(SessionContractError::Message { .. })
+        ));
+
+        let mut oversized = serde_json::from_str::<serde_json::Value>(state_line).unwrap();
+        oversized["available"] = serde_json::Value::Array(
+            (0..=MAX_SESSION_MODELS)
+                .map(|index| {
+                    serde_json::json!({
+                        "provider": "nopal-proof",
+                        "id": format!("model-{index}"),
+                        "name": format!("Model {index}")
+                    })
+                })
+                .collect(),
+        );
+        oversized["available_complete"] = serde_json::json!(true);
+        oversized["available_total"] = serde_json::json!(MAX_SESSION_MODELS + 1);
+        assert!(matches!(
+            parse_session_v4_server_frame(&oversized.to_string()),
+            Err(SessionContractError::Message { .. })
         ));
     }
 

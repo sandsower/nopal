@@ -88,6 +88,8 @@ const FIFO_SECOND_PROMPT: &str = "FIFO second while first is active";
 const FIFO_FIRST_RESPONSE: &str = "Nopal deterministic assistant: slow FIFO first";
 const FIFO_SECOND_RESPONSE: &str =
     "Nopal deterministic assistant: FIFO second while first is active";
+const MODEL_SWITCH_PROMPT: &str = "model switch proof";
+const MODEL_SWITCH_RESPONSE: &str = "Nopal deterministic model: deterministic-b";
 const POST_RESTART_PROMPT: &str = "structured proof after Pi restart";
 const POST_RESTART_COMMAND: &str = "command-real-pi-retry-0001";
 const TERMINAL_FAKE_EVENT: &str =
@@ -119,8 +121,10 @@ fn real_pi_tui_shares_one_session_between_structured_output_and_terminal() {
         "missing deterministic provider"
     );
     assert!(
-        repo.join("node_modules/@earendil-works/pi-ai").is_dir(),
-        "run npm ci before this proof so the deterministic provider can load its local event-stream helper"
+        provider_extension
+            .ancestors()
+            .any(|ancestor| ancestor.join("node_modules/@earendil-works/pi-ai").is_dir()),
+        "run npm ci in this checkout or an ancestor before the deterministic provider proof"
     );
 
     // macOS Unix sockets have a short sockaddr_un path limit. Keep the whole
@@ -296,6 +300,29 @@ fn real_pi_tui_shares_one_session_between_structured_output_and_terminal() {
     wait_for_replay_live(&mut runtime);
     assert_eq!(runtime.status(), &RuntimeStatus::Ready);
     wait_for_ready(&mut runtime);
+
+    wait_for_model_choices(&mut runtime, "deterministic", "deterministic-b");
+    let target = runtime
+        .model_state()
+        .and_then(|state| {
+            state
+                .available
+                .iter()
+                .find(|model| model.provider == "nopal-proof" && model.id == "deterministic-b")
+        })
+        .cloned()
+        .expect("real Pi must report the second deterministic model");
+    runtime
+        .switch_model(&target)
+        .expect("desktop runtime must send the exact Pi model switch");
+    wait_for_model_switch(&mut runtime, "nopal-proof", "deterministic-b");
+    let model_command = submitted_command(&mut runtime, MODEL_SWITCH_PROMPT);
+    wait_for_runtime_assistants(
+        &mut runtime,
+        &model_command,
+        MODEL_SWITCH_PROMPT,
+        &[MODEL_SWITCH_RESPONSE],
+    );
 
     let structured_command = submitted_command(&mut runtime, "structured proof");
     wait_for_runtime_pair(&mut runtime, Some(&structured_command), "structured proof");
@@ -1314,6 +1341,56 @@ fn wait_for_replay_live(runtime: &mut LiveSessionRuntime) {
     );
 }
 
+fn wait_for_model_choices(runtime: &mut LiveSessionRuntime, current: &str, available: &str) {
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        let outcome = runtime.drain();
+        assert!(
+            outcome.errors.is_empty(),
+            "model discovery failed: {:?}",
+            outcome.errors
+        );
+        if runtime.model_state().is_some_and(|state| {
+            state
+                .current
+                .as_ref()
+                .is_some_and(|model| model.id == current)
+                && state.available.iter().any(|model| model.id == available)
+        }) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("real Pi did not report both deterministic model choices");
+}
+
+fn wait_for_model_switch(runtime: &mut LiveSessionRuntime, provider: &str, model_id: &str) {
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        let outcome = runtime.drain();
+        assert!(
+            outcome.errors.is_empty(),
+            "model switch failed: {:?}",
+            outcome.errors
+        );
+        if !runtime.model_switch_pending()
+            && runtime.model_state().is_some_and(|state| {
+                state
+                    .current
+                    .as_ref()
+                    .is_some_and(|model| model.provider == provider && model.id == model_id)
+            })
+        {
+            return;
+        }
+        if let Some(error) = runtime.model_error() {
+            panic!("real Pi rejected the model switch: {error}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("real Pi did not confirm the requested model switch");
+}
+
 fn wait_for_reconnect_cycle(runtime: &mut LiveSessionRuntime) {
     let deadline = Instant::now() + TIMEOUT;
     let mut reconnect_seen = false;
@@ -1669,7 +1746,7 @@ fn feed_context(socket: &Path, plot_id: &str, session_id: &str) -> SessionFeedCo
     SessionFeedContext {
         plot_id: plot_id.to_owned(),
         session_id: session_id.to_owned(),
-        endpoint_kind: "nopal.session/v3".to_owned(),
+        endpoint_kind: "nopal.session/v4".to_owned(),
         endpoint_address: must_some(socket.to_str(), "UTF-8 Session socket").to_owned(),
     }
 }
@@ -1724,6 +1801,8 @@ fn subscribe_and_read(
             }
             Some(SessionFeedServerFrame::FeedError(error)) => {
                 panic!("direct production Session replay failed: {error:?}")
+            }
+            Some(SessionFeedServerFrame::ModelState(_) | SessionFeedServerFrame::ModelError(_)) => {
             }
             None => std::thread::sleep(Duration::from_millis(10)),
         }
