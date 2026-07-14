@@ -106,7 +106,7 @@ jobs:
           key: release-${{ matrix.target }}
           save-if: false
       - name: Set up pinned Rondo build tools
-        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        uses: jdx/mise-action@e6a8b3978addb5a52f2b4cd9d91eafa7f0ab959d # v4.2.0
         with:
           install: true
           cache: true
