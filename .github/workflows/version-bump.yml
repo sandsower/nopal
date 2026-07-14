@@ -23,6 +23,7 @@ jobs:
       actions: write
       contents: write
       pull-requests: write
+      statuses: write
     outputs:
       mode: ${{ steps.state.outputs.mode }}
       tag: ${{ steps.tag.outputs.tag }}
@@ -135,7 +136,42 @@ jobs:
               --body "$body"
           fi
 
-          gh workflow run ci.yml --ref "$RELEASE_BRANCH"
+          ci_url=$(gh workflow run ci.yml --ref "$RELEASE_BRANCH")
+          ci_id=${ci_url##*/}
+          case "$ci_id" in
+            ''|*[!0-9]*)
+              echo "CI dispatch did not return a workflow run URL: $ci_url" >&2
+              exit 1
+              ;;
+          esac
+
+          ci_state=failure
+          if gh run watch "$ci_id" --exit-status; then
+            ci_state=success
+          fi
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/statuses/${RELEASE_COMMIT}" \
+            -f state="$ci_state" \
+            -f context=checks \
+            -f description="Exact dispatched CI $ci_state" \
+            -f target_url="$ci_url" \
+            >/dev/null
+
+          action_required_runs=$(gh run list \
+            --workflow ci.yml \
+            --branch "$RELEASE_BRANCH" \
+            --event pull_request \
+            --limit 20 \
+            --json databaseId,headSha,conclusion \
+            --jq 'map(select(.headSha == env.RELEASE_COMMIT and .conclusion == "action_required")) | .[].databaseId')
+          for run_id in $action_required_runs; do
+            gh run delete "$run_id"
+          done
+
+          if [ "$ci_state" != success ]; then
+            exit 1
+          fi
           gh pr merge "$pr_number" \
             --auto \
             --squash \
