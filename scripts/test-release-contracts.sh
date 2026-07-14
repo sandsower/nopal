@@ -57,6 +57,8 @@ grep -Fq 'git switch --force-create "$RELEASE_BRANCH" origin/main' \
   || fail "the next version branch is not refreshed from current main"
 grep -Fq 'gh workflow run ci.yml --ref "$RELEASE_BRANCH"' "$version_workflow" \
   || fail "automated version pull requests do not dispatch CI explicitly"
+grep -Fq 'gh auth setup-git' "$version_workflow" \
+  || fail "credential-free checkout is not reauthenticated before protected writes"
 grep -Fq -- '--match-head-commit "$RELEASE_COMMIT"' "$version_workflow" \
   || fail "automated version pull requests can auto-merge a stale head"
 if grep -Fq 'git push origin main' "$version_workflow"; then

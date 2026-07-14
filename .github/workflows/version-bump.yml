@@ -36,7 +36,10 @@ jobs:
         with:
           toolchain: "1.95.0"
       - name: Configure release Git identity
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          gh auth setup-git
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
       - name: Classify the latest main commit
@@ -83,6 +86,7 @@ jobs:
         if: steps.state.outputs.mode == 'bump'
         id: bump
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_BRANCH: automation/version-bump
         run: |
           . scripts/release-version.sh
@@ -139,6 +143,8 @@ jobs:
       - name: Tag the protected release commit
         if: steps.state.outputs.mode == 'release'
         id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           . scripts/release-version.sh
           version=$(release_workspace_version Cargo.toml)
