@@ -9,7 +9,9 @@ use nopal_field_presentation::composer::{
     ComposerAuthority, ComposerIntent, ComposerTarget, SubmissionResolution,
 };
 use nopal_field_presentation::coordinator::SessionActivationOutcome;
+use nopal_field_presentation::model_picker::ModelPickerAuthority;
 use nopal_field_presentation::view_state::{LiveSessionState, WorkspaceSubject};
+use nopal_native_lifecycle::model_preferences::{ModelRecentsStore, ModelRecentsWriteOutcome};
 use nopal_native_lifecycle::reconcile::ExactSessionSelection;
 
 use crate::eframe_host::{EframeAppSeed, EframeUiBridge, session_runtime};
@@ -73,11 +75,19 @@ pub struct FieldShell {
     runtime_diagnostics: VecDeque<String>,
     outgoing: Vec<ComposerIntent>,
     terminal_input: String,
+    model_picker: ModelPickerAuthority,
+    model_recents_store: Option<ModelRecentsStore>,
     quit_requested: bool,
 }
 
 impl FieldShell {
     pub fn new(seed: EframeAppSeed) -> Self {
+        let model_target = seed
+            .coordinator
+            .view()
+            .live_session()
+            .map(LiveSessionState::selection)
+            .cloned();
         Self {
             coordinator: seed.coordinator,
             composer: seed.composer,
@@ -86,6 +96,8 @@ impl FieldShell {
             runtime_diagnostics: VecDeque::new(),
             outgoing: Vec::new(),
             terminal_input: String::new(),
+            model_picker: ModelPickerAuthority::new(model_target, seed.recent_models),
+            model_recents_store: seed.model_recents_store,
             quit_requested: false,
         }
     }
@@ -398,6 +410,22 @@ impl FieldShell {
             return;
         };
         let outcome = runtime.drain();
+        if let Some(model) = runtime.take_confirmed_model_switch() {
+            self.model_picker.record_confirmed(&model);
+            if let Some(store) = &self.model_recents_store {
+                match store.write(self.model_picker.recent()) {
+                    Ok(ModelRecentsWriteOutcome::Written) => {}
+                    Ok(ModelRecentsWriteOutcome::PreservedExisting(outcome)) => {
+                        self.runtime_diagnostics.push_back(format!(
+                            "Recent model ordering was not saved because the existing preference was preserved: {outcome:?}"
+                        ));
+                    }
+                    Err(error) => self
+                        .runtime_diagnostics
+                        .push_back(format!("Recent model ordering could not be saved: {error}")),
+                }
+            }
+        }
         for error in outcome.errors {
             if self.runtime_diagnostics.back() != Some(&error) {
                 self.runtime_diagnostics.push_back(error);
@@ -491,6 +519,7 @@ impl FieldShell {
     }
 
     fn session_stage(&mut self, ui: &mut egui::Ui, selection: &ExactSessionSelection) {
+        self.model_picker.retarget(Some(selection.clone()));
         let presentation = self
             .runtime
             .as_ref()
@@ -504,6 +533,21 @@ impl FieldShell {
             .unwrap_or_else(|| RuntimeStatus::Unavailable {
                 reason: "Session bindings are unavailable".to_owned(),
             });
+        let model_state = self
+            .runtime
+            .as_ref()
+            .and_then(LiveSessionRuntime::model_state)
+            .cloned();
+        let can_switch_model = self
+            .runtime
+            .as_ref()
+            .is_some_and(LiveSessionRuntime::can_switch_model);
+        let model_pending = self
+            .runtime
+            .as_ref()
+            .is_some_and(LiveSessionRuntime::model_switch_pending);
+        let mut selected_model = None;
+        let mut refresh_models = false;
         ui.horizontal(|ui| {
             ui.heading(
                 egui::RichText::new(format!("Session {}", selection.session_id())).color(TEXT),
@@ -516,6 +560,55 @@ impl FieldShell {
                     presentation == RuntimePresentation::Output,
                     "Structured output",
                 );
+                let model_label = if model_pending {
+                    "Switching model...".to_owned()
+                } else {
+                    model_state
+                        .as_ref()
+                        .and_then(|state| state.current.as_ref())
+                        .map(|model| model.name.clone())
+                        .unwrap_or_else(|| "Model unavailable".to_owned())
+                };
+                let picker = ui.add_enabled_ui(model_state.is_some(), |ui| {
+                    egui::ComboBox::from_id_salt("session-model-picker")
+                        .selected_text(model_label)
+                        .show_ui(ui, |ui| {
+                            let mut query = self.model_picker.query().to_owned();
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut query)
+                                        .hint_text("Filter models")
+                                        .desired_width(280.0),
+                                )
+                                .changed()
+                            {
+                                self.model_picker.set_query(query);
+                            }
+                            ui.separator();
+                            if let Some(state) = &model_state {
+                                for model in self.model_picker.visible(&state.available) {
+                                    let active = state.current.as_ref().is_some_and(|current| {
+                                        current.provider == model.provider && current.id == model.id
+                                    });
+                                    let label = format!(
+                                        "{}  {} / {}",
+                                        model.name, model.provider, model.id
+                                    );
+                                    if ui
+                                        .add_enabled(
+                                            can_switch_model && !active,
+                                            egui::Button::new(label).selected(active),
+                                        )
+                                        .clicked()
+                                    {
+                                        selected_model = Some(model);
+                                        ui.close();
+                                    }
+                                }
+                            }
+                        })
+                });
+                refresh_models = picker.inner.response.clicked();
                 if terminal.clicked()
                     && let Some(runtime) = self.runtime.as_mut()
                 {
@@ -528,11 +621,34 @@ impl FieldShell {
                 }
             });
         });
+        if refresh_models
+            && let Some(runtime) = self.runtime.as_mut()
+            && let Err(error) = runtime.refresh_models()
+        {
+            self.runtime_diagnostics.push_back(error);
+        }
+        if let Some(model) = selected_model
+            && let Some(runtime) = self.runtime.as_mut()
+            && let Err(error) = runtime.switch_model(&model)
+        {
+            self.runtime_diagnostics.push_back(error);
+        }
         ui.label(
             egui::RichText::new(runtime_status_label(&status))
                 .color(runtime_status_color(&status))
                 .size(12.0),
         );
+        if let Some(error) = self
+            .runtime
+            .as_ref()
+            .and_then(LiveSessionRuntime::model_error)
+        {
+            ui.label(
+                egui::RichText::new(format!("Model switch: {error}"))
+                    .color(egui::Color32::from_rgb(235, 141, 141))
+                    .size(12.0),
+            );
+        }
         if matches!(
             status,
             RuntimeStatus::TerminalOnly { .. }
@@ -922,6 +1038,8 @@ mod tests {
             composer: ComposerAuthority::new(ComposerTarget::new("plot-a", "session-a").ok()),
             runtime,
             startup_diagnostics: Vec::new(),
+            recent_models: Vec::new(),
+            model_recents_store: None,
         });
         assert!(
             !shell.composer_submission_enabled(),

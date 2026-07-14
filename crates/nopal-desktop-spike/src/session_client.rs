@@ -5,9 +5,11 @@ use std::io::{self, Read, Write};
 
 use nopal_feed_client::session::{
     ExpectedSessionContext, MAX_SESSION_LINE_BYTES, SessionServerFrame, SessionV3ServerFrame,
-    parse_session_command, parse_session_server_frame, parse_session_subscribe,
-    parse_session_v3_server_frame, validate_command_context, validate_durable_event_context,
-    validate_replay_complete_context, validate_session_activity_event_context,
+    SessionV4ServerFrame, parse_model_request, parse_session_command, parse_session_server_frame,
+    parse_session_subscribe, parse_session_v3_server_frame, parse_session_v4_server_frame,
+    validate_command_context, validate_durable_event_context, validate_model_error_context,
+    validate_model_request_context, validate_model_state_context, validate_replay_complete_context,
+    validate_session_activity_event_context,
 };
 
 use crate::session_feed::{
@@ -86,6 +88,11 @@ impl ProductionFeedConnection {
                     expected.clone(),
                 ))
             }
+            SessionEndpointVersion::V4 => {
+                ProductionFrameDecoder::V4(SessionFrameDecoder::<SessionV4ServerFrame>::new(
+                    expected.clone(),
+                ))
+            }
         };
         Ok(Self {
             stream,
@@ -117,6 +124,16 @@ impl ProductionFeedConnection {
                 let validated = parse_session_command(&encoded)
                     .map_err(|error| FeedError::protocol(error.to_string()))?;
                 validate_command_context(&validated, &self.expected)
+                    .map_err(|error| FeedError::protocol(error.to_string()))?;
+                encoded
+            }
+            ClientFeedFrame::Model(request) => {
+                let encoded = serde_json::to_string(&request).map_err(|error| {
+                    FeedError::protocol(format!("cannot encode Session model request: {error}"))
+                })?;
+                let validated = parse_model_request(&encoded)
+                    .map_err(|error| FeedError::protocol(error.to_string()))?;
+                validate_model_request_context(&validated, &self.expected)
                     .map_err(|error| FeedError::protocol(error.to_string()))?;
                 encoded
             }
@@ -414,6 +431,16 @@ impl StrictServerFrame for SessionV3ServerFrame {
     }
 }
 
+impl StrictServerFrame for SessionV4ServerFrame {
+    fn parse(line: &str) -> Result<Self, FeedError> {
+        parse_session_v4_server_frame(line).map_err(|error| FeedError::protocol(error.to_string()))
+    }
+
+    fn validate_context(&self, expected: &ExpectedSessionContext) -> Result<(), FeedError> {
+        validate_v4_server_frame_context(self, expected)
+    }
+}
+
 struct SessionFrameDecoder<F> {
     expected: ExpectedSessionContext,
     line: Vec<u8>,
@@ -497,6 +524,7 @@ where
 enum ProductionFrameDecoder {
     V2(SessionFrameDecoder<SessionServerFrame>),
     V3(SessionFrameDecoder<SessionV3ServerFrame>),
+    V4(SessionFrameDecoder<SessionV4ServerFrame>),
 }
 
 impl ProductionFrameDecoder {
@@ -512,6 +540,11 @@ impl ProductionFrameDecoder {
                 .into_iter()
                 .map(|frame| frame.map(SessionFeedServerFrame::from))
                 .collect(),
+            Self::V4(decoder) => decoder
+                .push(chunk)
+                .into_iter()
+                .map(|frame| frame.map(SessionFeedServerFrame::from))
+                .collect(),
         }
     }
 
@@ -519,6 +552,7 @@ impl ProductionFrameDecoder {
         match self {
             Self::V2(decoder) => decoder.finish(),
             Self::V3(decoder) => decoder.finish(),
+            Self::V4(decoder) => decoder.finish(),
         }
     }
 }
@@ -570,6 +604,37 @@ fn validate_v3_server_frame_context(
                 "Session feed error has partial Plot/Session context",
             )),
         },
+    }
+}
+
+fn validate_v4_server_frame_context(
+    frame: &SessionV4ServerFrame,
+    expected: &ExpectedSessionContext,
+) -> Result<(), FeedError> {
+    match frame {
+        SessionV4ServerFrame::Event(event) => validate_durable_event_context(event, expected)
+            .map_err(|error| FeedError::protocol(error.to_string())),
+        SessionV4ServerFrame::ActivityEvent(event) => {
+            validate_session_activity_event_context(event, expected)
+                .map_err(|error| FeedError::protocol(error.to_string()))
+        }
+        SessionV4ServerFrame::ReplayComplete(complete) => {
+            validate_replay_complete_context(complete, expected)
+                .map_err(|error| FeedError::protocol(error.to_string()))
+        }
+        SessionV4ServerFrame::FeedError(error) => match (&error.plot_id, &error.session_id) {
+            (Some(plot_id), Some(session_id)) => {
+                validate_feed_context(plot_id, session_id, expected)
+            }
+            (None, None) => Ok(()),
+            _ => Err(FeedError::protocol(
+                "Session feed error has partial Plot/Session context",
+            )),
+        },
+        SessionV4ServerFrame::ModelState(state) => validate_model_state_context(state, expected)
+            .map_err(|error| FeedError::protocol(error.to_string())),
+        SessionV4ServerFrame::ModelError(error) => validate_model_error_context(error, expected)
+            .map_err(|contract| FeedError::protocol(contract.to_string())),
     }
 }
 
@@ -663,7 +728,7 @@ mod tests {
         DURABLE_SESSION_EVENT_KIND, ExpectedSessionContext, MAX_SESSION_LINE_BYTES,
         SESSION_COMMAND_KIND, SESSION_FEED_ERROR_KIND, SESSION_REPLAY_COMPLETE_KIND,
         SESSION_SUBSCRIBE_KIND, SessionCommand, SessionCommandPayload, SessionSubscribe,
-        parse_session_command, parse_session_subscribe,
+        parse_model_request, parse_session_command, parse_session_subscribe,
     };
     use nopal_feed_client::session_activity::DURABLE_SESSION_ACTIVITY_EVENT_KIND;
 
@@ -912,6 +977,67 @@ mod tests {
         let error = foreign.try_receive().unwrap_err();
         assert_eq!(error.kind, FeedErrorKind::Protocol);
         assert!(error.message.contains("expected Plot/Session"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v4_connection_decodes_model_state_and_serializes_exact_switch_request() {
+        use std::os::unix::net::UnixStream;
+
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        let mut connection = ProductionFeedConnection::from_unix_stream_for_version(
+            stream,
+            expected(),
+            SessionEndpointVersion::V4,
+        )
+        .unwrap();
+        let state = serde_json::json!({
+            "kind": "nopal.session.model.state/v1",
+            "plot_id": PLOT_ID,
+            "session_id": SESSION_ID,
+            "request_id": null,
+            "state_epoch": "epoch-1",
+            "revision": 1,
+            "agent_state": "idle",
+            "current": {"provider": "nopal-proof", "id": "a", "name": "A"},
+            "available": [
+                {"provider": "nopal-proof", "id": "a", "name": "A"},
+                {"provider": "nopal-proof", "id": "b", "name": "B"}
+            ]
+        });
+        peer.write_all(format!("{state}\n").as_bytes()).unwrap();
+        assert!(matches!(
+            connection.try_receive().unwrap(),
+            Some(SessionFeedServerFrame::ModelState(state))
+                if state.current.as_ref().is_some_and(|model| model.id == "a")
+        ));
+
+        connection
+            .send(ClientFeedFrame::Model(
+                nopal_feed_client::session::SessionModelRequest {
+                    kind: nopal_feed_client::session::SESSION_MODEL_REQUEST_KIND.to_owned(),
+                    request_id: "switch-1".to_owned(),
+                    plot_id: PLOT_ID.to_owned(),
+                    session_id: SESSION_ID.to_owned(),
+                    request: nopal_feed_client::session::SessionModelRequestPayload::Switch {
+                        model: nopal_feed_client::session::SessionModelReference {
+                            provider: "nopal-proof".to_owned(),
+                            id: "b".to_owned(),
+                            extra: BTreeMap::new(),
+                        },
+                        extra: BTreeMap::new(),
+                    },
+                    extra: BTreeMap::new(),
+                },
+            ))
+            .unwrap();
+        let mut bytes = vec![0; 4096];
+        let count = peer.read(&mut bytes).unwrap();
+        let request = parse_model_request(
+            std::str::from_utf8(&bytes[..count - 1]).expect("UTF-8 model request"),
+        )
+        .expect("valid model switch request");
+        assert_eq!(request.request_id, "switch-1");
     }
 
     #[cfg(unix)]

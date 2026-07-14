@@ -59,7 +59,9 @@ mod unix {
         } else {
             core
         };
-        let host_factory = EframeHostFactory::default();
+        let host_factory = EframeHostFactory::with_model_recents(
+            scope.state_paths().model_recents().to_path_buf(),
+        );
         let bridge = host_factory.bridge();
         let mut product = NativeFieldProduct::new(
             scope,
