@@ -50,7 +50,7 @@ jobs:
         run: cargo fetch --locked
       - name: Generate third-party license report
         run: cargo about generate --workspace --locked --offline --fail about.hbs -o THIRD_PARTY_LICENSES.html
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nopal-third-party-licenses
           path: THIRD_PARTY_LICENSES.html
@@ -123,7 +123,7 @@ jobs:
           name: nopal-third-party-licenses
       - name: Package release archive
         run: sh scripts/package-release.sh "${{ matrix.target }}" "$RELEASE_TAG"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nopal-${{ matrix.target }}
           path: dist/*.tar.gz
