@@ -2533,7 +2533,7 @@ dependencies = [
 name = "nopal-core"
 version = "0.2.10"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "globset",
  "jsonc-parser",
  "nopal-ledger-json",
@@ -2614,7 +2614,7 @@ name = "nopal-native-lifecycle"
 version = "0.2.10"
 dependencies = [
  "fs2",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "libc",
  "nopal-feed-client",
  "serde",
@@ -2638,7 +2638,7 @@ name = "nopal-rondo-lifecycle"
 version = "0.2.10"
 dependencies = [
  "fs2",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "nopal-rondo-client",
  "serde",
  "serde_json",
