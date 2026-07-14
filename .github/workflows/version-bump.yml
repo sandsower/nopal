@@ -25,9 +25,8 @@ jobs:
       pull-requests: write
       statuses: write
     outputs:
-      mode: ${{ steps.state.outputs.mode }}
       tag: ${{ steps.tag.outputs.tag }}
-      commit: ${{ steps.state.outputs.base_sha }}
+      commit: ${{ steps.tag.outputs.commit }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -110,6 +109,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
       - name: Open or refresh the protected version pull request
         if: steps.state.outputs.mode == 'bump'
+        id: version_pr
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_BRANCH: automation/version-bump
@@ -135,6 +135,11 @@ jobs:
               --title "chore(release): v$RELEASE_VERSION" \
               --body "$body"
           fi
+
+          gh pr merge "$pr_number" \
+            --auto \
+            --squash \
+            --match-head-commit "$RELEASE_COMMIT"
 
           ci_url=$(gh workflow run ci.yml --ref "$RELEASE_BRANCH")
           ci_id=${ci_url##*/}
@@ -172,35 +177,73 @@ jobs:
           if [ "$ci_state" != success ]; then
             exit 1
           fi
-          gh pr merge "$pr_number" \
-            --auto \
-            --squash \
-            --match-head-commit "$RELEASE_COMMIT"
+
+          release_commit=
+          for delay in 0 2 4 8 16 32; do
+            if [ "$delay" -ne 0 ]; then
+              sleep "$delay"
+            fi
+            pr_state=$(gh pr view "$pr_number" \
+              --json headRefOid,mergeCommit,state)
+            current_head=$(printf '%s\n' "$pr_state" | jq -r '.headRefOid')
+            if [ "$current_head" != "$RELEASE_COMMIT" ]; then
+              echo "release pull request head changed to $current_head" >&2
+              exit 1
+            fi
+            if [ "$(printf '%s\n' "$pr_state" | jq -r '.state')" = MERGED ]; then
+              release_commit=$(printf '%s\n' "$pr_state" | jq -r '.mergeCommit.oid')
+              break
+            fi
+          done
+          if [ -z "$release_commit" ] || [ "$release_commit" = null ]; then
+            echo "release pull request did not merge after exact CI succeeded" >&2
+            exit 1
+          fi
+          echo "release_commit=$release_commit" >> "$GITHUB_OUTPUT"
       - name: Tag the protected release commit
-        if: steps.state.outputs.mode == 'release'
         id: tag
         env:
           GH_TOKEN: ${{ github.token }}
+          MERGED_RELEASE_COMMIT: ${{ steps.version_pr.outputs.release_commit }}
+          RELEASE_MODE: ${{ steps.state.outputs.mode }}
         run: |
+          case "$RELEASE_MODE" in
+            bump) commit=$MERGED_RELEASE_COMMIT ;;
+            release) commit=${{ steps.state.outputs.base_sha }} ;;
+            *)
+              echo "unknown release mode: $RELEASE_MODE" >&2
+              exit 1
+              ;;
+          esac
+          if [ -z "$commit" ]; then
+            echo "protected release commit was not selected" >&2
+            exit 1
+          fi
+
+          git fetch --force --tags origin main
+          git checkout --detach "$commit"
           . scripts/release-version.sh
           version=$(release_workspace_version Cargo.toml)
           tag="v$version"
           release_validate_tag Cargo.toml "$tag" >/dev/null
           if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
             tagged_commit=$(git rev-parse "refs/tags/$tag^{}")
-            if [ "$tagged_commit" != "${{ steps.state.outputs.base_sha }}" ]; then
+            if [ "$tagged_commit" != "$commit" ]; then
               echo "$tag already names $tagged_commit" >&2
               exit 1
             fi
           else
-            git tag -a "$tag" -m "$tag" "${{ steps.state.outputs.base_sha }}"
+            git tag -a "$tag" -m "$tag" "$commit"
             git push origin "refs/tags/$tag"
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$tag"
+            echo "commit=$commit"
+          } >> "$GITHUB_OUTPUT"
 
   release:
     needs: coordinate
-    if: needs.coordinate.outputs.mode == 'release'
+    if: needs.coordinate.outputs.tag != ''
     permissions:
       contents: write
     uses: ./.github/workflows/release.yml

@@ -72,6 +72,15 @@ grep -Fq 'gh run delete "$run_id"' "$version_workflow" \
   || fail "release coordinator does not remove the exact inert bot PR run"
 grep -Fq -- '--match-head-commit "$RELEASE_COMMIT"' "$version_workflow" \
   || fail "automated version pull requests can auto-merge a stale head"
+grep -Fq 'release_commit=$(printf' "$version_workflow" \
+  || fail "release coordinator does not capture the protected merge commit"
+grep -Fq 'echo "release_commit=$release_commit" >> "$GITHUB_OUTPUT"' \
+  "$version_workflow" \
+  || fail "release coordinator does not expose the protected merge commit"
+grep -Fq 'bump) commit=$MERGED_RELEASE_COMMIT ;;' "$version_workflow" \
+  || fail "release tagging does not continue from the protected merge"
+grep -Fq "if: needs.coordinate.outputs.tag != ''" "$version_workflow" \
+  || fail "artifact publication does not continue in the coordinating workflow"
 if grep -Fq 'git push origin main' "$version_workflow"; then
   fail "version workflow still pushes directly to main"
 fi
