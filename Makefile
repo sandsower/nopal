@@ -6,6 +6,7 @@ HOST_OS := $(shell uname -s)
 APP_VERSION := $(shell sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml)
 CARGO_TARGET_DIR := $(CURDIR)/target
 RELEASE_DIR := $(CARGO_TARGET_DIR)/release
+INSTALL_DIR ?= /Applications
 
 ifeq ($(HOST_OS),Darwin)
 HOST_APP_TARGET := macos
@@ -15,7 +16,7 @@ else
 HOST_APP_TARGET := unsupported-host
 endif
 
-.PHONY: app macos linux unsupported-host clean-app help
+.PHONY: app macos linux install reinstall unsupported-host clean-app help
 
 app: $(HOST_APP_TARGET)
 
@@ -83,6 +84,12 @@ linux:
 	trap - EXIT HUP INT TERM; \
 	printf 'Built %s/Nopal-linux/nopal-field-native\n' "$(CURDIR)"
 
+install: macos
+	./scripts/install-macos-app.sh install "$(CURDIR)/Nopal.app" "$(INSTALL_DIR)"
+
+reinstall: macos
+	./scripts/install-macos-app.sh reinstall "$(CURDIR)/Nopal.app" "$(INSTALL_DIR)"
+
 unsupported-host:
 	@echo "unsupported host OS: $(HOST_OS)" >&2
 	@exit 2
@@ -95,4 +102,6 @@ help:
 		'make           Build the desktop app for this host OS' \
 		'make macos     Build ./Nopal.app on macOS' \
 		'make linux     Build ./Nopal-linux/nopal-field-native on Linux' \
+		'make install   Build and safely install /Applications/Nopal.app' \
+		'make reinstall Quit, install, and relaunch /Applications/Nopal.app' \
 		'make clean-app Remove generated desktop app bundles'
