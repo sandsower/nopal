@@ -1,0 +1,18 @@
+{
+  "pr_reviews": {
+    "source": {
+      "summary_command": "gh pr view --json url,number,reviewDecision,reviews,comments",
+      "threads_command": "gh api repos/{owner}/{repo}/pulls/{number}/comments",
+      "type": "cli"
+    },
+    "update": {
+      "reply_command": "gh api repos/{owner}/{repo}/pulls/{number}/comments --method POST --input {json_file}",
+      "rerequest_command": "gh api repos/{owner}/{repo}/pulls/{number}/requested_reviewers --method POST --input {json_file}",
+      "type": "cli"
+    }
+  },
+  "probe_cache": {
+    "ttl_hours": 24
+  },
+  "version": "nopal.integrations/v1"
+}

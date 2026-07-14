@@ -1,0 +1,25 @@
+[package]
+name = "nopal-core"
+description = "Deterministic core for Nopal: config discovery, profile/module validation, diagnostics, TOON output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Ledger payloads need byte-faithful Python numeric text; keep that parser
+# isolated from normal config/policy serde_json::Value users.
+nopal-ledger-json = { path = "../nopal-ledger-json" }
+jsonc-parser = { workspace = true }
+globset = { workspace = true }
+regex = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

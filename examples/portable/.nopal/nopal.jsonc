@@ -1,0 +1,6 @@
+{
+  // The portable profile: deterministic gates + action policy, no host coupling.
+  "version": "nopal.project/v1",
+  "project": { "name": "portable-example" },
+  "profile": "portable"
+}

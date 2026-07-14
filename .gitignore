@@ -1,0 +1,9 @@
+/target
+/.nopal
+/.beislid
+/.codex
+/plans
+/WORKFLOW.md
+.DS_Store
+__pycache__/
+node_modules/

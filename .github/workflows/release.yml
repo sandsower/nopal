@@ -1,0 +1,157 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing vX.Y.Z tag to release
+        required: true
+        type: string
+      commit:
+        description: Commit named by the release tag
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  licenses:
+    name: third-party-licenses
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.95.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-licenses
+          save-if: false
+      - uses: taiki-e/install-action@43aecc8d72668fbcfe75c31400bc4f890f1c5853 # v2
+        with:
+          tool: cargo-about@0.9.1
+          fallback: none
+      - name: Fetch locked dependency sources
+        run: cargo fetch --locked
+      - name: Generate third-party license report
+        run: cargo about generate --workspace --locked --offline --fail about.hbs -o THIRD_PARTY_LICENSES.html
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nopal-third-party-licenses
+          path: THIRD_PARTY_LICENSES.html
+          if-no-files-found: error
+
+  build:
+    name: build-${{ matrix.target }}
+    needs: licenses
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - name: Checkout pinned Rondo runtime source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: sandsower/rondo
+          ref: 9e8e325cff50e780c1d3de166c8f4894fb562c8b
+          path: _rondo
+          persist-credentials: false
+      - name: Resolve tagged commit
+        id: source
+        env:
+          EXPECTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          commit=$(git rev-parse HEAD)
+          if [ -n "$EXPECTED_COMMIT" ] && [ "$commit" != "$EXPECTED_COMMIT" ]; then
+            echo "tag $RELEASE_TAG resolved to $commit, expected $EXPECTED_COMMIT" >&2
+            exit 1
+          fi
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.95.0"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-${{ matrix.target }}
+          save-if: false
+      - name: Set up pinned Rondo build tools
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          install: true
+          cache: true
+          working_directory: _rondo/elixir
+      - name: Build pinned Rondo runtime
+        working-directory: _rondo/elixir
+        run: mise exec -- mix deps.get && mise exec -- mix escript.build
+      - name: Build release binary
+        env:
+          NOPAL_BUILD_COMMIT: ${{ steps.source.outputs.commit }}
+        run: cargo build --locked --release -p nopal-cli --target "${{ matrix.target }}"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nopal-third-party-licenses
+      - name: Package release archive
+        run: sh scripts/package-release.sh "${{ matrix.target }}" "$RELEASE_TAG"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nopal-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish-github-release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: nopal-*
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA-256 checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz > SHA256SUMS
+      - name: Create or reconcile GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: sh scripts/publish-release.sh "$RELEASE_TAG" dist

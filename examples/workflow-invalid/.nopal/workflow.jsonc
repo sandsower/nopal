@@ -1,0 +1,24 @@
+{
+  "version": "nopal.workflow/v1",
+  "lifecycle": {
+    "events": {
+      "made_up_event": {
+        "actions": [
+          { "id": "bad-event-action", "type": "artifact", "path": "plans/x.md" }
+        ]
+      },
+      "kickoff_start": {
+        "actions": [
+          { "type": "cli", "command": "echo missing id", "approval": "auto" },
+          { "id": "kickoff-artifact", "type": "artifact", "path": "plans/kickoff.md" }
+        ]
+      },
+      "blueprint_approved": {
+        "actions": [
+          { "id": "write-design", "type": "artifact", "path": "plans/a.md" },
+          { "id": "write-design", "type": "artifact", "path": "plans/b.md" }
+        ]
+      }
+    }
+  }
+}

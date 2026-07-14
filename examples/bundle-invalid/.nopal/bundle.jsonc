@@ -1,0 +1,8 @@
+{
+  // Deliberately broken: no file exists at the declared path, so
+  // bundle_report resolves it to bundle_resource_missing.
+  "version": "nopal.bundle/v1",
+  "extensions": [
+    { "source": "missing-extension", "path": "resources/does-not-exist.txt" }
+  ]
+}

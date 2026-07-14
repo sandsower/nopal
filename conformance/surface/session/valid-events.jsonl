@@ -1,0 +1,4 @@
+{"kind":"nopal.session.event/v1","event_id":"event-ready","plot_id":"plot-fixture","session_id":"session-fixture","event":{"type":"session_ready","future_capability":"structured"}}
+{"kind":"nopal.session.event/v1","event_id":"event-user","plot_id":"plot-fixture","session_id":"session-fixture","command_id":"command-fixture","event":{"type":"user_message","text":"Exercise the structured round trip"}}
+{"kind":"nopal.session.event/v1","event_id":"event-assistant","plot_id":"plot-fixture","session_id":"session-fixture","command_id":"command-fixture","event":{"type":"assistant_message","text":"Structured output is ready.","future_citation":"evidence-01"},"future_cursor":3}
+{"kind":"nopal.session.event/v1","event_id":"event-error","plot_id":"plot-fixture","session_id":"session-fixture","command_id":"command-fixture","event":{"type":"session_error","message":"Fixture failure"}}

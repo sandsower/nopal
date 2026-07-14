@@ -1,0 +1,7 @@
+{
+  "version": "nopal.guidance/v1",
+  "hints": { "skills": ["blueprint"] },
+  "gates": [ { "id": "fmt" } ],
+  "policy": { "modes": {} },
+  "progression": { "next": "implement" }
+}

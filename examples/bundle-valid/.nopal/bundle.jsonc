@@ -1,0 +1,18 @@
+{
+  // nopal.bundle/v1: paths are project-relative (resolved against --dir) or
+  // absolute after ~/${ENV} expansion. This example pins one resource of
+  // each kind to files checked into this example directory.
+  "version": "nopal.bundle/v1",
+  "extensions": [
+    { "source": "example-extension", "version": "0.1.0", "path": "resources/example-extension.txt" }
+  ],
+  "skills": [
+    { "source": "example-skill", "path": "resources/example-skill.md" }
+  ],
+  "prompt_templates": [
+    { "source": "example-prompt-template", "path": "resources/example-prompt-template.md" }
+  ],
+  "themes": [
+    { "source": "example-theme", "path": "resources/example-theme.json" }
+  ]
+}

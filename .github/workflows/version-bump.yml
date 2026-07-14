@@ -1,0 +1,80 @@
+name: version-bump
+
+# Every merge to main bumps the workspace patch version, commits, and tags
+# vX.Y.Z. Local `cargo install --path crates/nopal-cli` then replaces the
+# installed binary without --force, and the tags give the future Homebrew
+# tap release anchors. Minor/major bumps stay manual: edit
+# [workspace.package] version in a PR and this job continues from there.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+# Serialize bumps so two quick merges don't race the push; the rebase in
+# the commit step covers the window a queued run still sees a stale HEAD.
+concurrency:
+  group: version-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      commit: ${{ steps.release.outputs.commit }}
+    # GITHUB_TOKEN pushes never retrigger workflows, so the bump commit
+    # cannot loop; this guard only protects manual re-runs on a bump commit.
+    if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.95.0"
+      - name: Bump workspace patch version
+        id: bump
+        run: |
+          current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          IFS=. read -r major minor patch <<<"$current"
+          next="$major.$minor.$((patch + 1))"
+          # Root Cargo.toml has exactly one line-anchored version key: the
+          # [workspace.package] one every crate inherits.
+          sed -i "s/^version = \"$current\"\$/version = \"$next\"/" Cargo.toml
+          # Refresh only the workspace members' entries in Cargo.lock.
+          cargo update --workspace --offline || cargo update --workspace
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+      - name: Commit, tag, push
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): v${{ steps.bump.outputs.next }}"
+          git pull --rebase origin main
+          # Annotated tag + explicit tag ref: --follow-tags silently skips
+          # lightweight tags, which is how v0.2.1's tag failed to push on
+          # this workflow's first run.
+          tag="v${{ steps.bump.outputs.next }}"
+          git tag -a "$tag" -m "$tag"
+          git push origin main "refs/tags/$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # A tag pushed with GITHUB_TOKEN does not emit another workflow event.
+  # Calling the same tag-driven workflow explicitly guarantees that the
+  # automatically created tag still receives release artifacts. Human or
+  # externally authenticated tag pushes enter release.yml through push.tags.
+  release:
+    needs: bump
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.bump.outputs.tag }}
+      commit: ${{ needs.bump.outputs.commit }}

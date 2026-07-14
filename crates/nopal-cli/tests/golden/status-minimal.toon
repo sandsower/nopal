@@ -1,0 +1,15 @@
+kind: nopal.status/v1
+project: minimal-example
+profile: minimal
+ready: true
+modules[7]{name,required,state}:
+  gates,false,absent
+  policy,false,absent
+  workflow,false,absent
+  roots,false,absent
+  integrations,false,absent
+  guidance,false,absent
+  review_policy,false,absent
+missing_modules[0]:
+diagnostics: 0
+help[1]: ready; run nopal validate in CI to keep it that way

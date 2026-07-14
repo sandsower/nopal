@@ -1,0 +1,6 @@
+{
+  // Deliberately broken example: gates.jsonc is present but not valid JSONC.
+  "version": "nopal.project/v1",
+  "project": { "name": "portable-broken-gates" },
+  "profile": "portable"
+}

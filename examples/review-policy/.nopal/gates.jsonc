@@ -1,0 +1,34 @@
+{
+  "version": "nopal.gates/v1",
+  "gates": [
+    {
+      "id": "fmt",
+      "stage": "pre_pr",
+      "command": "cargo fmt --all --check",
+      "parallel_safe": true
+    },
+    {
+      "id": "clippy",
+      "stage": "pre_pr",
+      "argv": ["cargo", "clippy", "--workspace", "--all-targets"],
+      "parallel_safe": true
+    },
+    // Deliberately missing parallel_safe/mutates: demonstrates the
+    // conservative fallback when a multi-scope run can't prove every
+    // selected gate is safe to run concurrently.
+    { "id": "docs-lint", "stage": "pre_pr", "command": "markdownlint {changed_files}" }
+  ],
+  "gate_sets": {
+    "rust": { "gates": ["fmt", "clippy"] },
+    "docs": { "gates": ["docs-lint"] }
+  },
+  "selectors": [
+    {
+      "name": "rust-files",
+      "paths": ["**/*.rs"],
+      "exclude": ["target/**"],
+      "gate_sets": ["rust"]
+    },
+    { "name": "doc-files", "paths": ["**/*.md"], "gate_sets": ["docs"] }
+  ]
+}

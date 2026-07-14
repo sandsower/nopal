@@ -1,0 +1,19 @@
+{
+  "version": "nopal.roots/v1",
+  "roots": [
+    {
+      "id": "dogfood-quality",
+      "statement": "Nopal must remain usable as its own high-quality coordination surface.",
+      "proof_requirements": [
+        {
+          "id": "full-repository-gates",
+          "stage": "pre_pr",
+          "required": true,
+          "gates": ["fmt", "clippy", "test", "ext-test"],
+          "on_missing": "block",
+          "on_failure": "block"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+kind: nopal.validation/v1
+ok: true
+project: minimal-example
+profile: minimal
+diagnostics[0]{severity,code,path,position,message}:

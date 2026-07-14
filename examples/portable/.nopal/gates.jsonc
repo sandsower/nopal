@@ -1,0 +1,34 @@
+{
+  "version": "nopal.gates/v1",
+  "preflights": [
+    { "id": "toolchain", "stage": "run_start", "command": "rustup show" }
+  ],
+  "gates": [
+    {
+      "id": "fmt",
+      "stage": "pre_pr",
+      "command": "cargo fmt --all --check",
+      "autofix": "cargo fmt --all"
+    },
+    {
+      "id": "clippy",
+      "stage": "pre_pr",
+      "argv": ["cargo", "clippy", "--workspace", "--all-targets"]
+    },
+    { "id": "test", "stage": "pre_pr", "command": "cargo test --workspace" },
+    { "id": "docs-lint", "stage": "pre_commit", "command": "markdownlint {changed_files}" }
+  ],
+  "gate_sets": {
+    "rust": { "gates": ["fmt", "clippy", "test"] },
+    "docs": { "gates": ["docs-lint"] }
+  },
+  "selectors": [
+    {
+      "name": "rust-files",
+      "paths": ["**/*.rs", "Cargo.toml", "crates/**"],
+      "exclude": ["target/**"],
+      "gate_sets": ["rust"]
+    },
+    { "name": "doc-files", "paths": ["**/*.md"], "gate_sets": ["docs"] }
+  ]
+}

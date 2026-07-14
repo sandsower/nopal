@@ -1,0 +1,30 @@
+[package]
+name = "nopal-cli"
+description = "Nopal: deterministic AXI-style CLI and coordinator over nopal-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "nopal"
+path = "src/main.rs"
+
+[dependencies]
+nopal-core = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+nopal-ledger-json = { path = "../nopal-ledger-json" }
+nopal-field = { path = "../nopal-field" }
+nopal-feed-client = { path = "../nopal-feed-client" }
+nopal-rondo-client = { workspace = true }
+nopal-rondo-lifecycle = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+nopal-native-lifecycle = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

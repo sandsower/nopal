@@ -1,0 +1,18 @@
+{
+  // Guidance is advisory only. It may help hosts choose context, skills,
+  // agents, or models, but cannot define gates, policy, lifecycle actions,
+  // proof requirements, or progression.
+  "version": "nopal.guidance/v1",
+  "hints": {
+    "skills": ["kickoff", "blueprint", "implement", "verify", "ready-for-review"],
+    "agents": ["domain-expert"],
+    "models": {
+      "blueprint": "opus",
+      "implement": "sonnet"
+    },
+    "context": [
+      "Read .beislid/workflow.md before Beislið-compatible workflow work.",
+      "Match diagnostics by stable code, never message text."
+    ]
+  }
+}

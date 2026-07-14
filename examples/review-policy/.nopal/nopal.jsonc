@@ -1,0 +1,8 @@
+{
+  // Dedicated fixture for nopal.review_risk/v1 (TASK-35). Kept out of
+  // portable/nopal so review-risk goldens never perturb the validate/status
+  // goldens those examples already own.
+  "version": "nopal.project/v1",
+  "project": { "name": "review-policy-example" },
+  "profile": "minimal"
+}

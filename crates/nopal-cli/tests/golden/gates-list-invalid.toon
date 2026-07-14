@@ -1,0 +1,12 @@
+kind: nopal.gates.list/v1
+ok: false
+gates[0]{id,stage,run,cwd,autofix}:
+gate_sets[0]{name,gates}:
+selectors[0]{name,paths,exclude,gate_sets}:
+diagnostics[6]{severity,code,path,position,message}:
+  error,version_unsupported,.nopal/gates.jsonc,-,"unsupported gates version \"nopal.gates/v2\"; expected \"nopal.gates/v1\""
+  warning,stage_unknown,.nopal/gates.jsonc,-,"gates[0]: unknown gate stage \"someday\"; expected one of \"per_edit\", \"pre_commit\", \"pre_pr\", \"post_pr\", \"continuous\", \"human_interrupt\""
+  warning,placeholder_unknown,.nopal/gates.jsonc,-,"gates[1].command: unknown placeholder {typo}; expected one of \"changed_files\""
+  error,duplicate_id,.nopal/gates.jsonc,-,"gates[2]: duplicate id \"dup\"; ids are unique across preflights and gates"
+  error,gate_ref_unknown,.nopal/gates.jsonc,-,"gate_sets.fast: references unknown gate id \"missing\""
+  error,gate_set_unknown,.nopal/gates.jsonc,-,"selectors[0]: references unknown gate set \"nope\""

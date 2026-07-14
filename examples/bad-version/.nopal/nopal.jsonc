@@ -1,0 +1,6 @@
+{
+  // Deliberately broken example: future manifest version this nopal does not support.
+  "version": "nopal.project/v9",
+  "project": { "name": "bad-version" },
+  "profile": "minimal"
+}

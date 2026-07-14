@@ -1,0 +1,8 @@
+kind: nopal.status/v1
+project: -
+profile: -
+ready: false
+modules[0]{name,required,state}:
+missing_modules[0]:
+diagnostics: 1
+help[1]: "create .nopal/nopal.jsonc with \"version\": \"nopal.project/v1\" and a built-in or manifest-defined profile"

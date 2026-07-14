@@ -1,0 +1,14 @@
+{
+  "version": "nopal.review_policy/v1",
+  "risk": {
+    "max_auto_closeout_risk": "low",
+    "high_risk_paths": ["**/.github/workflows/**", "bin/**"],
+    "low_risk_paths": ["docs/**", "**/*.md"],
+    "high_risk_file_count": 12,
+    "high_risk_total_changes": 500,
+    "low_risk_file_count": 3,
+    "low_risk_total_changes": 120
+  },
+  "fast_path": { "max_changed_lines": 100 },
+  "split_policy": "exclusive"
+}

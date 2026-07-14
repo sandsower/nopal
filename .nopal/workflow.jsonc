@@ -1,0 +1,11 @@
+{
+  "establishment": {
+    "events": [
+      "kickoff_context_ready"
+    ]
+  },
+  "lifecycle": {
+    "events": {}
+  },
+  "version": "nopal.workflow/v1"
+}

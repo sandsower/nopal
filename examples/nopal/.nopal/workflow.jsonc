@@ -1,0 +1,74 @@
+{
+  // Lifecycle/checkpoint side-effect surface. Nopal validates the event/action
+  // vocabulary; executors decide whether to run configured actions.
+  "version": "nopal.workflow/v1",
+  "lifecycle": {
+    "events": {
+      "kickoff_start": {
+        "actions": [
+          {
+            "id": "announce-kickoff",
+            "type": "cli",
+            "command": "printf 'starting {ticket_id} on {branch}\\n'",
+            "approval": "prompt",
+            "classes": ["workspace_write"],
+            "on_failure": "continue"
+          }
+        ]
+      },
+      "spec_approved": {
+        "actions": [
+          {
+            "id": "write-approved-spec",
+            "type": "artifact",
+            "approval": "prompt",
+            "path": "plans/{feature}-spec.md"
+          },
+          {
+            "id": "post-spec-to-tracker",
+            "type": "tracker",
+            "approval": "prompt"
+          }
+        ]
+      },
+      "blueprint_approved": {
+        "actions": [
+          {
+            "id": "write-approved-design",
+            "type": "artifact",
+            "approval": "auto",
+            "path": "plans/{feature}-design.md"
+          }
+        ]
+      },
+      "kickoff_context_ready": {
+        "actions": [
+          {
+            "id": "write-kickoff-checkpoint",
+            "type": "artifact",
+            "path": "checkpoints/{event}-{ticket_id}.md"
+          }
+        ]
+      },
+      "implementation_plan_created": {
+        "actions": [
+          {
+            "id": "write-implementation-plan-checkpoint",
+            "type": "artifact",
+            "path": "checkpoints/{event}-{ticket_id}.md"
+          }
+        ]
+      }
+    }
+  },
+  // Auto-handoff and babysit config: event tokens here are open vocabulary,
+  // not membership-checked against the lifecycle events above.
+  "handoff": {
+    "auto": true,
+    "events": ["kickoff_context_ready"],
+    "exclude": ["break_spec_approved", "spec_approved", "blueprint_approved"]
+  },
+  "babysit": {
+    "token_budget": 400000
+  }
+}

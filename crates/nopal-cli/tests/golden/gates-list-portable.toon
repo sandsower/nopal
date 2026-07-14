@@ -1,0 +1,14 @@
+kind: nopal.gates.list/v1
+ok: true
+gates[4]{id,stage,run,cwd,autofix}:
+  fmt,pre_pr,cargo fmt --all --check,-,cargo fmt --all
+  clippy,pre_pr,cargo clippy --workspace --all-targets,-,-
+  test,pre_pr,cargo test --workspace,-,-
+  docs-lint,pre_commit,"markdownlint {changed_files}",-,-
+gate_sets[2]{name,gates}:
+  docs,docs-lint
+  rust,fmt clippy test
+selectors[2]{name,paths,exclude,gate_sets}:
+  rust-files,**/*.rs Cargo.toml crates/**,target/**,rust
+  doc-files,**/*.md,-,docs
+diagnostics[0]{severity,code,path,position,message}:

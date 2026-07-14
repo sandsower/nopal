@@ -1,0 +1,8 @@
+{
+  // A portable project with an unresolvable nopal.bundle/v1: proves bare
+  // `nopal --dry-run` fails closed (bundle_resource_missing) instead of
+  // exec-ing Pi against a broken bundle.
+  "version": "nopal.project/v1",
+  "project": { "name": "bundle-invalid-example" },
+  "profile": "portable"
+}

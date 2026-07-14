@@ -1,0 +1,19 @@
+{
+  "version": "nopal.roots/v1",
+  "roots": [
+    {
+      "id": "quality",
+      "statement": "The full Nopal distribution remains green.",
+      "proof_requirements": [
+        {
+          "id": "pre-pr",
+          "stage": "pre_pr",
+          "required": true,
+          "gates": ["fmt", "test"],
+          "on_missing": "block",
+          "on_failure": "block"
+        }
+      ]
+    }
+  ]
+}
