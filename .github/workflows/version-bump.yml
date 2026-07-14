@@ -1,80 +1,167 @@
 name: version-bump
 
-# Every merge to main bumps the workspace patch version, commits, and tags
-# vX.Y.Z. Local `cargo install --path crates/nopal-cli` then replaces the
-# installed binary without --force, and the tags give the future Homebrew
-# tap release anchors. Minor/major bumps stay manual: edit
-# [workspace.package] version in a PR and this job continues from there.
+# Every non-release merge to main prepares the next patch version in a
+# protected pull request.
+# The pull request is refreshed from the latest main, receives an explicit CI
+# dispatch, and auto-merges only after the required check succeeds.
+# The resulting squash merge is then tagged and passed to release.yml.
 on:
   push:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
-# Serialize bumps so two quick merges don't race the push; the rebase in
-# the commit step covers the window a queued run still sees a stale HEAD.
 concurrency:
   group: version-bump
   cancel-in-progress: false
 
 jobs:
-  bump:
+  coordinate:
     runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
     outputs:
-      tag: ${{ steps.release.outputs.tag }}
-      commit: ${{ steps.release.outputs.commit }}
-    # GITHUB_TOKEN pushes never retrigger workflows, so the bump commit
-    # cannot loop; this guard only protects manual re-runs on a bump commit.
-    if: "!startsWith(github.event.head_commit.message, 'chore(release):')"
+      mode: ${{ steps.state.outputs.mode }}
+      tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.state.outputs.base_sha }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          fetch-depth: 0
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: "1.95.0"
-      - name: Bump workspace patch version
-        id: bump
+      - name: Configure release Git identity
         run: |
-          current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
-          IFS=. read -r major minor patch <<<"$current"
-          next="$major.$minor.$((patch + 1))"
-          # Root Cargo.toml has exactly one line-anchored version key: the
-          # [workspace.package] one every crate inherits.
-          sed -i "s/^version = \"$current\"\$/version = \"$next\"/" Cargo.toml
-          # Refresh only the workspace members' entries in Cargo.lock.
-          cargo update --workspace --offline || cargo update --workspace
-          echo "next=$next" >> "$GITHUB_OUTPUT"
-      - name: Commit, tag, push
-        id: release
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Classify the latest main commit
+        id: state
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_BRANCH: automation/version-bump
         run: |
-          gh auth setup-git
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          git commit -m "chore(release): v${{ steps.bump.outputs.next }}"
-          git pull --rebase origin main
-          # Annotated tag + explicit tag ref: --follow-tags silently skips
-          # lightweight tags, which is how v0.2.1's tag failed to push on
-          # this workflow's first run.
-          tag="v${{ steps.bump.outputs.next }}"
-          git tag -a "$tag" -m "$tag"
-          git push origin main "refs/tags/$tag"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git fetch --force --tags origin main
+          base_sha=$GITHUB_SHA
+          git checkout --detach "$base_sha"
 
-  # A tag pushed with GITHUB_TOKEN does not emit another workflow event.
-  # Calling the same tag-driven workflow explicitly guarantees that the
-  # automatically created tag still receives release artifacts. Human or
-  # externally authenticated tag pushes enter release.yml through push.tags.
+          subject=$(git log -1 --format=%s)
+          delays=0
+          case "$subject" in
+            "chore(release): v"*) delays="0 2 4 8 16" ;;
+          esac
+
+          release_pr=
+          for delay in $delays; do
+            if [ "$delay" -ne 0 ]; then
+              sleep "$delay"
+            fi
+            release_pr=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${GITHUB_REPOSITORY}/commits/${base_sha}/pulls" \
+              --jq "$(cat scripts/release-pr.jq)")
+            if [ -n "$release_pr" ]; then
+              break
+            fi
+          done
+
+          if [ -n "$release_pr" ]; then
+            mode=release
+          else
+            mode=bump
+          fi
+          {
+            echo "base_sha=$base_sha"
+            echo "mode=$mode"
+            echo "release_pr=$release_pr"
+          } >> "$GITHUB_OUTPUT"
+      - name: Prepare the version pull request commit
+        if: steps.state.outputs.mode == 'bump'
+        id: bump
+        env:
+          RELEASE_BRANCH: automation/version-bump
+        run: |
+          . scripts/release-version.sh
+          git fetch --force origin main
+          git switch --force-create "$RELEASE_BRANCH" origin/main
+          current=$(release_workspace_version Cargo.toml)
+          next=$(release_next_patch_version "$current")
+          sed -i "s/^version = \"$current\"\$/version = \"$next\"/" Cargo.toml
+          cargo update --workspace --offline || cargo update --workspace
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): v$next"
+
+          remote_sha=$(git ls-remote --heads origin "refs/heads/$RELEASE_BRANCH" | cut -f1)
+          git push \
+            "--force-with-lease=refs/heads/$RELEASE_BRANCH:$remote_sha" \
+            origin "HEAD:refs/heads/$RELEASE_BRANCH"
+          {
+            echo "commit=$(git rev-parse HEAD)"
+            echo "next=$next"
+          } >> "$GITHUB_OUTPUT"
+      - name: Open or refresh the protected version pull request
+        if: steps.state.outputs.mode == 'bump'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BRANCH: automation/version-bump
+          RELEASE_COMMIT: ${{ steps.bump.outputs.commit }}
+          RELEASE_VERSION: ${{ steps.bump.outputs.next }}
+        run: |
+          pr_number=$(gh pr list \
+            --base main \
+            --head "$RELEASE_BRANCH" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+          body='Automated patch-version update. CI is dispatched explicitly because events created with GITHUB_TOKEN do not recursively start pull-request workflows.'
+          if [ -z "$pr_number" ]; then
+            pr_url=$(gh pr create \
+              --base main \
+              --head "$RELEASE_BRANCH" \
+              --title "chore(release): v$RELEASE_VERSION" \
+              --body "$body")
+            pr_number=${pr_url##*/}
+          else
+            gh pr edit "$pr_number" \
+              --title "chore(release): v$RELEASE_VERSION" \
+              --body "$body"
+          fi
+
+          gh workflow run ci.yml --ref "$RELEASE_BRANCH"
+          gh pr merge "$pr_number" \
+            --auto \
+            --squash \
+            --match-head-commit "$RELEASE_COMMIT"
+      - name: Tag the protected release commit
+        if: steps.state.outputs.mode == 'release'
+        id: tag
+        run: |
+          . scripts/release-version.sh
+          version=$(release_workspace_version Cargo.toml)
+          tag="v$version"
+          release_validate_tag Cargo.toml "$tag" >/dev/null
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            tagged_commit=$(git rev-parse "refs/tags/$tag^{}")
+            if [ "$tagged_commit" != "${{ steps.state.outputs.base_sha }}" ]; then
+              echo "$tag already names $tagged_commit" >&2
+              exit 1
+            fi
+          else
+            git tag -a "$tag" -m "$tag" "${{ steps.state.outputs.base_sha }}"
+            git push origin "refs/tags/$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
   release:
-    needs: bump
+    needs: coordinate
+    if: needs.coordinate.outputs.mode == 'release'
     permissions:
       contents: write
     uses: ./.github/workflows/release.yml
     with:
-      tag: ${{ needs.bump.outputs.tag }}
-      commit: ${{ needs.bump.outputs.commit }}
+      tag: ${{ needs.coordinate.outputs.tag }}
+      commit: ${{ needs.coordinate.outputs.commit }}

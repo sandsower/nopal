@@ -14,6 +14,55 @@ fail() {
 
 version=$(release_workspace_version "$repo_root/Cargo.toml")
 tag="v$version"
+
+[ "$(release_next_patch_version 0.2.9)" = "0.2.10" ] \
+  || fail "patch version did not increment across a digit boundary"
+[ "$(release_next_patch_version 4.19.99)" = "4.19.100" ] \
+  || fail "patch version did not preserve major and minor components"
+if release_next_patch_version 1.2 >"$tmp/invalid-version.stdout" \
+  2>"$tmp/invalid-version.stderr"; then
+  fail "invalid workspace version unexpectedly produced a patch version"
+fi
+grep -q 'workspace version must be numeric major.minor.patch' \
+  "$tmp/invalid-version.stderr" \
+  || fail "invalid workspace version did not explain the required format"
+
+release_pr_fixture='[
+  {"number": 7, "head": {"ref": "feature/other"}, "base": {"ref": "main"}, "merged_at": "2026-07-14T00:00:00Z"},
+  {"number": 8, "head": {"ref": "automation/version-bump"}, "base": {"ref": "main"}, "merged_at": null},
+  {"number": 9, "head": {"ref": "automation/version-bump"}, "base": {"ref": "main"}, "merged_at": "2026-07-14T00:01:00Z"}
+]'
+release_pr=$(
+  printf '%s\n' "$release_pr_fixture" \
+    | RELEASE_BRANCH=automation/version-bump \
+      jq -r -f "$repo_root/scripts/release-pr.jq"
+)
+[ "$release_pr" = 9 ] \
+  || fail "release classifier did not select the merged automation pull request"
+release_pr=$(
+  printf '%s\n' "$release_pr_fixture" \
+    | RELEASE_BRANCH=automation/other \
+      jq -r -f "$repo_root/scripts/release-pr.jq"
+)
+[ -z "$release_pr" ] \
+  || fail "release classifier accepted an unrelated pull request"
+
+version_workflow="$repo_root/.github/workflows/version-bump.yml"
+grep -Fq 'cancel-in-progress: false' "$version_workflow" \
+  || fail "release coordination can cancel an in-flight artifact build"
+grep -Fq 'base_sha=$GITHUB_SHA' "$version_workflow" \
+  || fail "release classification is not anchored to the immutable push commit"
+grep -Fq 'git switch --force-create "$RELEASE_BRANCH" origin/main' \
+  "$version_workflow" \
+  || fail "the next version branch is not refreshed from current main"
+grep -Fq 'gh workflow run ci.yml --ref "$RELEASE_BRANCH"' "$version_workflow" \
+  || fail "automated version pull requests do not dispatch CI explicitly"
+grep -Fq -- '--match-head-commit "$RELEASE_COMMIT"' "$version_workflow" \
+  || fail "automated version pull requests can auto-merge a stale head"
+if grep -Fq 'git push origin main' "$version_workflow"; then
+  fail "version workflow still pushes directly to main"
+fi
+
 target=test-release-target
 stem="nopal-$tag-$target"
 fake_binary="$tmp/nopal"

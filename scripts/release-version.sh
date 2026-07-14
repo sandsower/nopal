@@ -14,6 +14,22 @@ release_workspace_version() {
   printf '%s\n' "$release_version"
 }
 
+release_next_patch_version() {
+  release_current_version=$1
+  if ! printf '%s\n' "$release_current_version" \
+    | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+    echo "workspace version must be numeric major.minor.patch: $release_current_version" >&2
+    return 1
+  fi
+
+  release_major=${release_current_version%%.*}
+  release_remainder=${release_current_version#*.}
+  release_minor=${release_remainder%%.*}
+  release_patch=${release_remainder#*.}
+  release_patch=$((release_patch + 1))
+  printf '%s.%s.%s\n' "$release_major" "$release_minor" "$release_patch"
+}
+
 release_validate_tag() {
   release_manifest=$1
   release_tag=$2
