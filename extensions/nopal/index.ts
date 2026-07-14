@@ -87,6 +87,19 @@ function unresolvedEstablishmentRuns(ctx: ExtensionContext): ManagedRun[] {
 	return [...pending.values()];
 }
 
+function latestAppliedEstablishment(ctx: ExtensionContext): EstablishmentAppliedEntry | undefined {
+	const entries = customEntries(ctx);
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const entry = entries[index];
+		if (entry.customType !== ESTABLISHMENT_APPLIED_ENTRY) continue;
+		const applied = entry.data as Partial<EstablishmentAppliedEntry> | undefined;
+		if (typeof applied?.runId !== "string" || typeof applied.plotId !== "string") continue;
+		if (typeof applied.boundary?.event !== "string" || typeof applied.boundary.id !== "string") continue;
+		return applied as EstablishmentAppliedEntry;
+	}
+	return undefined;
+}
+
 function continuationPrompt(boundary: BoundaryIdentity, workflow: string): string {
 	return `Continue the Nopal ${workflow} workflow from a fresh Pi session.\n\nRead the checkpoint pointer (\`nopal ledger pointer\`), then read the referenced checkpoint artifact for event ${boundary.event} at ${boundary.path}. Use that artifact as the primary context seed. Do not synthesize missing context from prior chat history. Do not auto-handoff again for this same checkpoint boundary: ${boundary.id}.`;
 }
@@ -169,10 +182,30 @@ export default function nopalExtension(pi: ExtensionAPI) {
 			if (anyBoundary) completeEstablishmentRun(run.runId);
 		}
 	};
+	const republishEstablishedSessionProtocol = async (ctx: ExtensionContext) => {
+		const applied = latestAppliedEstablishment(ctx);
+		if (!applied) return;
+		const endpoint = await sessionBridge.refresh(ctx.cwd);
+		if (!endpoint) {
+			notify(ctx, "The established Plot Session bridge could not be restarted", "error");
+			return;
+		}
+		const result = await establishPlot(exec, {
+			event: applied.boundary.event,
+			cwd: ctx.cwd,
+			plotId: applied.plotId,
+			protocol: endpoint,
+		});
+		if (!result.ok) notify(ctx, result.error, "error");
+	};
 
 	pi.on("session_start", async (_event, ctx) => {
 		refreshConsumed(ctx, consumed);
 		configCache.refresh();
+		// A Pi reload recreates the bridge and can upgrade its protocol version.
+		// Republish the ready endpoint so Core never leaves the desktop selecting
+		// an older strict decoder for frames emitted by the new bridge.
+		await republishEstablishedSessionProtocol(ctx);
 		await recoverEstablishments(ctx);
 
 		// Hide the native `/skill:<name>` picker entry for every beislid skill this
