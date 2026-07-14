@@ -59,6 +59,17 @@ grep -Fq 'gh workflow run ci.yml --ref "$RELEASE_BRANCH"' "$version_workflow" \
   || fail "automated version pull requests do not dispatch CI explicitly"
 grep -Fq 'gh auth setup-git' "$version_workflow" \
   || fail "credential-free checkout is not reauthenticated before protected writes"
+grep -Fq 'statuses: write' "$version_workflow" \
+  || fail "release coordinator cannot publish the verified commit status"
+grep -Fq 'gh run watch "$ci_id" --exit-status' "$version_workflow" \
+  || fail "release coordinator does not wait for exact dispatched CI"
+grep -Fq 'repos/${GITHUB_REPOSITORY}/statuses/${RELEASE_COMMIT}' \
+  "$version_workflow" \
+  || fail "release coordinator does not publish status on its exact commit"
+grep -Fq 'conclusion == "action_required"' "$version_workflow" \
+  || fail "release coordinator does not identify the inert bot PR run"
+grep -Fq 'gh run delete "$run_id"' "$version_workflow" \
+  || fail "release coordinator does not remove the exact inert bot PR run"
 grep -Fq -- '--match-head-commit "$RELEASE_COMMIT"' "$version_workflow" \
   || fail "automated version pull requests can auto-merge a stale head"
 if grep -Fq 'git push origin main' "$version_workflow"; then
