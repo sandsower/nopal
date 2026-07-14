@@ -46,11 +46,47 @@ fi
 "$plutil_command" -lint "$source_plist" >/dev/null
 source_version=$("$plutil_command" -extract CFBundleShortVersionString raw "$source_plist")
 
-running_pids() {
-  "$pgrep_command" -f -x "$destination_executable" 2>/dev/null || true
+probe_running() {
+  if "$pgrep_command" -f -x "$destination_executable" >/dev/null 2>&1; then
+    return 0
+  else
+    probe_status=$?
+  fi
+
+  if [ "$probe_status" -eq 1 ]; then
+    return 1
+  fi
+
+  echo "cannot determine whether Nopal is running (process check exited $probe_status)" >&2
+  exit 1
 }
 
-if [ -n "$(running_pids)" ]; then
+stage="$applications_dir/.Nopal.app.install.$$"
+backup="$applications_dir/.Nopal.app.backup.$$"
+swapped=false
+reopen_on_failure=false
+
+# The replacement is one transaction from graceful quit through relaunch.
+# Any failure removes a swapped-in bundle, restores the prior bundle, and
+# reopens it when this invocation stopped it.
+cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  rm -rf "$stage"
+  if [ "$swapped" = true ]; then
+    rm -rf "$destination"
+  fi
+  if [ -e "$backup" ] && [ ! -e "$destination" ]; then
+    mv "$backup" "$destination"
+  fi
+  if [ "$reopen_on_failure" = true ] && [ -e "$destination" ]; then
+    "$open_command" "$destination" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+trap cleanup EXIT HUP INT TERM
+
+if probe_running; then
   if [ "$mode" = "install" ]; then
     echo "Nopal is running from $destination; quit it or use 'make reinstall'" >&2
     exit 1
@@ -66,58 +102,48 @@ if [ -n "$(running_pids)" ]; then
     echo "Nopal did not accept a graceful quit request; quit it manually and retry" >&2
     exit 1
   fi
+  reopen_on_failure=true
 
   attempts=0
-  while [ -n "$(running_pids)" ] && [ "$attempts" -lt 50 ]; do
+  while probe_running && [ "$attempts" -lt 50 ]; do
     sleep 0.1
     attempts=$((attempts + 1))
   done
-  if [ -n "$(running_pids)" ]; then
+  if probe_running; then
     echo "Nopal is still running after the graceful quit request" >&2
     exit 1
   fi
 fi
 
 mkdir -p "$applications_dir"
-stage="$applications_dir/.Nopal.app.install.$$"
-backup="$applications_dir/.Nopal.app.backup.$$"
-
-# The destination is never partially overwritten. A complete staged bundle is
-# swapped into place, and the prior installation is restored if the swap fails.
-cleanup() {
-  status=$?
-  trap - EXIT HUP INT TERM
-  rm -rf "$stage"
-  if [ -e "$backup" ] && [ ! -e "$destination" ]; then
-    mv "$backup" "$destination"
-  fi
-  exit "$status"
-}
-trap cleanup EXIT HUP INT TERM
-
 rm -rf "$stage" "$backup"
 "$ditto_command" "$source_app" "$stage"
 "$plutil_command" -lint "$stage/Contents/Info.plist" >/dev/null
+
+if probe_running; then
+  echo "Nopal started while the replacement was being staged; quit it and retry" >&2
+  exit 1
+fi
 
 if [ -e "$destination" ]; then
   mv "$destination" "$backup"
 fi
 mv "$stage" "$destination"
+swapped=true
 
 installed_version=$(
   "$plutil_command" -extract CFBundleShortVersionString raw \
     "$destination/Contents/Info.plist"
 )
 if [ "$installed_version" != "$source_version" ]; then
-  rm -rf "$destination"
   echo "installed Nopal version $installed_version does not match build $source_version" >&2
   exit 1
+fi
+
+if [ "$mode" = "reinstall" ]; then
+  "$open_command" "$destination"
 fi
 
 rm -rf "$backup"
 trap - EXIT HUP INT TERM
 printf 'Installed Nopal %s at %s\n' "$installed_version" "$destination"
-
-if [ "$mode" = "reinstall" ]; then
-  "$open_command" "$destination"
-fi

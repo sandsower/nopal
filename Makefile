@@ -16,7 +16,7 @@ else
 HOST_APP_TARGET := unsupported-host
 endif
 
-.PHONY: app macos linux install reinstall unsupported-host clean-app help
+.PHONY: app macos linux install reinstall test-macos-install unsupported-host clean-app help
 
 app: $(HOST_APP_TARGET)
 
@@ -90,6 +90,9 @@ install: macos
 reinstall: macos
 	./scripts/install-macos-app.sh reinstall "$(CURDIR)/Nopal.app" "$(INSTALL_DIR)"
 
+test-macos-install: macos
+	./scripts/test-install-macos-app.sh "$(CURDIR)/Nopal.app"
+
 unsupported-host:
 	@echo "unsupported host OS: $(HOST_OS)" >&2
 	@exit 2
@@ -104,4 +107,5 @@ help:
 		'make linux     Build ./Nopal-linux/nopal-field-native on Linux' \
 		'make install   Build and safely install /Applications/Nopal.app' \
 		'make reinstall Quit, install, and relaunch /Applications/Nopal.app' \
+		'make test-macos-install Run transactional macOS installer tests' \
 		'make clean-app Remove generated desktop app bundles'
