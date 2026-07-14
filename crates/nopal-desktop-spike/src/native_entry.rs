@@ -2,7 +2,7 @@
 
 #[cfg(unix)]
 mod unix {
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -41,9 +41,10 @@ mod unix {
     /// Runs the native Field or activates the already-resident instance.
     pub fn run() -> Result<(), String> {
         let arguments = std::env::args_os().collect::<Vec<_>>();
-        let state_dir = state_dir(&arguments)?;
+        let state_configuration = state_configuration(&arguments)?;
         let release_channel = release_channel()?;
-        let (scope, core_state_dir) = scope_and_core_state_dir(&state_dir, release_channel)?;
+        let (scope, core_state_dir) =
+            scope_and_core_state_dir(&state_configuration, release_channel)?;
         let scope_fingerprint = scope.fingerprint().to_owned();
         let coordinator = UnixInstanceCoordinator::with_default_control_root(scope.clone())
             .map_err(|error| format!("cannot prepare native instance coordination: {error}"))?;
@@ -52,8 +53,12 @@ mod unix {
             scope_fingerprint: scope.fingerprint().to_owned(),
         };
         let recovery = ScopedOwnedResourceRecovery::new(FailClosedRecoveryAdapter);
-        let core =
-            CliCoreFieldSnapshotSource::production(nopal_binary()).with_state_dir(core_state_dir);
+        let core = CliCoreFieldSnapshotSource::production(nopal_binary());
+        let core = if let Some(core_state_dir) = core_state_dir {
+            core.with_state_dir(core_state_dir)
+        } else {
+            core
+        };
         let host_factory = EframeHostFactory::default();
         let bridge = host_factory.bridge();
         let mut product = NativeFieldProduct::new(
@@ -224,18 +229,46 @@ mod unix {
         }
     }
 
-    fn state_dir(arguments: &[OsString]) -> Result<PathBuf, String> {
+    #[derive(Debug, Eq, PartialEq)]
+    struct NativeStateConfiguration {
+        native_state_root: PathBuf,
+        core_state_dir: Option<PathBuf>,
+    }
+
+    fn state_configuration(arguments: &[OsString]) -> Result<NativeStateConfiguration, String> {
+        let nopal_state_dir = std::env::var_os("NOPAL_STATE_DIR");
+        let home = std::env::var_os("HOME");
+        state_configuration_from(arguments, nopal_state_dir.as_deref(), home.as_deref())
+    }
+
+    fn state_configuration_from(
+        arguments: &[OsString],
+        nopal_state_dir: Option<&OsStr>,
+        home: Option<&OsStr>,
+    ) -> Result<NativeStateConfiguration, String> {
         let explicit = argument_value(arguments, "--state-dir")?;
-        Ok(explicit
-            .or_else(|| std::env::var_os("BEISLID_STATE_DIR").map(PathBuf::from))
-            .unwrap_or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".local")
-                    .join("state")
-                    .join("beislid")
-            }))
+        if let Some(explicit) = explicit {
+            return Ok(NativeStateConfiguration {
+                native_state_root: explicit.clone(),
+                core_state_dir: Some(explicit),
+            });
+        }
+
+        // An ordinary Field query deliberately uses separate Nopal Plot and
+        // compatibility run roots. Leaving Core's override absent preserves
+        // that contract, while the Plot root gives native lifecycle state a
+        // deterministic Nopal-owned home.
+        let native_state_root = nopal_state_dir.map(PathBuf::from).unwrap_or_else(|| {
+            home.map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local")
+                .join("state")
+                .join("nopal")
+        });
+        Ok(NativeStateConfiguration {
+            native_state_root,
+            core_state_dir: None,
+        })
     }
 
     fn argument_value(arguments: &[OsString], flag: &str) -> Result<Option<PathBuf>, String> {
@@ -267,12 +300,16 @@ mod unix {
     }
 
     fn scope_and_core_state_dir(
-        state_dir: &Path,
+        state_configuration: &NativeStateConfiguration,
         release_channel: ReleaseChannel,
-    ) -> Result<(NativeInstanceScope, PathBuf), String> {
-        let canonical_state_root = CanonicalStateRoot::create(state_dir)
-            .map_err(|error| format!("cannot prepare native state root: {error}"))?;
-        let core_state_dir = canonical_state_root.as_path().to_path_buf();
+    ) -> Result<(NativeInstanceScope, Option<PathBuf>), String> {
+        let canonical_state_root =
+            CanonicalStateRoot::create(&state_configuration.native_state_root)
+                .map_err(|error| format!("cannot prepare native state root: {error}"))?;
+        let core_state_dir = state_configuration
+            .core_state_dir
+            .as_ref()
+            .map(|_| canonical_state_root.as_path().to_path_buf());
         Ok((
             NativeInstanceScope::new(canonical_state_root, release_channel),
             core_state_dir,
@@ -325,6 +362,27 @@ mod unix {
         }
 
         #[test]
+        fn native_default_preserves_core_split_state_defaults() {
+            let arguments = ["nopal-field-native"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+
+            let configuration = state_configuration_from(
+                &arguments,
+                Some(OsStr::new("/nopal-state")),
+                Some(OsStr::new("/home/operator")),
+            )
+            .expect("resolve default native state configuration");
+
+            assert_eq!(
+                configuration.native_state_root,
+                PathBuf::from("/nopal-state")
+            );
+            assert_eq!(configuration.core_state_dir, None);
+        }
+
+        #[test]
         fn core_inspection_uses_the_same_canonical_root_as_singleton_identity() {
             let sandbox = tempfile::tempdir().expect("create state-root sandbox");
             let target = sandbox.path().join("state");
@@ -332,13 +390,19 @@ mod unix {
             let alias = sandbox.path().join("state-alias");
             symlink(&target, &alias).expect("create state-root alias");
 
+            let arguments = ["nopal-field-native", "--state-dir", alias.to_str().unwrap()]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+            let configuration = state_configuration_from(&arguments, None, None)
+                .expect("resolve explicit native state configuration");
             let (scope, core_state_dir) =
-                scope_and_core_state_dir(&alias, ReleaseChannel::Development)
+                scope_and_core_state_dir(&configuration, ReleaseChannel::Development)
                     .expect("canonicalize native scope");
             let expected = std::fs::canonicalize(&target).expect("canonical target state root");
 
             assert_eq!(scope.state_root().as_path(), expected);
-            assert_eq!(core_state_dir, expected);
+            assert_eq!(core_state_dir, Some(expected));
         }
     }
 }

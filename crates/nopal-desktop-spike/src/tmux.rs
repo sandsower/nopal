@@ -1,6 +1,7 @@
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::JoinHandle;
 
@@ -8,16 +9,82 @@ use async_channel::Receiver;
 
 use crate::source::CommandRunner;
 
+fn resolve_tmux_program_from(
+    override_program: Option<&OsStr>,
+    search_path: Option<&OsStr>,
+    fallbacks: &[PathBuf],
+) -> OsString {
+    if let Some(program) = override_program.filter(|program| !program.is_empty()) {
+        return program.to_os_string();
+    }
+    if let Some(program) = search_path
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|directory| directory.join("tmux"))
+        .find(|candidate| is_executable_file(candidate))
+    {
+        return program.into_os_string();
+    }
+    if let Some(program) = fallbacks
+        .iter()
+        .find(|candidate| is_executable_file(candidate))
+    {
+        return program.as_os_str().to_os_string();
+    }
+    OsString::from("tmux")
+}
+
+fn resolve_tmux_program() -> OsString {
+    let mut fallbacks = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        fallbacks.push(home.join(".local/bin/tmux"));
+        fallbacks.push(home.join(".nix-profile/bin/tmux"));
+    }
+    fallbacks.extend([
+        PathBuf::from("/opt/homebrew/bin/tmux"),
+        PathBuf::from("/usr/local/bin/tmux"),
+        PathBuf::from("/opt/local/bin/tmux"),
+        PathBuf::from("/nix/var/nix/profiles/default/bin/tmux"),
+    ]);
+    resolve_tmux_program_from(
+        std::env::var_os("NOPAL_TMUX_BIN").as_deref(),
+        std::env::var_os("PATH").as_deref(),
+        &fallbacks,
+    )
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 pub struct OwnedDemoSession {
     name: String,
     pane_id: String,
+    tmux_program: OsString,
 }
 
 impl OwnedDemoSession {
     pub fn start() -> Result<Self, String> {
         let name = format!("nopal-clean-demo-{}", std::process::id());
-        let (program, args) = clean_demo_command(&name);
-        let output = Command::new(program)
+        let tmux_program = resolve_tmux_program();
+        let args = clean_demo_args(&name);
+        let output = Command::new(&tmux_program)
             .args(&args)
             .output()
             .map_err(|error| format!("cannot launch clean demo Session: {error}"))?;
@@ -29,7 +96,11 @@ impl OwnedDemoSession {
         }
         let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         validate_pane_id(&pane_id)?;
-        Ok(Self { name, pane_id })
+        Ok(Self {
+            name,
+            pane_id,
+            tmux_program,
+        })
     }
 
     pub fn pane_id(&self) -> &str {
@@ -39,37 +110,34 @@ impl OwnedDemoSession {
 
 impl Drop for OwnedDemoSession {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
+        let _ = Command::new(&self.tmux_program)
             .args(["kill-session", "-t", &self.name])
             .output();
     }
 }
 
-fn clean_demo_command(session: &str) -> (&'static str, Vec<String>) {
-    (
-        "tmux",
-        vec![
-            "new-session".to_owned(),
-            "-d".to_owned(),
-            "-P".to_owned(),
-            "-F".to_owned(),
-            "#{pane_id}".to_owned(),
-            "-s".to_owned(),
-            session.to_owned(),
-            "-x".to_owned(),
-            "100".to_owned(),
-            "-y".to_owned(),
-            "30".to_owned(),
-            "/usr/bin/env".to_owned(),
-            "-i".to_owned(),
-            "HOME=/tmp".to_owned(),
-            "PATH=/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
-            "TERM=xterm-256color".to_owned(),
-            "PS1=nopal> ".to_owned(),
-            "/bin/zsh".to_owned(),
-            "-f".to_owned(),
-        ],
-    )
+fn clean_demo_args(session: &str) -> Vec<String> {
+    vec![
+        "new-session".to_owned(),
+        "-d".to_owned(),
+        "-P".to_owned(),
+        "-F".to_owned(),
+        "#{pane_id}".to_owned(),
+        "-s".to_owned(),
+        session.to_owned(),
+        "-x".to_owned(),
+        "100".to_owned(),
+        "-y".to_owned(),
+        "30".to_owned(),
+        "/usr/bin/env".to_owned(),
+        "-i".to_owned(),
+        "HOME=/tmp".to_owned(),
+        "PATH=/usr/bin:/bin:/usr/sbin:/sbin".to_owned(),
+        "TERM=xterm-256color".to_owned(),
+        "PS1=nopal> ".to_owned(),
+        "/bin/zsh".to_owned(),
+        "-f".to_owned(),
+    ]
 }
 
 pub trait PaneTransport {
@@ -92,6 +160,7 @@ where
 
 pub struct TmuxTransport<R> {
     runner: R,
+    program: OsString,
 }
 
 impl<R> TmuxTransport<R>
@@ -99,15 +168,30 @@ where
     R: CommandRunner,
 {
     pub fn new(runner: R) -> Self {
-        Self { runner }
+        Self {
+            runner,
+            program: OsString::from("tmux"),
+        }
+    }
+
+    pub fn production(runner: R) -> Self {
+        Self {
+            runner,
+            program: resolve_tmux_program(),
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Result<crate::source::CommandOutput, String> {
+        let program = self
+            .program
+            .to_str()
+            .ok_or_else(|| "tmux executable path is not valid UTF-8".to_owned())?;
+        self.runner.run(program, args)
     }
 
     pub fn capture(&self, pane_id: &str) -> Result<Vec<u8>, String> {
         validate_pane_id(pane_id)?;
-        let output = self.runner.run(
-            "tmux",
-            &["capture-pane", "-e", "-p", "-S", "-5000", "-t", pane_id],
-        )?;
+        let output = self.run(&["capture-pane", "-e", "-p", "-S", "-5000", "-t", pane_id])?;
         if !output.success {
             return Err(command_failure("tmux capture-pane", &output.stderr));
         }
@@ -116,16 +200,13 @@ where
 
     pub fn pane_size(&self, pane_id: &str) -> Result<(usize, usize), String> {
         validate_pane_id(pane_id)?;
-        let output = self.runner.run(
-            "tmux",
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                pane_id,
-                "#{pane_width} #{pane_height}",
-            ],
-        )?;
+        let output = self.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{pane_width} #{pane_height}",
+        ])?;
         if !output.success {
             return Err(command_failure("tmux display-message", &output.stderr));
         }
@@ -140,10 +221,7 @@ where
 
     pub fn pane_process_id(&self, pane_id: &str) -> Result<u32, String> {
         validate_pane_id(pane_id)?;
-        let output = self.runner.run(
-            "tmux",
-            &["display-message", "-p", "-t", pane_id, "#{pane_pid}"],
-        )?;
+        let output = self.run(&["display-message", "-p", "-t", pane_id, "#{pane_pid}"])?;
         if !output.success {
             return Err(command_failure("tmux display-message", &output.stderr));
         }
@@ -169,7 +247,7 @@ where
         ];
         args.extend(bytes.iter().map(|byte| format!("{byte:02X}")));
         let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let output = self.runner.run("tmux", &arg_refs)?;
+        let output = self.run(&arg_refs)?;
         if !output.success {
             return Err(command_failure("tmux send-keys", &output.stderr));
         }
@@ -181,16 +259,13 @@ where
         if columns < 2 || rows == 0 {
             return Err("invalid tmux pane dimensions".to_owned());
         }
-        let layout = self.runner.run(
-            "tmux",
-            &[
-                "display-message",
-                "-p",
-                "-t",
-                pane_id,
-                "#{window_panes} #{window_height} #{pane_height}",
-            ],
-        )?;
+        let layout = self.run(&[
+            "display-message",
+            "-p",
+            "-t",
+            pane_id,
+            "#{window_panes} #{window_height} #{pane_height}",
+        ])?;
         if !layout.success {
             return Err(command_failure("tmux display-message", &layout.stderr));
         }
@@ -218,18 +293,15 @@ where
         let columns = columns.to_string();
         let reserved_rows = window_height - pane_height;
         let window_rows = rows.saturating_add(reserved_rows).to_string();
-        let output = self.runner.run(
-            "tmux",
-            &[
-                "resize-window",
-                "-t",
-                pane_id,
-                "-x",
-                &columns,
-                "-y",
-                &window_rows,
-            ],
-        )?;
+        let output = self.run(&[
+            "resize-window",
+            "-t",
+            pane_id,
+            "-x",
+            &columns,
+            "-y",
+            &window_rows,
+        ])?;
         if !output.success {
             return Err(command_failure("tmux resize-window", &output.stderr));
         }
@@ -273,6 +345,7 @@ fn command_failure(command: &str, stderr: &str) -> String {
 pub struct LivePipe {
     pane_id: String,
     fifo_path: PathBuf,
+    tmux_program: OsString,
     reader: Option<JoinHandle<()>>,
 }
 
@@ -305,7 +378,8 @@ impl LivePipe {
             "cat >> {}",
             shell_single_quote(&fifo_path.to_string_lossy())
         );
-        let pipe = Command::new("tmux")
+        let tmux_program = resolve_tmux_program();
+        let pipe = Command::new(&tmux_program)
             .args(["pipe-pane", "-O", "-t", pane_id, &sink])
             .output()
             .map_err(|error| format!("cannot start tmux pipe-pane: {error}"))?;
@@ -340,6 +414,7 @@ impl LivePipe {
             Self {
                 pane_id: pane_id.to_owned(),
                 fifo_path,
+                tmux_program,
                 reader: Some(reader),
             },
             receiver,
@@ -349,7 +424,7 @@ impl LivePipe {
 
 impl Drop for LivePipe {
     fn drop(&mut self) {
-        let _ = Command::new("tmux")
+        let _ = Command::new(&self.tmux_program)
             .args(["pipe-pane", "-t", &self.pane_id])
             .output();
         if let Some(reader) = self.reader.take() {
@@ -377,17 +452,39 @@ fn normalize_capture(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::ffi::OsStr;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
     use crate::source::{CommandOutput, CommandRunner, ProcessRunner};
 
-    use super::{LivePipe, TmuxTransport, clean_demo_command};
+    use super::{LivePipe, TmuxTransport, clean_demo_args, resolve_tmux_program_from};
+
+    #[test]
+    fn native_tmux_resolution_survives_a_gui_path_without_homebrew() {
+        let directory = tempfile::tempdir().expect("create executable fixture directory");
+        let tmux = directory.path().join("tmux");
+        std::fs::write(&tmux, b"fixture").expect("create executable fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o700))
+                .expect("make executable fixture runnable");
+        }
+
+        let resolved = resolve_tmux_program_from(
+            None,
+            Some(OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin")),
+            std::slice::from_ref(&tmux),
+        );
+
+        assert_eq!(resolved, tmux.as_os_str());
+    }
 
     #[test]
     fn clean_demo_uses_an_isolated_shell_without_user_startup_files() {
-        let (program, args) = clean_demo_command("nopal-clean-demo-test");
-        assert_eq!(program, "tmux");
+        let args = clean_demo_args("nopal-clean-demo-test");
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["-s", "nopal-clean-demo-test"])

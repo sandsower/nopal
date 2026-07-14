@@ -670,8 +670,8 @@ mod tests {
     use super::{ProductionFeedConnection, ProductionFeedTransport, SessionServerFrameDecoder};
     use crate::activity::VerifiedSessionEvent;
     use crate::session_feed::{
-        ClientFeedFrame, FeedConnection, FeedErrorKind, FeedTransport, SessionEndpointVersion,
-        SessionFeedContext, SessionFeedServerFrame,
+        ClientFeedFrame, FeedConnection, FeedError, FeedErrorKind, FeedTransport,
+        SessionEndpointVersion, SessionFeedContext, SessionFeedServerFrame,
     };
 
     const PLOT_ID: &str = "plot-01";
@@ -994,6 +994,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn receive_terminal_error(connection: &mut ProductionFeedConnection) -> FeedError {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            match connection.try_receive() {
+                Err(error) => return error,
+                Ok(None) if std::time::Instant::now() < deadline => std::thread::yield_now(),
+                Ok(None) => panic!("Session feed did not expose peer closure before the deadline"),
+                Ok(Some(frame)) => {
+                    panic!("unexpected Session frame before peer closure: {frame:?}")
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn production_feed_connection_classifies_clean_and_partial_eof() {
         use std::os::unix::net::UnixStream;
@@ -1002,7 +1017,7 @@ mod tests {
         let mut connection =
             ProductionFeedConnection::from_unix_stream(stream, expected()).unwrap();
         drop(peer);
-        let clean = connection.try_receive().unwrap_err();
+        let clean = receive_terminal_error(&mut connection);
         assert_eq!(clean.kind, FeedErrorKind::Eof);
         assert!(clean.retryable());
 
@@ -1011,7 +1026,9 @@ mod tests {
             ProductionFeedConnection::from_unix_stream(stream, expected()).unwrap();
         peer.write_all(b"{\"kind\":").unwrap();
         drop(peer);
-        let partial = connection.try_receive().unwrap_err();
+        // A nonblocking stream may expose the final bytes before its peer closure becomes
+        // observable, so classification belongs to the bounded polling contract, not one read.
+        let partial = receive_terminal_error(&mut connection);
         assert_eq!(partial.kind, FeedErrorKind::Protocol);
         assert!(!partial.retryable());
     }

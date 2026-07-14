@@ -225,7 +225,7 @@ impl FieldShell {
                     .corner_radius(12.0)
                     .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
-                        let enabled = self.composer.active_target().is_some();
+                        let enabled = self.composer_submission_enabled();
                         let mut text = self
                             .composer
                             .active_draft()
@@ -651,28 +651,20 @@ impl FieldShell {
                         }
                     });
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.terminal_input)
-                            .desired_width(f32::INFINITY)
-                            .hint_text("Terminal input for this same Session"),
-                    );
-                    let submit = ui.button("Send Enter").clicked()
-                        || (response.has_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-                    if submit && !self.terminal_input.is_empty() {
-                        let sent = self.runtime.as_mut().is_some_and(|runtime| {
-                            runtime.terminal_binding_mut().is_some_and(|binding| {
-                                binding.controller_mut().is_some_and(|controller| {
-                                    controller.submit_instruction(&self.terminal_input)
-                                })
+                let row = terminal_input_row(ui, &mut self.terminal_input);
+                let submit = row.submitted;
+                if submit && !self.terminal_input.is_empty() {
+                    let sent = self.runtime.as_mut().is_some_and(|runtime| {
+                        runtime.terminal_binding_mut().is_some_and(|binding| {
+                            binding.controller_mut().is_some_and(|controller| {
+                                controller.submit_instruction(&self.terminal_input)
                             })
-                        });
-                        if sent {
-                            self.terminal_input.clear();
-                        }
+                        })
+                    });
+                    if sent {
+                        self.terminal_input.clear();
                     }
-                });
+                }
             });
     }
 
@@ -684,6 +676,52 @@ impl FieldShell {
             self.composer.retarget(target);
         }
     }
+
+    fn composer_submission_enabled(&self) -> bool {
+        self.composer.active_target().is_some()
+            && self
+                .runtime
+                .as_ref()
+                .is_some_and(LiveSessionRuntime::can_submit)
+    }
+}
+
+struct TerminalInputRow {
+    submitted: bool,
+    #[cfg(test)]
+    input_bounds: egui::Rect,
+    #[cfg(test)]
+    button_bounds: egui::Rect,
+    #[cfg(test)]
+    clip_bounds: egui::Rect,
+}
+
+fn terminal_input_row(ui: &mut egui::Ui, terminal_input: &mut String) -> TerminalInputRow {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Reserve the fixed-width action first so the expanding editor can only consume
+            // the space that genuinely remains inside the row.
+            let button = ui.button("Send Enter");
+            let response = ui.add(
+                egui::TextEdit::singleline(terminal_input)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("Terminal input for this same Session"),
+            );
+            TerminalInputRow {
+                submitted: button.clicked()
+                    || (response.has_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter))),
+                #[cfg(test)]
+                input_bounds: response.rect,
+                #[cfg(test)]
+                button_bounds: button.rect,
+                #[cfg(test)]
+                clip_bounds: ui.clip_rect(),
+            }
+        })
+        .inner
+    })
+    .inner
 }
 
 fn top_bar(ui: &mut egui::Ui, quit_requested: &mut bool) {
@@ -791,6 +829,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terminal_input_row_keeps_every_control_inside_its_clip_bounds() {
+        let context = egui::Context::default();
+        configure_context(&context);
+        let mut terminal_input = String::new();
+        let mut bounds = None;
+
+        let _ = context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(520.0, 120.0),
+                )),
+                focused: true,
+                ..Default::default()
+            },
+            |ui| bounds = Some(terminal_input_row(ui, &mut terminal_input)),
+        );
+
+        let bounds = bounds.expect("terminal input row should render");
+        assert!(
+            bounds.clip_bounds.contains_rect(bounds.input_bounds),
+            "terminal input extends beyond the row clip: {:?} outside {:?}",
+            bounds.input_bounds,
+            bounds.clip_bounds
+        );
+        assert!(
+            bounds.clip_bounds.contains_rect(bounds.button_bounds),
+            "terminal submit button extends beyond the row clip: {:?} outside {:?}",
+            bounds.button_bounds,
+            bounds.clip_bounds
+        );
+    }
+
+    #[test]
     fn headless_field_renders_structured_ui_and_accessibility_tree() {
         let snapshot = parse_field(&serde_json::json!({
             "kind": "nopal.field/v1",
@@ -851,6 +923,10 @@ mod tests {
             runtime,
             startup_diagnostics: Vec::new(),
         });
+        assert!(
+            !shell.composer_submission_enabled(),
+            "Composer must not advertise submission without a live structured Session"
+        );
         shell.activate_session_with(ExactSessionSelection::new("plot-a", "session-b"), |_, _| {
             Err("replacement binding unavailable".to_owned())
         });

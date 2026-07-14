@@ -334,7 +334,7 @@ where
 }
 
 fn run_terminal_worker(context: TerminalWorkerContext) {
-    let transport = TmuxTransport::new(TimedProcessRunner::new(TERMINAL_COMMAND_TIMEOUT));
+    let transport = TmuxTransport::production(TimedProcessRunner::new(TERMINAL_COMMAND_TIMEOUT));
     run_terminal_worker_with_transport(context, &transport);
 }
 
@@ -550,7 +550,7 @@ fn resolve_production_host_process(
         .host_pane
         .as_ref()
         .ok_or_else(|| "selected Session has no live terminal pane".to_owned())?;
-    let process_id = TmuxTransport::new(TimedProcessRunner::new(TERMINAL_COMMAND_TIMEOUT))
+    let process_id = TmuxTransport::production(TimedProcessRunner::new(TERMINAL_COMMAND_TIMEOUT))
         .pane_process_id(pane_id)?;
     SessionHostProcessIdentity::new(process_id)
         .map_err(|error| format!("invalid Session host process identity: {error}"))
@@ -563,7 +563,7 @@ fn bind_production_terminal(
         .host_pane
         .as_ref()
         .ok_or_else(|| "selected Session has no live terminal pane".to_owned())?;
-    let transport = TmuxTransport::new(TimedProcessRunner::new(TERMINAL_COMMAND_TIMEOUT));
+    let transport = TmuxTransport::production(TimedProcessRunner::new(TERMINAL_COMMAND_TIMEOUT));
     let (handshake, ownership) =
         establish_terminal_ownership(pane_id, || capture_terminal_handshake(&transport, pane_id))?;
     let process_identity = TerminalProcessIdentity::new(handshake.process_id)
