@@ -443,7 +443,8 @@ Everything above (the config/envelope surface and the Beislið process/proof-art
 
 ### Releases
 
-Every merge to `main` runs `.github/workflows/version-bump.yml`, which increments the workspace patch version, commits it, and creates an annotated `vX.Y.Z` tag.
+Every non-release merge to `main` runs `.github/workflows/version-bump.yml`, which prepares the next workspace patch version on an automation branch and opens or refreshes a protected pull request.
+The workflow explicitly dispatches CI for that branch, requests squash auto-merge, and creates the annotated `vX.Y.Z` tag only after the protected version pull request lands.
 GitHub does not start a new workflow for a tag pushed by another workflow's `GITHUB_TOKEN`, so version-bump calls `.github/workflows/release.yml` as a reusable workflow after pushing the tag.
 The release workflow also listens for independently pushed `v*` tags.
 
