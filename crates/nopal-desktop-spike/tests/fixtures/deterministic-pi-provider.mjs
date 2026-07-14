@@ -2,6 +2,8 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 
 const PROVIDER = "nopal-proof";
 const MODEL = "deterministic";
+const SECOND_MODEL = "deterministic-b";
+const MODEL_PROMPT = "model switch proof";
 const TOOL_PROMPT = "tool loop proof";
 const TOOL_CALL_ID = "nopal-proof-read-cargo";
 const SHELL_PROMPT = "shell activity proof";
@@ -100,6 +102,8 @@ function streamDeterministic(model, context) {
 			pushToolCall(stream, output, selectedTool);
 		} else if (selectedTool !== undefined) {
 			pushText(stream, output, `Nopal deterministic assistant after tool: ${prompt}`);
+		} else if (prompt === MODEL_PROMPT) {
+			pushText(stream, output, `Nopal deterministic model: ${model.id}`);
 		} else {
 			pushText(stream, output, `Nopal deterministic assistant: ${prompt}`);
 		}
@@ -117,15 +121,15 @@ export default function deterministicProvider(pi) {
 		baseUrl: "http://127.0.0.1:1/not-used",
 		apiKey: "deterministic-local-fixture",
 		api: "nopal-proof-api",
-		models: [{
-			id: MODEL,
-			name: "Nopal deterministic proof model",
+		models: [MODEL, SECOND_MODEL].map((id) => ({
+			id,
+			name: id === MODEL ? "Nopal deterministic proof model" : "Nopal deterministic proof model B",
 			reasoning: false,
 			input: ["text"],
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 			contextWindow: 4096,
 			maxTokens: 256,
-		}],
+		})),
 		streamSimple: streamDeterministic,
 	});
 }

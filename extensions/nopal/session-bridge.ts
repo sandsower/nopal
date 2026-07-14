@@ -29,13 +29,18 @@ import {
 
 export { SESSION_EVENT_ENTRY };
 export { MAX_SESSION_IDENTITY_BYTES };
-export const SESSION_ENDPOINT_KIND = "nopal.session/v3" as const;
+export const SESSION_ENDPOINT_KIND = "nopal.session/v4" as const;
 export const SESSION_COMMAND_KIND = "nopal.session.command/v1" as const;
 export const SESSION_EVENT_KIND = SESSION_EVENT_V3_KIND;
 export const SESSION_SUBSCRIBE_KIND = "nopal.session.subscribe/v1" as const;
 export const SESSION_REPLAY_COMPLETE_KIND = "nopal.session.replay_complete/v1" as const;
 export const SESSION_FEED_ERROR_KIND = "nopal.session.feed_error/v1" as const;
+export const SESSION_MODEL_REQUEST_KIND = "nopal.session.model.request/v1" as const;
+export const SESSION_MODEL_STATE_KIND = "nopal.session.model.state/v1" as const;
+export const SESSION_MODEL_ERROR_KIND = "nopal.session.model.error/v1" as const;
 export const MAX_JSONL_LINE_BYTES = 1024 * 1024;
+export const MAX_SESSION_MODELS = 2048;
+export const MAX_MODEL_REQUEST_CACHE = 128;
 export const MAX_REPLAY_LIVE_EVENTS = 128;
 export const MAX_REPLAY_LIVE_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_REPLAY_PAGE_LIMIT = 256;
@@ -110,7 +115,56 @@ export type SessionFeedError = {
 	message: string;
 };
 
-export type SessionFeedFrame = DurableSessionEvent | SessionReplayComplete | SessionFeedError;
+export type SessionFeedFrame =
+	| DurableSessionEvent
+	| SessionReplayComplete
+	| SessionFeedError
+	| SessionModelState
+	| SessionModelError;
+
+export type SessionModelLike = {
+	provider: string;
+	id: string;
+	name: string;
+	[key: string]: unknown;
+};
+
+export type SessionModelRequest = {
+	kind: typeof SESSION_MODEL_REQUEST_KIND;
+	request_id: string;
+	plot_id: string;
+	session_id: string;
+	request:
+		| { type: "refresh"; [key: string]: unknown }
+		| { type: "switch"; model: { provider: string; id: string; [key: string]: unknown }; [key: string]: unknown };
+	[key: string]: unknown;
+};
+
+export type SessionModelState = {
+	kind: typeof SESSION_MODEL_STATE_KIND;
+	plot_id: string;
+	session_id: string;
+	request_id: string | null;
+	state_epoch: string;
+	revision: number;
+	agent_state: "idle" | "active";
+	current: SessionModelLike | null;
+	available: SessionModelLike[];
+	available_complete: boolean;
+	available_total: number;
+};
+
+export type SessionModelError = {
+	kind: typeof SESSION_MODEL_ERROR_KIND;
+	request_id: string;
+	plot_id: string;
+	session_id: string;
+	code: "busy" | "unknown_model" | "conflict" | "unavailable" | "internal";
+	retryable: boolean;
+	message: string;
+};
+
+export type SessionModelResponse = SessionModelState | SessionModelError;
 
 export type SessionCommandResult =
 	| { kind: "accepted" }
@@ -149,6 +203,223 @@ function isSafeIdentity(value: unknown): value is string {
 		&& value.trim().length > 0
 		&& Buffer.byteLength(value, "utf8") <= MAX_SESSION_IDENTITY_BYTES
 		&& !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+
+function parseModelRequest(value: unknown): SessionModelRequest | undefined {
+	if (!isObject(value) || value.kind !== SESSION_MODEL_REQUEST_KIND) return undefined;
+	if (!isSafeIdentity(value.request_id) || !isSafeIdentity(value.plot_id) || !isSafeIdentity(value.session_id)) {
+		return undefined;
+	}
+	if (!isObject(value.request)) return undefined;
+	if (value.request.type === "refresh") return value as SessionModelRequest;
+	if (value.request.type !== "switch" || !isObject(value.request.model)) return undefined;
+	if (!isSafeIdentity(value.request.model.provider) || !isSafeIdentity(value.request.model.id)) return undefined;
+	return value as SessionModelRequest;
+}
+
+type SessionModelControllerEffects = {
+	available(): readonly SessionModelLike[];
+	current(): SessionModelLike | undefined;
+	isIdle(): boolean;
+	setModel(model: SessionModelLike): Promise<boolean>;
+};
+
+/**
+ * Exact-Session live model authority projected from Pi.
+ *
+ * This controller never persists model facts into durable Session history.
+ * Every response is rebuilt from Pi-owned current and available model state.
+ */
+export class SessionModelController {
+	readonly binding: SessionBinding;
+	readonly #effects: SessionModelControllerEffects;
+	readonly #epoch = randomUUID();
+	#revision = 0;
+	#switching = false;
+	#switchAcknowledgement: Promise<void> = Promise.resolve();
+	readonly #listeners = new Set<(state: SessionModelState) => void>();
+	readonly #requests = new Map<string, {
+		fingerprint: string;
+		response: Promise<SessionModelResponse>;
+		settled: boolean;
+	}>();
+
+	constructor(binding: SessionBinding, effects: SessionModelControllerEffects) {
+		if (!isSafeIdentity(binding.plotId) || !isSafeIdentity(binding.sessionId)) {
+			throw new Error("invalid Nopal Session model binding identity");
+		}
+		this.binding = { ...binding };
+		this.#effects = effects;
+	}
+
+	snapshot(requestId: string | null = null): SessionModelState {
+		this.#revision += 1;
+		const seen = new Set<string>();
+		const candidates = [...this.#effects.available()]
+			.filter(isModelLike)
+			.sort(compareModels)
+			.filter((model) => {
+				const identity = `${model.provider}\0${model.id}`;
+				if (seen.has(identity)) return false;
+				seen.add(identity);
+				return true;
+			})
+			.map(modelDescriptor);
+		const current = this.#effects.current();
+		const state: SessionModelState = {
+			kind: SESSION_MODEL_STATE_KIND,
+			plot_id: this.binding.plotId,
+			session_id: this.binding.sessionId,
+			request_id: requestId,
+			state_epoch: this.#epoch,
+			revision: this.#revision,
+			agent_state: this.#effects.isIdle() && !this.#switching ? "idle" : "active",
+			current: current && isModelLike(current) ? modelDescriptor(current) : null,
+			available: [],
+			available_complete: false,
+			available_total: candidates.length,
+		};
+		let serializedBytes = Buffer.byteLength(JSON.stringify(state), "utf8");
+		for (const model of candidates) {
+			if (state.available.length >= MAX_SESSION_MODELS) break;
+			const modelBytes = Buffer.byteLength(JSON.stringify(model), "utf8");
+			const separatorBytes = state.available.length === 0 ? 0 : 1;
+			if (serializedBytes + separatorBytes + modelBytes > MAX_JSONL_LINE_BYTES) break;
+			state.available.push(model);
+			serializedBytes += separatorBytes + modelBytes;
+		}
+		state.available_complete = state.available.length === candidates.length;
+		return state;
+	}
+
+	subscribe(listener: (state: SessionModelState) => void): () => void {
+		this.#listeners.add(listener);
+		return () => this.#listeners.delete(listener);
+	}
+
+	publish(): SessionModelState {
+		const state = this.snapshot();
+		for (const listener of this.#listeners) listener(state);
+		return state;
+	}
+
+	close(): void {
+		this.#listeners.clear();
+	}
+
+	/** Every client shares this barrier so no Session prompt can overtake a switch acknowledgement. */
+	trackSwitchAcknowledgement(operation: Promise<unknown>): void {
+		const previous = this.#switchAcknowledgement;
+		this.#switchAcknowledgement = Promise.allSettled([previous, operation]).then(() => undefined);
+	}
+
+	waitForSwitchAcknowledgement(): Promise<void> {
+		return this.#switchAcknowledgement;
+	}
+
+	accept(value: unknown): Promise<SessionModelResponse> {
+		const request = parseModelRequest(value);
+		if (!request) return Promise.resolve(this.#error("invalid", "internal", "invalid model control request", false));
+		if (request.plot_id !== this.binding.plotId || request.session_id !== this.binding.sessionId) {
+			return Promise.resolve(this.#error(request.request_id, "conflict", "model request identity does not match this Plot Session", false));
+		}
+		const fingerprint = request.request.type === "refresh"
+			? "refresh"
+			: `switch\0${request.request.model.provider}\0${request.request.model.id}`;
+		const previous = this.#requests.get(request.request_id);
+		if (previous) {
+			return previous.fingerprint === fingerprint
+				? previous.response
+				: Promise.resolve(this.#error(request.request_id, "conflict", "model request id was reused for different content", false));
+		}
+		const response = this.#acceptNew(request);
+		const entry = { fingerprint, response, settled: false };
+		const settle = () => {
+			entry.settled = true;
+			this.#trimRequests();
+		};
+		void response.then(settle, settle);
+		this.#requests.set(request.request_id, entry);
+		this.#trimRequests();
+		return response;
+	}
+
+	#trimRequests(): void {
+		while (this.#requests.size > MAX_MODEL_REQUEST_CACHE) {
+			const oldestSettled = [...this.#requests].find(([, entry]) => entry.settled)?.[0];
+			if (!oldestSettled) return;
+			this.#requests.delete(oldestSettled);
+		}
+	}
+
+	async #acceptNew(request: SessionModelRequest): Promise<SessionModelResponse> {
+		if (request.request.type === "refresh") return this.snapshot(request.request_id);
+		if (!this.#effects.isIdle() || this.#switching) {
+			return this.#error(request.request_id, "busy", "wait for the active Pi response to settle", true);
+		}
+		const target = this.#effects.available().find((model) =>
+			isModelLike(model)
+			&& model.provider === request.request.model.provider
+			&& model.id === request.request.model.id);
+		if (!target) {
+			return this.#error(request.request_id, "unknown_model", "Pi did not report the requested model as available", false);
+		}
+		this.#switching = true;
+		try {
+			if (!await this.#effects.setModel(target)) {
+				return this.#error(request.request_id, "unavailable", "Pi rejected the requested model", true);
+			}
+			this.#switching = false;
+			const current = this.#effects.current();
+			if (!current || current.provider !== target.provider || current.id !== target.id) {
+				return this.#error(request.request_id, "unavailable", "Pi did not confirm the requested model as current", true);
+			}
+			return this.snapshot(request.request_id);
+		} catch (error) {
+			return this.#error(request.request_id, "internal", `Pi model switch failed: ${errorMessage(error)}`, true);
+		} finally {
+			this.#switching = false;
+		}
+	}
+
+	#error(
+		requestId: string,
+		code: SessionModelError["code"],
+		message: string,
+		retryable: boolean,
+	): SessionModelError {
+		return {
+			kind: SESSION_MODEL_ERROR_KIND,
+			request_id: requestId,
+			plot_id: this.binding.plotId,
+			session_id: this.binding.sessionId,
+			code,
+			retryable,
+			message: boundedFeedMessage(message),
+		};
+	}
+}
+
+function isModelLike(value: unknown): value is SessionModelLike {
+	return isObject(value)
+		&& isSafeIdentity(value.provider)
+		&& isSafeIdentity(value.id)
+		&& isSafeIdentity(value.name);
+}
+
+function modelDescriptor(model: SessionModelLike): SessionModelLike {
+	return { provider: model.provider, id: model.id, name: model.name };
+}
+
+function compareModels(left: SessionModelLike, right: SessionModelLike): number {
+	return compareUtf8(left.provider, right.provider)
+		|| compareUtf8(left.name, right.name)
+		|| compareUtf8(left.id, right.id);
+}
+
+function compareUtf8(left: string, right: string): number {
+	// Byte ordering is stable across host locales and matches the Rust consumer's string ordering.
+	return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
 export function retainRecentSessionCursors(
@@ -569,6 +840,7 @@ export class JsonlDecoder {
 
 type FeedConnectionOptions = {
 	engine: SessionProtocolEngine;
+	modelController?: SessionModelController;
 	send(frame: SessionFeedFrame): void | Promise<void>;
 	fail?(frame: SessionFeedError): void | Promise<void>;
 	finish?(): void | Promise<void>;
@@ -578,6 +850,7 @@ type FeedConnectionOptions = {
 
 export class SessionFeedConnection {
 	readonly #engine: SessionProtocolEngine;
+	readonly #modelController?: SessionModelController;
 	readonly #sendEffect: FeedConnectionOptions["send"];
 	readonly #failEffect?: FeedConnectionOptions["fail"];
 	readonly #finishEffect: NonNullable<FeedConnectionOptions["finish"]>;
@@ -585,6 +858,8 @@ export class SessionFeedConnection {
 	readonly #replayYield?: FeedConnectionOptions["replayYield"];
 	readonly #liveBuffer: DurableSessionEvent[] = [];
 	readonly #unsubscribe: () => void;
+	readonly #unsubscribeModel?: () => void;
+	#pendingModelState?: SessionModelState;
 	#requestId: string | null = null;
 	#liveBytes = 0;
 	#subscribed = false;
@@ -593,12 +868,14 @@ export class SessionFeedConnection {
 
 	constructor(options: FeedConnectionOptions) {
 		this.#engine = options.engine;
+		this.#modelController = options.modelController;
 		this.#sendEffect = options.send;
 		this.#failEffect = options.fail;
 		this.#finishEffect = options.finish ?? options.close;
 		this.#closeEffect = options.close;
 		this.#replayYield = options.replayYield;
 		this.#unsubscribe = this.#engine.subscribe((event) => this.#onLive(event));
+		this.#unsubscribeModel = this.#modelController?.subscribe((state) => this.#onModelState(state));
 	}
 
 	async accept(record: unknown): Promise<void> {
@@ -625,6 +902,32 @@ export class SessionFeedConnection {
 			await this.protocolViolation("one client connection may subscribe only once");
 			return;
 		}
+		const modelRequest = parseModelRequest(record);
+		if (modelRequest) {
+			if (!this.#modelController) {
+				await this.protocolViolation("Session endpoint does not provide model control");
+				return;
+			}
+			const operation = (async () => {
+				try {
+					const response = await this.#modelController!.accept(record);
+					await this.#send(response);
+				} catch (error) {
+					await this.#fatal(
+						"unavailable",
+						`could not acknowledge model request: ${errorMessage(error)}`,
+						true,
+					);
+				}
+			})();
+			if (modelRequest.request.type === "switch") {
+				this.#modelController.trackSwitchAcknowledgement(operation);
+			}
+			await operation;
+			return;
+		}
+		await this.#modelController?.waitForSwitchAcknowledgement();
+		if (this.#closed) return;
 		const result = await this.#engine.accept(record);
 		if (result.kind === "error") {
 			await this.#fatal(result.error.code, result.error.message, result.error.retryable);
@@ -671,6 +974,10 @@ export class SessionFeedConnection {
 				sequence: snapshotSequence,
 				event_count: emitted,
 			});
+			if (this.#modelController) {
+				await this.#send(this.#pendingModelState ?? this.#modelController.snapshot());
+				this.#pendingModelState = undefined;
+			}
 			while (this.#liveBuffer.length > 0) {
 				const event = this.#liveBuffer[0];
 				if (!event) break;
@@ -710,6 +1017,16 @@ export class SessionFeedConnection {
 		this.#liveBytes += bytes;
 	}
 
+	#onModelState(state: SessionModelState): void {
+		if (this.#closed || !this.#subscribed) return;
+		if (this.#replaying) {
+			this.#pendingModelState = state;
+			return;
+		}
+		void this.#send(state).catch((error) =>
+			this.#fatal("unavailable", `could not write live model state: ${errorMessage(error)}`, true));
+	}
+
 	async #fatal(code: SessionFeedErrorCode, message: string, retryable = false): Promise<void> {
 		if (!this.#beginClose()) return;
 		const frame: SessionFeedError = {
@@ -741,6 +1058,7 @@ export class SessionFeedConnection {
 		if (this.#closed) return false;
 		this.#closed = true;
 		this.#unsubscribe();
+		this.#unsubscribeModel?.();
 		this.#liveBuffer.length = 0;
 		this.#liveBytes = 0;
 		return true;
@@ -779,7 +1097,13 @@ class SocketFrameWriter {
 		if (!this.#accepting || this.#socket.destroyed) {
 			return Promise.reject(new Error("Session feed socket is closed"));
 		}
-		const line = `${JSON.stringify(frame)}\n`;
+		const payload = JSON.stringify(frame);
+		if (Buffer.byteLength(payload, "utf8") > MAX_JSONL_LINE_BYTES) {
+			const error = new Error("Session feed frame exceeds the 1 MiB line limit");
+			this.#beginFailure(error);
+			return Promise.reject(error);
+		}
+		const line = `${payload}\n`;
 		const bytes = Buffer.byteLength(line, "utf8");
 		if (
 			this.#queuedFrames >= MAX_SOCKET_QUEUE_FRAMES
@@ -1050,11 +1374,13 @@ class UnixSessionServer {
 export class NopalSessionBridge {
 	readonly path: string;
 	readonly engine: SessionProtocolEngine;
+	readonly modelController?: SessionModelController;
 	readonly #server: UnixSessionServer;
 
-	constructor(options: { path: string; engine: SessionProtocolEngine }) {
+	constructor(options: { path: string; engine: SessionProtocolEngine; modelController?: SessionModelController }) {
 		this.path = options.path;
 		this.engine = options.engine;
+		this.modelController = options.modelController;
 		this.#server = new UnixSessionServer(this.path, (socket) => this.#acceptClient(socket));
 	}
 
@@ -1074,6 +1400,7 @@ export class NopalSessionBridge {
 
 	async close(): Promise<void> {
 		this.engine.close();
+		this.modelController?.close();
 		await this.#server.close();
 	}
 
@@ -1081,6 +1408,7 @@ export class NopalSessionBridge {
 		const writer = new SocketFrameWriter(socket);
 		const feed = new SessionFeedConnection({
 			engine: this.engine,
+			modelController: this.modelController,
 			send: (frame) => writer.send(frame),
 			fail: (frame) => writer.fail(frame),
 			finish: () => writer.finish(),
@@ -1162,6 +1490,7 @@ export type SessionBridgeAdapter = {
 export type SessionBridgeFactory = (options: {
 	path: string;
 	engine: SessionProtocolEngine;
+	modelController?: SessionModelController;
 }) => SessionBridgeAdapter;
 
 export function registerNopalSessionBridge(
@@ -1177,7 +1506,11 @@ export function registerNopalSessionBridge(
 ): SessionBridgeRegistration {
 	let bridge: SessionBridgeAdapter | undefined;
 	let engine: SessionProtocolEngine | undefined;
+	let modelController: SessionModelController | undefined;
 	let activityProducer: SessionActivityProducer | undefined;
+	let modelRegistry: { getAvailable(): readonly SessionModelLike[] } | undefined;
+	let currentModel: SessionModelLike | undefined;
+	let agentIdle = true;
 	let activeBinding: SessionBinding | undefined;
 	let activeHistory = options.history;
 	let transition: Promise<void> = Promise.resolve();
@@ -1201,10 +1534,13 @@ export function registerNopalSessionBridge(
 	const closeActive = async () => {
 		rememberEngine();
 		const current = bridge;
+		const currentModelController = modelController;
 		bridge = undefined;
 		engine = undefined;
+		modelController = undefined;
 		activityProducer = undefined;
 		activeBinding = undefined;
+		currentModelController?.close();
 		await current?.close();
 	};
 	const historyFromContext = (ctx: unknown): SessionHistorySource | undefined => {
@@ -1212,6 +1548,10 @@ export function registerNopalSessionBridge(
 		return isObject(manager) && typeof manager.getBranch === "function"
 			? manager as unknown as SessionHistorySource
 			: undefined;
+	};
+	const idleFromContext = (ctx: unknown): boolean => {
+		const isIdle = (ctx as { isIdle?: unknown } | undefined)?.isIdle;
+		return typeof isIdle === "function" ? Boolean(isIdle.call(ctx)) : true;
 	};
 	const createEngine = (binding: SessionBinding, branch: readonly PiSessionEntry[]): SessionProtocolEngine => {
 		const effects = {
@@ -1269,9 +1609,16 @@ export function registerNopalSessionBridge(
 				return undefined;
 			}
 		}
+		const nextModelController = new SessionModelController(binding, {
+			available: () => modelRegistry?.getAvailable() ?? [],
+			current: () => currentModel,
+			isIdle: () => agentIdle,
+			setModel: async (model) => pi.setModel(model as Parameters<ExtensionAPI["setModel"]>[0]),
+		});
 		const next = (options.bridgeFactory ?? ((bridgeOptions) => new NopalSessionBridge(bridgeOptions)))({
 			path: defaultSessionSocketPath(binding, options.runtimeRoot),
 			engine: nextEngine,
+			modelController: nextModelController,
 		});
 		try {
 			const nextActivityProducer = new SessionActivityProducer({
@@ -1286,6 +1633,7 @@ export function registerNopalSessionBridge(
 			}
 			bridge = next;
 			engine = nextEngine;
+			modelController = nextModelController;
 			activityProducer = nextActivityProducer;
 			activeBinding = { ...binding };
 			rememberEngine();
@@ -1329,6 +1677,9 @@ export function registerNopalSessionBridge(
 
 	pi.on("session_start", async (_event, ctx) => {
 		const generation = ++lifecycleGeneration;
+		modelRegistry = ctx.modelRegistry as unknown as { getAvailable(): readonly SessionModelLike[] };
+		currentModel = ctx.model as unknown as SessionModelLike | undefined;
+		agentIdle = idleFromContext(ctx);
 		await serialize(async () => {
 			if (permanentlyClosed || generation !== lifecycleGeneration) return undefined;
 			stopped = false;
@@ -1345,6 +1696,9 @@ export function registerNopalSessionBridge(
 	});
 
 	pi.on("session_tree", async (_event, ctx) => {
+		modelRegistry = ctx.modelRegistry as unknown as { getAvailable(): readonly SessionModelLike[] };
+		currentModel = ctx.model as unknown as SessionModelLike | undefined;
+		agentIdle = idleFromContext(ctx);
 		await serialize(async () => {
 			if (!activeBinding || stopped || permanentlyClosed) return undefined;
 			activeHistory = historyFromContext(ctx) ?? activeHistory;
@@ -1361,6 +1715,8 @@ export function registerNopalSessionBridge(
 		return { action: "continue" };
 	});
 	pi.on("agent_start", () => {
+		agentIdle = false;
+		modelController?.publish();
 		engine?.observeAgentStart();
 	});
 	pi.on("message_end", (event) => {
@@ -1372,6 +1728,14 @@ export function registerNopalSessionBridge(
 		} catch {
 			// Persistence failure leaves the prior durable prefix authoritative.
 		}
+	});
+	pi.on("agent_settled", () => {
+		agentIdle = true;
+		modelController?.publish();
+	});
+	pi.on("model_select", (event) => {
+		currentModel = event.model as unknown as SessionModelLike;
+		modelController?.publish();
 	});
 	pi.on("session_shutdown", async () => {
 		stopped = true;

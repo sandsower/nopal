@@ -232,7 +232,7 @@ fn plot_establishment_cli_binds_and_updates_the_structured_protocol_endpoint()
     assert_eq!(
         first["plot"]["sessions"][0]["protocol"],
         serde_json::json!({
-            "kind": "nopal.session/v3",
+            "kind": "nopal.session/v4",
             "transport": "unix",
             "address": "/tmp/nopal-session-1.sock",
             "state": "starting"
