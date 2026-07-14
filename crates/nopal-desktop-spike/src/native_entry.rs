@@ -41,9 +41,10 @@ mod unix {
     /// Runs the native Field or activates the already-resident instance.
     pub fn run() -> Result<(), String> {
         let arguments = std::env::args_os().collect::<Vec<_>>();
-        let state_dir = state_dir(&arguments)?;
+        let state_roots = state_roots(&arguments)?;
         let release_channel = release_channel()?;
-        let (scope, core_state_dir) = scope_and_core_state_dir(&state_dir, release_channel)?;
+        let (scope, canonical_state_dir) =
+            scope_and_core_state_dir(&state_roots.lifecycle_state_dir, release_channel)?;
         let scope_fingerprint = scope.fingerprint().to_owned();
         let coordinator = UnixInstanceCoordinator::with_default_control_root(scope.clone())
             .map_err(|error| format!("cannot prepare native instance coordination: {error}"))?;
@@ -52,8 +53,12 @@ mod unix {
             scope_fingerprint: scope.fingerprint().to_owned(),
         };
         let recovery = ScopedOwnedResourceRecovery::new(FailClosedRecoveryAdapter);
-        let core =
-            CliCoreFieldSnapshotSource::production(nopal_binary()).with_state_dir(core_state_dir);
+        let core = CliCoreFieldSnapshotSource::production(nopal_binary());
+        let core = if state_roots.core_state_dir.is_some() {
+            core.with_state_dir(canonical_state_dir)
+        } else {
+            core
+        };
         let host_factory = EframeHostFactory::default();
         let bridge = host_factory.bridge();
         let mut product = NativeFieldProduct::new(
@@ -224,18 +229,43 @@ mod unix {
         }
     }
 
-    fn state_dir(arguments: &[OsString]) -> Result<PathBuf, String> {
-        let explicit = argument_value(arguments, "--state-dir")?;
-        Ok(explicit
-            .or_else(|| std::env::var_os("BEISLID_STATE_DIR").map(PathBuf::from))
-            .unwrap_or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."))
-                    .join(".local")
-                    .join("state")
-                    .join("beislid")
-            }))
+    #[derive(Debug, Eq, PartialEq)]
+    struct NativeStateRoots {
+        lifecycle_state_dir: PathBuf,
+        core_state_dir: Option<PathBuf>,
+    }
+
+    fn state_roots(arguments: &[OsString]) -> Result<NativeStateRoots, String> {
+        state_roots_from(
+            arguments,
+            std::env::var_os("NOPAL_STATE_DIR"),
+            std::env::var_os("HOME"),
+        )
+    }
+
+    fn state_roots_from(
+        arguments: &[OsString],
+        nopal_state_dir: Option<OsString>,
+        home: Option<OsString>,
+    ) -> Result<NativeStateRoots, String> {
+        if let Some(explicit) = argument_value(arguments, "--state-dir")? {
+            return Ok(NativeStateRoots {
+                lifecycle_state_dir: explicit.clone(),
+                core_state_dir: Some(explicit),
+            });
+        }
+
+        let lifecycle_state_dir = nopal_state_dir.map(PathBuf::from).unwrap_or_else(|| {
+            home.map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local")
+                .join("state")
+                .join("nopal")
+        });
+        Ok(NativeStateRoots {
+            lifecycle_state_dir,
+            core_state_dir: None,
+        })
     }
 
     fn argument_value(arguments: &[OsString], flag: &str) -> Result<Option<PathBuf>, String> {
@@ -322,6 +352,42 @@ mod unix {
                 let rejected = rejected.into_iter().map(OsString::from).collect::<Vec<_>>();
                 assert!(argument_value(&rejected, "--state-dir").is_err());
             }
+        }
+
+        #[test]
+        fn default_native_scope_preserves_cores_split_state_roots() {
+            let arguments = ["nopal-field-native"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+
+            let roots = state_roots_from(
+                &arguments,
+                Some(OsString::from("/nopal-state")),
+                Some(OsString::from("/home")),
+            )
+            .expect("resolve default state roots");
+
+            assert_eq!(roots.lifecycle_state_dir, PathBuf::from("/nopal-state"));
+            assert_eq!(roots.core_state_dir, None);
+        }
+
+        #[test]
+        fn explicit_native_state_root_unifies_core_stores() {
+            let arguments = ["nopal-field-native", "--state-dir", "/isolated"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+
+            let roots = state_roots_from(
+                &arguments,
+                Some(OsString::from("/nopal-state")),
+                Some(OsString::from("/home")),
+            )
+            .expect("resolve explicit state root");
+
+            assert_eq!(roots.lifecycle_state_dir, PathBuf::from("/isolated"));
+            assert_eq!(roots.core_state_dir, Some(PathBuf::from("/isolated")));
         }
 
         #[test]
