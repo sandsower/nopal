@@ -228,16 +228,31 @@ mod unix {
 
     fn state_dir(arguments: &[OsString]) -> Result<PathBuf, String> {
         let explicit = argument_value(arguments, "--state-dir")?;
-        Ok(explicit
-            .or_else(|| std::env::var_os("BEISLID_STATE_DIR").map(PathBuf::from))
+        Ok(resolve_state_dir(
+            explicit,
+            std::env::var_os("NOPAL_STATE_DIR").map(PathBuf::from),
+            std::env::var_os("BEISLID_STATE_DIR").map(PathBuf::from),
+            std::env::var_os("HOME").map(PathBuf::from),
+        ))
+    }
+
+    fn resolve_state_dir(
+        explicit: Option<PathBuf>,
+        nopal_state_dir: Option<PathBuf>,
+        beislid_state_dir: Option<PathBuf>,
+        home: Option<PathBuf>,
+    ) -> PathBuf {
+        explicit
+            .or(nopal_state_dir)
+            // Preserve the former environment override for existing launchers,
+            // but do not let it outrank Nopal's own Core state-root contract.
+            .or(beislid_state_dir)
             .unwrap_or_else(|| {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("."))
+                home.unwrap_or_else(|| PathBuf::from("."))
                     .join(".local")
                     .join("state")
-                    .join("beislid")
-            }))
+                    .join("nopal")
+            })
     }
 
     fn argument_value(arguments: &[OsString], flag: &str) -> Result<Option<PathBuf>, String> {
@@ -324,6 +339,35 @@ mod unix {
                 let rejected = rejected.into_iter().map(OsString::from).collect::<Vec<_>>();
                 assert!(argument_value(&rejected, "--state-dir").is_err());
             }
+        }
+
+        #[test]
+        fn native_state_root_matches_core_nopal_defaults_and_precedence() {
+            let home = PathBuf::from("/home/nopal-user");
+            let expected_default = home.join(".local").join("state").join("nopal");
+
+            assert_eq!(
+                resolve_state_dir(None, None, None, Some(home)),
+                expected_default
+            );
+            assert_eq!(
+                resolve_state_dir(
+                    None,
+                    Some(PathBuf::from("/nopal-state")),
+                    Some(PathBuf::from("/legacy-state")),
+                    None,
+                ),
+                PathBuf::from("/nopal-state")
+            );
+            assert_eq!(
+                resolve_state_dir(
+                    Some(PathBuf::from("/explicit-state")),
+                    Some(PathBuf::from("/nopal-state")),
+                    Some(PathBuf::from("/legacy-state")),
+                    None,
+                ),
+                PathBuf::from("/explicit-state")
+            );
         }
 
         #[test]
