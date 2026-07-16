@@ -651,6 +651,101 @@ test("fresh Session establishes identity, starts the bridge, and binds its ready
 	}
 });
 
+test("Session reload republishes the active bridge protocol to the established Plot", async (t) => {
+	const extension = await loadNopalModule<{ default: (pi: any) => void }>("../index.js");
+	const { SESSION_ENDPOINT_KIND } = await loadNopalModule<typeof import("../session-bridge.ts")>("../session-bridge.js");
+	const handlers: Record<string, Array<(event: unknown, ctx: any) => Promise<void> | void>> = {};
+	const establishmentCalls: string[][] = [];
+	const notifications: string[] = [];
+	const plotId = `plot-reload-${process.pid}`;
+	const sessionId = `session-reload-${process.pid}`;
+	const previousPane = process.env.TMUX_PANE;
+	const previousSignals = process.env.NOPAL_BEISLID_SIGNALS;
+	process.env.TMUX_PANE = "%78";
+	process.env.NOPAL_BEISLID_SIGNALS = "0";
+	const entries = [{
+		type: "custom",
+		customType: "nopal-plot-establishment-applied",
+		data: {
+			runId: "run-complete",
+			boundary: {
+				id: "kickoff_context_ready:plans/kickoff-context-TASK-54.md",
+				event: "kickoff_context_ready",
+				path: "plans/kickoff-context-TASK-54.md",
+				writtenAt: "2026-07-13T00:00:00Z",
+			},
+			plotId,
+			establishedAt: "2026-07-13T00:00:01Z",
+		},
+	}, {
+		type: "custom",
+		customType: "nopal-plot-establishment-complete",
+		data: { runId: "run-complete", completedAt: "2026-07-13T00:00:02Z" },
+	}];
+	try {
+		extension.default({
+			registerTool() {},
+			registerCommand() {},
+			on(event: string, handler: any) { (handlers[event] ??= []).push(handler); },
+			getActiveTools: () => [],
+			setActiveTools() {},
+			exec: async (command: string, args: string[]) => {
+				if (command === "tmux") {
+					return {
+						stdout: `${args.at(-1) === "@nopal_plot" ? plotId : sessionId}\n`,
+						stderr: "",
+						code: 0,
+					};
+				}
+				if (args.includes("establish")) {
+					establishmentCalls.push(args);
+					return { stdout: JSON.stringify({
+						kind: "nopal.plot_establishment/v1",
+						ok: true,
+						outcome: "extended",
+						plot: { plot_id: plotId, selected_session_id: sessionId },
+						diagnostics: [],
+					}), stderr: "", code: 0 };
+				}
+				return { stdout: "", stderr: "", code: 1 };
+			},
+			sendUserMessage: async () => {},
+			appendEntry() {},
+		});
+		const ctx = {
+			cwd: "/repo/worktree",
+			hasUI: true,
+			ui: {
+				notify(message: string) { notifications.push(message); },
+				setStatus() {},
+				setTitle() {},
+				addAutocompleteProvider() {},
+			},
+			modelRegistry: { getAvailable: () => [] },
+			model: undefined,
+			sessionManager: { getEntries: () => entries, getBranch: () => [] },
+		};
+		t.after(async () => {
+			for (const handler of handlers.session_shutdown ?? []) {
+				await handler({ type: "session_shutdown", reason: "test cleanup" }, ctx);
+			}
+		});
+
+		for (const handler of handlers.session_start ?? []) {
+			await handler({ type: "session_start", reason: "reload" }, ctx);
+		}
+
+		assert.equal(establishmentCalls.length, 1, notifications.join("; "));
+		const protocolKindIndex = establishmentCalls[0].indexOf("--protocol-kind");
+		assert.equal(establishmentCalls[0][protocolKindIndex + 1], SESSION_ENDPOINT_KIND);
+	} finally {
+		if (previousPane === undefined) delete process.env.TMUX_PANE;
+		else process.env.TMUX_PANE = previousPane;
+		if (previousSignals === undefined) delete process.env.NOPAL_BEISLID_SIGNALS;
+		else process.env.NOPAL_BEISLID_SIGNALS = previousSignals;
+	}
+});
+
 test("Nopal extension retries a durable pending establishment after a transient failure", async () => {
 	const extension = await loadNopalModule<{ default: (pi: any) => void }>("../index.js");
 	const commands: Record<string, any> = {};

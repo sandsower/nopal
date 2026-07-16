@@ -167,9 +167,10 @@ export function parsePlotEstablishmentEnvelope(value: unknown): PlotEstablishmen
 
 export async function establishPlot(
 	exec: ExecFn,
-	params: { event: string; cwd: string; protocol?: PlotSessionProtocolEndpoint },
+	params: { event: string; cwd: string; plotId?: string; protocol?: PlotSessionProtocolEndpoint },
 ): Promise<PlotEstablishmentResult> {
 	const args = ["plot", "establish", "--event", params.event, "--workspace", params.cwd];
+	if (params.plotId) args.push("--plot-id", params.plotId);
 	if (params.protocol) {
 		args.push(
 			"--protocol-kind",

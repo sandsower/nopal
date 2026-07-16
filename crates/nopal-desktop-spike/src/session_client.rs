@@ -1126,11 +1126,27 @@ mod tests {
     fn production_feed_connection_classifies_clean_and_partial_eof() {
         use std::os::unix::net::UnixStream;
 
+        fn receive_terminal_error(
+            connection: &mut ProductionFeedConnection,
+        ) -> crate::session_feed::FeedError {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            loop {
+                match connection.try_receive() {
+                    Err(error) => return error,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Ok(None) => panic!("peer EOF was not observed within one second"),
+                    Ok(Some(frame)) => panic!("unexpected frame before EOF: {frame:?}"),
+                }
+            }
+        }
+
         let (stream, peer) = UnixStream::pair().unwrap();
         let mut connection =
             ProductionFeedConnection::from_unix_stream(stream, expected()).unwrap();
         drop(peer);
-        let clean = connection.try_receive().unwrap_err();
+        let clean = receive_terminal_error(&mut connection);
         assert_eq!(clean.kind, FeedErrorKind::Eof);
         assert!(clean.retryable());
 
@@ -1139,7 +1155,7 @@ mod tests {
             ProductionFeedConnection::from_unix_stream(stream, expected()).unwrap();
         peer.write_all(b"{\"kind\":").unwrap();
         drop(peer);
-        let partial = connection.try_receive().unwrap_err();
+        let partial = receive_terminal_error(&mut connection);
         assert_eq!(partial.kind, FeedErrorKind::Protocol);
         assert!(!partial.retryable());
     }

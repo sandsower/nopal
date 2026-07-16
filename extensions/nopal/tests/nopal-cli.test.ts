@@ -260,6 +260,7 @@ test("Plot Establishment passes a ready structured endpoint through exact CLI fl
 	}, {
 		event: "kickoff_context_ready",
 		cwd: "/repo/worktree",
+		plotId: "plot-1",
 		protocol: { kind: "nopal.session/v2", transport: "unix", address: "/tmp/nopal-501/session.sock", state: "ready" },
 	});
 
@@ -268,6 +269,7 @@ test("Plot Establishment passes a ready structured endpoint through exact CLI fl
 		"--json", "plot", "establish",
 		"--event", "kickoff_context_ready",
 		"--workspace", "/repo/worktree",
+		"--plot-id", "plot-1",
 		"--protocol-kind", "nopal.session/v2",
 		"--protocol-address", "/tmp/nopal-501/session.sock",
 		"--protocol-state", "ready",
