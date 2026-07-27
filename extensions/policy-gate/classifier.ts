@@ -254,6 +254,13 @@ function classifyCredentialCommand(segment: Segment): Classification | null {
 // ---------------------------------------------------------------------------
 
 const HIGH_SEVERITY_RULES: ClassRule[] = [
+	{
+		id: "nopal-enforcement-internal",
+		command: "nopal",
+		argsPrefixAny: [["enforcement"], ["--json", "enforcement"]],
+		class: "destructive",
+		action: "nopal.enforcement_internal",
+	},
 	{ id: "git-reset-hard", command: "git", argsPrefixAny: [["reset", "--hard"]], class: "destructive", action: "git.reset_hard" },
 	{
 		id: "git-clean-force",
@@ -262,7 +269,16 @@ const HIGH_SEVERITY_RULES: ClassRule[] = [
 		class: "destructive",
 		action: "git.clean_force",
 	},
-	{ id: "git-push", command: "git", argsPrefixAny: [["push"]], class: "git_remote", action: "git.push" },
+	{
+		id: "git-push",
+		command: "git",
+		argsPrefixAny: [["push"]],
+		class: "git_remote",
+		action: (segment) =>
+			segment.argv.slice(2).some((arg) => arg === "-f" || arg === "--force" || arg.startsWith("--force-with-lease"))
+				? "git.push_force"
+				: "git.push",
+	},
 	{ id: "git-commit", command: "git", argsPrefixAny: [["commit"]], class: "git_local", action: "git.commit" },
 	{
 		id: "rm-recursive",

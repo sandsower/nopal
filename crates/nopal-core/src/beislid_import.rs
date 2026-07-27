@@ -110,18 +110,59 @@ struct DraftModule {
     value: Value,
 }
 
+/// Typed, in-memory result shared by launch-time enforcement and the explicit
+/// import command. Markdown prose never enters this representation.
+#[derive(Debug, Clone)]
+pub struct CompiledWorkflow {
+    pub modules: BTreeMap<String, Value>,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl CompiledWorkflow {
+    pub fn ok(&self) -> bool {
+        self.diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.severity != Severity::Error)
+    }
+}
+
+fn compile_drafts(
+    text: &str,
+    source: &str,
+    output_dir: &Path,
+) -> (Vec<DraftModule>, Vec<Diagnostic>) {
+    let mut diagnostics = Vec::new();
+    let blocks = extract_blocks(text, source, &mut diagnostics);
+    let modules = build_modules(&blocks, source, &mut diagnostics);
+    for module in &modules {
+        validate_draft_module(module, output_dir, &mut diagnostics);
+    }
+    diagnostics::sort(&mut diagnostics);
+    (modules, diagnostics)
+}
+
+/// Compile recognized `beislid:*` fences without writing generated modules.
+/// Unknown Beislið-owned fences remain diagnostics, while invalid recognized
+/// fences make [`CompiledWorkflow::ok`] false so launch can fail closed.
+pub fn compile_text(text: &str, source: &str) -> CompiledWorkflow {
+    let (modules, diagnostics) =
+        compile_drafts(text, source, Path::new(crate::discover::NOPAL_DIR));
+    CompiledWorkflow {
+        modules: modules
+            .into_iter()
+            .map(|module| (module.name.to_owned(), module.value))
+            .collect(),
+        diagnostics,
+    }
+}
+
 pub fn import(root: &Path, options: &ImportOptions) -> io::Result<ImportReport> {
     let source_path = root.join(&options.source);
     let source_rel = rel_string(&options.source);
     let text = fs::read_to_string(&source_path)?;
-    let mut diagnostics = Vec::new();
-    let blocks = extract_blocks(&text, &source_rel, &mut diagnostics);
-    let modules = build_modules(&blocks, &source_rel, &mut diagnostics);
+    let (modules, mut diagnostics) = compile_drafts(&text, &source_rel, &options.output_dir);
     let generated_filenames: BTreeSet<&'static str> =
         modules.iter().map(|module| module.filename).collect();
-    for module in &modules {
-        validate_draft_module(module, &options.output_dir, &mut diagnostics);
-    }
 
     let mut outputs = Vec::new();
     for module in modules {
@@ -306,6 +347,38 @@ fn outputs_table(outputs: &[DraftOutput]) -> ToonValue {
     }
 }
 
+fn recognized_block_key(key: &str) -> bool {
+    matches!(
+        key,
+        "ticket_source"
+            | "ticket_update"
+            | "pr_review_source"
+            | "pr_review_update"
+            | "probe_cache"
+            | "model_routing"
+            | "gates"
+            | "gate_sets"
+            | "action_policy"
+            | "lifecycle_actions"
+            | "plot_establishment"
+            | "visual_surfaces"
+            | "workflow_signals"
+            | "guidance"
+            | "hints"
+            | "review_policy"
+            | "split_policy"
+    )
+}
+
+fn unclosed_block_diagnostic(path: &str, block: &Block, message: String) -> Diagnostic {
+    if recognized_block_key(&block.key) {
+        Diagnostic::error(Code::BeislidImportParseError, path, message).with_position(block.line, 1)
+    } else {
+        Diagnostic::warning(Code::BeislidImportUnsupported, path, message)
+            .with_position(block.line, 1)
+    }
+}
+
 fn extract_blocks(text: &str, path: &str, diagnostics: &mut Vec<Diagnostic>) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut current: Option<Block> = None;
@@ -315,25 +388,22 @@ fn extract_blocks(text: &str, path: &str, diagnostics: &mut Vec<Diagnostic>) -> 
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix("```beislid:") {
             if let Some(open) = current.take() {
-                diagnostics.push(
-                    Diagnostic::error(
-                        Code::BeislidImportParseError,
-                        path,
-                        format!(
-                            "beislid block {:?} opened before previous block was closed",
-                            open.key
-                        ),
-                    )
-                    .with_position(line_no, 1),
-                );
+                diagnostics.push(unclosed_block_diagnostic(
+                    path,
+                    &open,
+                    format!(
+                        "beislid block {:?} opened before previous block was closed",
+                        open.key
+                    ),
+                ));
             }
             let key = rest.trim().to_owned();
             if key.is_empty() {
                 diagnostics.push(
-                    Diagnostic::error(
-                        Code::BeislidImportParseError,
+                    Diagnostic::warning(
+                        Code::BeislidImportUnsupported,
                         path,
-                        "beislid block is missing a key after beislid:",
+                        "beislid block is missing a recognized key after beislid:",
                     )
                     .with_position(line_no, 1),
                 );
@@ -361,14 +431,11 @@ fn extract_blocks(text: &str, path: &str, diagnostics: &mut Vec<Diagnostic>) -> 
     }
 
     if let Some(open) = current.take() {
-        diagnostics.push(
-            Diagnostic::error(
-                Code::BeislidImportParseError,
-                path,
-                format!("beislid block {:?} is missing closing fence", open.key),
-            )
-            .with_position(open.line, 1),
-        );
+        diagnostics.push(unclosed_block_diagnostic(
+            path,
+            &open,
+            format!("beislid block {:?} is missing closing fence", open.key),
+        ));
     }
 
     blocks

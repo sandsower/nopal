@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { decidePolicy, parsePolicyDecisionOutput, resolvePolicyMode, type ExecFn } from "../nopal-cli.ts";
+import {
+	decidePolicy,
+	parseEnforcementPlanOutput,
+	parsePolicyDecisionOutput,
+	planEnforcement,
+	recordEnforcementGate,
+	resolvePolicyMode,
+	type ExecFn,
+} from "../nopal-cli.ts";
 
 function envelope(overrides: Record<string, unknown> = {}): string {
 	return JSON.stringify({
@@ -126,4 +134,39 @@ test("decidePolicy: deny decision is passed through unchanged", async () => {
 
 	assert.equal(result.decision, "deny");
 	assert.equal(result.failClosed, false);
+});
+
+test("parseEnforcementPlanOutput accepts selected command and argv gates", () => {
+	const result = parseEnforcementPlanOutput(JSON.stringify({
+		kind: "nopal.enforcement.plan/v1",
+		ok: true,
+		root: "/repo",
+		decision: "allow",
+		required_gates: [
+			{ id: "fmt", run: { command: "cargo fmt --check" } },
+			{ id: "test", run: { argv: ["cargo", "test"] }, cwd: "crate" },
+		],
+	}), 0);
+	assert.equal(result.failClosed, false);
+	assert.equal(result.root, "/repo");
+	assert.deepEqual(result.requiredGates.map((gate) => gate.id), ["fmt", "test"]);
+});
+
+test("enforcement subprocess helpers use the initialized run and fail closed", async () => {
+	const calls: Array<{ command: string; args: string[] }> = [];
+	const exec: ExecFn = async (command, args) => {
+		calls.push({ command, args });
+		if (args.includes("record-gate")) {
+			return { stdout: JSON.stringify({ kind: "nopal.enforcement.record_gate/v1", ok: true }), stderr: "", code: 0 };
+		}
+		return {
+			stdout: JSON.stringify({ kind: "nopal.enforcement.plan/v1", ok: true, root: "/repo", decision: "deny", required_gates: [] }),
+			stderr: "",
+			code: 0,
+		};
+	};
+	const params = { mode: "supervised_auto", action: "git.push_force", class: "git_remote", runId: "run-1" };
+	assert.equal((await planEnforcement(exec, params)).decision, "deny");
+	assert.equal(await recordEnforcementGate(exec, { ...params, gateId: "fmt", exitCode: 0 }), true);
+	assert.ok(calls.every((call) => call.args.includes("run-1")));
 });

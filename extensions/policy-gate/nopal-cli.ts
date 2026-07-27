@@ -107,6 +107,29 @@ export function parsePolicyDecisionOutput(stdout: string, code: number): PolicyD
 	return { decision: parsed.decision, explanation, failClosed: false };
 }
 
+export type GateRun = { command: string } | { argv: string[] };
+
+export type EnforcementGate = {
+	id: string;
+	run: GateRun;
+	cwd?: string;
+};
+
+export type EnforcementPlanResult = PolicyDecisionResult & {
+	ok: boolean;
+	root: string;
+	requiredGates: EnforcementGate[];
+};
+
+export type EnforcementParams = {
+	mode: string;
+	action: string;
+	class: string;
+	runId: string;
+	cwd?: string;
+	timeoutMs?: number;
+};
+
 export type DecidePolicyParams = {
 	mode: string;
 	action: string;
@@ -130,4 +153,81 @@ export async function decidePolicy(exec: ExecFn, params: DecidePolicyParams): Pr
 		return failClosed(`nopal binary could not be executed (${message}); treating as ask (fail closed)`);
 	}
 	return parsePolicyDecisionOutput(result.stdout, result.code);
+}
+
+function validGateRun(value: unknown): value is GateRun {
+	if (!value || typeof value !== "object") return false;
+	const run = value as { command?: unknown; argv?: unknown };
+	return typeof run.command === "string" || (Array.isArray(run.argv) && run.argv.every((arg) => typeof arg === "string"));
+}
+
+export function parseEnforcementPlanOutput(stdout: string, code: number): EnforcementPlanResult {
+	const fallback = failClosed(`nopal enforcement plan exited with code ${code}; treating as ask (fail closed)`);
+	if (code !== 0) return { ...fallback, ok: false, root: "", requiredGates: [] };
+	try {
+		const value = JSON.parse(stdout) as {
+			kind?: unknown;
+			ok?: unknown;
+			root?: unknown;
+			decision?: unknown;
+			required_gates?: unknown;
+		};
+		if (value.kind !== "nopal.enforcement.plan/v1" || value.ok !== true || typeof value.root !== "string" || !isPolicyDecision(value.decision)) {
+			throw new Error("invalid enforcement envelope");
+		}
+		if (!Array.isArray(value.required_gates)) throw new Error("invalid gate list");
+		const requiredGates = value.required_gates.map((entry) => {
+			if (!entry || typeof entry !== "object") throw new Error("invalid gate");
+			const gate = entry as { id?: unknown; run?: unknown; cwd?: unknown };
+			if (typeof gate.id !== "string" || !validGateRun(gate.run) || (gate.cwd !== undefined && typeof gate.cwd !== "string")) {
+				throw new Error("invalid gate");
+			}
+			return { id: gate.id, run: gate.run, ...(gate.cwd === undefined ? {} : { cwd: gate.cwd }) };
+		});
+		return {
+			ok: true,
+			root: value.root,
+			decision: value.decision,
+			explanation: `effective decision ${value.decision}`,
+			failClosed: false,
+			requiredGates,
+		};
+	} catch {
+		const invalid = failClosed("nopal enforcement plan produced an invalid envelope; treating as ask (fail closed)");
+		return { ...invalid, ok: false, root: "", requiredGates: [] };
+	}
+}
+
+export async function planEnforcement(exec: ExecFn, params: EnforcementParams): Promise<EnforcementPlanResult> {
+	const args = [
+		"--json", "enforcement", "plan", "--mode", params.mode, "--action", params.action,
+		"--class", params.class, "--run-id", params.runId,
+	];
+	try {
+		const result = await exec("nopal", args, { cwd: params.cwd, timeout: params.timeoutMs ?? DEFAULT_TIMEOUT_MS });
+		return parseEnforcementPlanOutput(result.stdout, result.code);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		const fallback = failClosed(`nopal binary could not be executed (${message}); treating as ask (fail closed)`);
+		return { ...fallback, ok: false, root: "", requiredGates: [] };
+	}
+}
+
+export async function recordEnforcementGate(
+	exec: ExecFn,
+	params: EnforcementParams & { gateId: string; exitCode: number },
+): Promise<boolean> {
+	const args = [
+		"--json", "enforcement", "record-gate", "--mode", params.mode, "--action", params.action,
+		"--class", params.class, "--run-id", params.runId, "--gate-id", params.gateId,
+		"--exit-code", String(params.exitCode),
+	];
+	try {
+		const result = await exec("nopal", args, { cwd: params.cwd, timeout: params.timeoutMs ?? DEFAULT_TIMEOUT_MS });
+		if (result.code !== 0) return false;
+		const value = JSON.parse(result.stdout) as { kind?: unknown; ok?: unknown };
+		return value.kind === "nopal.enforcement.record_gate/v1" && value.ok === true;
+	} catch {
+		return false;
+	}
 }

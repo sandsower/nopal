@@ -60,6 +60,13 @@
         },
         {
           "actions": [
+            "git.push_force"
+          ],
+          "decision": "deny",
+          "id": "action-git-push-force"
+        },
+        {
+          "actions": [
             "pr.review.reply"
           ],
           "decision": "allow",

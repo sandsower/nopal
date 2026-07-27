@@ -99,10 +99,12 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_include_info_and_field() {
+    fn capabilities_include_enforcement_and_hide_legacy_launch_routes() {
         let report = info_report(&cli_command());
         assert!(report.capabilities.iter().any(|name| name == "info"));
-        assert!(report.capabilities.iter().any(|name| name == "field"));
+        assert!(report.capabilities.iter().any(|name| name == "enforcement"));
+        assert!(!report.capabilities.iter().any(|name| name == "field"));
+        assert!(!report.capabilities.iter().any(|name| name == "cli"));
     }
 
     #[test]

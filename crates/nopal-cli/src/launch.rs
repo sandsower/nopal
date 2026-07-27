@@ -1,4 +1,4 @@
-//! `nopal.launch/v1` plan - the cold gates `nopal cli` runs before handing
+//! `nopal.launch/v1` plan - the cold gates bare `nopal` runs before handing
 //! off to Pi.
 //!
 //! `plan` never execs and never spawns Pi; it is both the `--dry-run` payload

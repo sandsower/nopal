@@ -1,11 +1,12 @@
 # Nopal
 
-Nopal is the next-generation agentic dev harness: one deterministic core (Nopal Core) with multiple thin surfaces over it, delivered as a distribution over Pi.
+Nopal is an opinionated Pi distribution with deterministic workflow, gate, and action-policy enforcement.
 Its canonical domain is [nopal.sh](https://nopal.sh), and its source repository is [`sandsower/nopal`](https://github.com/sandsower/nopal).
-This repo is its physical umbrella - a Cargo workspace holding the `nopal` binary (deterministic core plus product-facing coordinator), the two inter-product contract surfaces (execution, memory), and Nopal's own versioned config/envelope and process/proof-artifact surface.
+Pi owns interaction and sessions, Beislið owns prose-first workflow meaning, and Nopal Core owns deterministic compilation, decisions, gate selection, receipt validation, and Workflow Run Ledger evidence.
 
-Nopal Core decides, selects, and explains; it never executes gates, and its cold commands make no network, shell, or agent calls.
-Four surfaces are deliberately warm: bare `nopal` attaches to or creates the tmux-backed Field; `nopal cli` is the single-session Pi launcher, running its own cold gates and, once they pass, `exec`ing into Pi; `nopal ledger` records durable run state under the state dir and probes git; `nopal bridge herdr` publishes the versioned Field feed to a local Herdr socket.
+Bare `nopal` validates the effective project contract, initializes enforcement, and launches Pi directly.
+Nopal Core never executes gates.
+The bundled Pi adapter intercepts protected tool calls and executes exactly the gate plan returned by Core.
 
 ## Workspace
 
@@ -61,76 +62,29 @@ Until that tap exists, `brew install nopal` is not a supported installation path
 
 ## Usage
 
-Until the native desktop route is ready for adoption, bare `nopal` and bare `nopal field` remain aliases for the legacy tmux-backed Field.
-The explicit native route is reserved for the separately packaged `nopal-field-native` sibling and works without a TTY.
-That sibling is not part of release archives while native renderer selection and packaging remain unfinished.
-Until then, the route reports an actionable unavailable-sibling error instead of silently falling back to tmux.
+Bare `nopal` is the canonical launch path.
+It fails before Pi starts when the project contract, typed Beislið blocks, enforcement extension, or Workflow Run Ledger cannot initialize.
+Arguments after `--` are passed unchanged to Pi.
 
 ```sh
-nopal                        # bare invocation: attach to or create the tmux-backed Field
-nopal field                  # same as bare `nopal`, spelled out explicitly
-nopal field native           # require the separately installed native Field sibling
-nopal field native --state-dir <p>
-                             # native Field state root override
-nopal field legacy           # explicit tmux-backed compatibility fallback
-nopal cli                    # single-session Pi launcher: validate, resolve .nopal/bundle.jsonc, then exec into a pinned Pi session
-nopal cli --dry-run          # print the nopal.launch/v1 plan without touching Pi
-nopal cli --with-ambient     # layer the pinned bundle on top of ambient Pi resources
-nopal cli --verbose          # also print the one-line nopal.launch/v1 stderr summary before exec
-nopal validate        # validate manifest + profile-required modules (exit 0/1)
-nopal preflights list # list nopal.gates/v1 preflights
-nopal gates list      # list gates, gate sets, and selectors
+nopal                         # validate enforcement, initialize a ledger run, and launch Pi
+nopal --dry-run               # print the launch plan without scaffolding or starting Pi
+nopal --with-ambient          # layer pinned resources on top of ambient Pi resources
+nopal --verbose               # print the launch summary before Pi starts
+nopal -- --mode json -p "..." # pass Pi arguments after `--`
+nopal validate
+nopal gates list
 nopal gates select --stage pre_pr --changed-files a.rs,b.md
-                      # deterministic changed-file-aware gate selection
-nopal policy evaluate  --mode <mode> --action <id> [--class <c>]... [--env <NAME>]...
-nopal policy placement --mode <mode> --action <id> [--class <c>]... [--env <NAME>]...
-nopal policy decide    --mode <mode> --action <id> [--class <c>]... [--env <NAME>]...
-nopal export process --stdout --json
-nopal export process --output .nopal/process-artifact.json
-nopal export process --output .nopal/process-artifact.json --check
-nopal import beislid-workflow              # preview .beislid/workflow.md -> .nopal/*.jsonc drafts
-nopal import beislid-workflow --write      # write drafts, refusing existing files unless --overwrite
-nopal import beislid-workflow --check      # fail if checked-in .nopal modules differ semantically
-nopal ledger init --skill <skill> [--flow <f>] [--ticket-id <id>] [--ticket-title <t>] [--ticket-url <u>] [--branch <b>] [--run-id <id>]
-nopal ledger event --run-id <id> [--flow <f>] --type <type> [--json-file <p>] [--summary <s>]
-nopal ledger checkpoint --run-id <id> [--flow <f>] --name <name> [--json-file <p>] [--resume-hint <h>]
-nopal ledger gate --run-id <id> [--flow <f>] --name <name> --envelope-file <p> [--scope <s>] [--resume-hint <h>]
-nopal ledger interrupt --run-id <id> [--flow <f>] --reason <r> [--resume-hint <h>]
-nopal ledger finalize --run-id <id> [--flow <f>] --status <interrupted|failed|completed> [--report-file <p>]
-nopal ledger resume [--flow <f>] [--ticket-id <id>] [--branch <b>] [--include-completed]
-nopal ledger dashboard [--flow <f>] [--all] [--limit <n>]
-nopal ledger --state-dir <p> <subcommand> ...
-                      # ledger state root override (note: precedes the subcommand)
-nopal field inspect          # inspect runs, placements, gates, ledger state, and pending asks across every repo
-nopal field inspect --all --rondo-events <feed>
-                      # include completed runs/terminal asks and attach rondo.core/v1 run status/events
-nopal field inspect --state-dir <p>
-                      # Field state root override (a Field spans every repo, not just --dir)
-nopal bridge herdr     # continuously publish matching live run/gate/ask state to herdr's sidebar
-nopal bridge herdr --once
-                      # poll once; a missing herdr socket is a successful no-op
-nopal bridge herdr --state-dir <p>
-                      # state root override for the child Field inspection
-nopal bridge herdr --socket <p> --interval 5
-                      # override the Unix socket and daemon poll interval
-nopal status          # Nopal readiness + missing modules, explicitly (the cold path; bare invocation opens the Field, `nopal cli` launches instead)
-nopal info            # machine-readable version + capability report (nopal.info/v1)
-nopal placement       # explain the runtime placement Nopal would use for an action
-nopal rondo start     # start or reuse the verified user-scoped Rondo Core
-nopal rondo health    # display verified Core identity, health, state, and log paths
-nopal rondo restart   # restart the verified Core when no runs are active
-nopal rondo stop      # stop the verified Core when no runs are active
-nopal run start       # dry-run run-start coordination; never submits AFK work
-nopal run submit --manifest <path> --plot-id <id> [--state-dir <path>]
-                      # submit one approved per-slice export through Rondo Core
-nopal run observe --repo-id <id> --plot-id <id> --run-id <id> [--cursor <cursor>] [--state-dir <path>]
-                      # fetch one bounded status and event page without cancelling the run
-nopal --json ...      # versioned JSON envelopes (nopal.status/v1, nopal.validation/v1, nopal.preflights.list/v1, nopal.gates.*/v1, nopal.policy_*/v1, nopal.process_artifact/v1, nopal.beislid_import/v1, nopal.run_ledger.*/v1, nopal.ask.*/v1, nopal.field/v1, nopal.placement/v1, nopal.rondo_service/v1, nopal.run_start_dry_run/v1, nopal.run_submit/v1, nopal.run_observation/v1, nopal.launch/v1, nopal.bundle/v1, nopal.info/v1)
-nopal --dir <path>    # start project discovery there (walks up to the git root to find `.nopal/`)
+nopal policy decide --mode <mode> --action <id> [--class <class>]...
+nopal import beislid-workflow
+nopal ledger resume --flow enforcement
+nopal status
+nopal info
+nopal --dir <path>            # start project discovery at this path
 ```
 
 Configuration lives in `.nopal/` as JSONC: `nopal.jsonc` (the manifest) plus per-concern modules (`gates.jsonc`, `policy.jsonc`, `workflow.jsonc`, `roots.jsonc`, `integrations.jsonc`, `guidance.jsonc`), plus the coordinator's own `config.jsonc` for run-start policy and optional explicit Core endpoint settings.
-Verified Rondo lifecycle state and durable logs live in the user state directory, never in the repository.
+Workflow Run Ledger state lives in the user state directory, never in the repository.
 
 Profiles declare which modules are required:
 

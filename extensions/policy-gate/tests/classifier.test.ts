@@ -32,6 +32,17 @@ test("classifyBashCommand: git reset --hard is destructive", () => {
 	assert.equal(result.action, "git.reset_hard");
 });
 
+test("classifyBashCommand: force push has a distinct denyable action", () => {
+	assert.deepEqual(classifyBashCommand("git push --force origin main"), {
+		action: "git.push_force",
+		class: "git_remote",
+	});
+	assert.deepEqual(classifyBashCommand("git push -f"), {
+		action: "git.push_force",
+		class: "git_remote",
+	});
+});
+
 test("classifyBashCommand: rm -rf is destructive", () => {
 	const result = classifyBashCommand("rm -rf ./build");
 	assert.equal(result.class, "destructive");

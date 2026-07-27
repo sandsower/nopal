@@ -2,7 +2,7 @@
 //! template and a hermetic fallback.
 //!
 //! Supersedes the former zero-config in-memory synthesis: a real (not
-//! `--dry-run`) `nopal cli` launch against a repo with no `.nopal/`
+//! `--dry-run`) bare `nopal` launch against a repo with no `.nopal/`
 //! directory at all at the discovered project root
 //! (`discover::project_root`) writes both files before handing off to Pi -
 //! no prompt. An existing `.nopal/` is never written into, even when both

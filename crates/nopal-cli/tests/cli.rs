@@ -1752,9 +1752,8 @@ fn info_json_reports_version_and_capabilities() {
         vec![
             "ask",
             "bridge",
-            "cli",
+            "enforcement",
             "export",
-            "field",
             "gates",
             "import",
             "info",
@@ -1789,7 +1788,7 @@ fn info_toon_and_json_come_from_the_same_report() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|v| v == "field")
+            .any(|v| v == "enforcement")
     );
 }
 
