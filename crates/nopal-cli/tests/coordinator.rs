@@ -462,6 +462,20 @@ fn write_bundle(root: &Path, text: &str) {
     fs::write(root.join(".nopal/bundle.jsonc"), text).unwrap();
 }
 
+fn write_enforcement_bundle(root: &Path) {
+    let extension = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../extensions/policy-gate/index.ts")
+        .canonicalize()
+        .unwrap();
+    write_bundle(
+        root,
+        &format!(
+            "{{ \"version\": \"nopal.bundle/v1\", \"extensions\": [{{ \"source\": \"enforcement\", \"path\": {:?} }}] }}",
+            extension.display().to_string()
+        ),
+    );
+}
+
 fn write_nopal_config(root: &Path, mode: &str, action: &str, classes: &[&str]) {
     fs::create_dir_all(root.join(".nopal")).unwrap();
     let classes = classes
@@ -765,7 +779,7 @@ fn launch_dry_run_configured_repo_reports_scaffold_none() {
 
 #[test]
 #[cfg(unix)]
-fn cli_real_launch_on_empty_repo_scaffolds_defaults_then_execs_stub() {
+fn cli_real_launch_on_empty_repo_scaffolds_then_fails_closed_until_baseline_exists() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -782,7 +796,7 @@ fn cli_real_launch_on_empty_repo_scaffolds_defaults_then_execs_stub() {
         .output()
         .unwrap();
 
-    assert_eq!(out.status.code(), Some(9), "{out:?}");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
     let manifest_text = fs::read_to_string(temp.path().join(".nopal/nopal.jsonc")).unwrap();
     assert!(
         manifest_text.contains("\"nopal.project/v1\""),
@@ -797,10 +811,8 @@ fn cli_real_launch_on_empty_repo_scaffolds_defaults_then_execs_stub() {
          isolated config dir: {bundle_text}"
     );
 
-    // The two always-on stderr notices: scaffold provenance names
-    // the built-in hermetic default (no template was present), and the
-    // resource-surface line reflects the hermetic bundle just written.
-    // Neither is gated by --verbose.
+    // Scaffold provenance remains visible even though enforcement rejects
+    // the incomplete baseline before Pi or its resource surface starts.
     let launch_stderr = stderr(&out);
     assert!(
         launch_stderr.contains(".nopal/nopal.jsonc")
@@ -808,10 +820,7 @@ fn cli_real_launch_on_empty_repo_scaffolds_defaults_then_execs_stub() {
             && launch_stderr.contains("built-in hermetic defaults"),
         "{launch_stderr}"
     );
-    assert!(
-        launch_stderr.contains("nopal: hermetic launch - no ambient, no pinned resources"),
-        "{launch_stderr}"
-    );
+    assert!(launch_stderr.contains("enforcement initialization failed"));
 
     // A second dry-run against the now-scaffolded repo must not re-scaffold
     // or re-report the scaffold diagnostic.
@@ -892,7 +901,7 @@ fn launch_dry_run_valid_template_synthesizes_its_content_and_names_the_source() 
 
 #[test]
 #[cfg(unix)]
-fn cli_real_launch_copies_a_valid_template_verbatim_and_names_it_in_the_notice() {
+fn cli_real_launch_copies_a_valid_template_then_fails_closed_without_enforcement() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -916,7 +925,7 @@ fn cli_real_launch_copies_a_valid_template_verbatim_and_names_it_in_the_notice()
         .output()
         .unwrap();
 
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
     let bundle_text = fs::read_to_string(repo.join(".nopal/bundle.jsonc")).unwrap();
     assert_eq!(
         bundle_text, template_text,
@@ -1062,7 +1071,7 @@ fn launch_dry_run_from_subdir_finds_configured_root() {
 
 #[test]
 #[cfg(unix)]
-fn cli_real_launch_from_subdir_of_unconfigured_git_repo_scaffolds_at_toplevel() {
+fn cli_real_launch_from_subdir_scaffolds_at_toplevel_then_fails_closed() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -1083,7 +1092,7 @@ fn cli_real_launch_from_subdir_of_unconfigured_git_repo_scaffolds_at_toplevel() 
         .output()
         .unwrap();
 
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
     assert!(
         temp.path().join(".nopal/nopal.jsonc").is_file(),
         "scaffold must land at the git toplevel, not the --dir subfolder"
@@ -1557,12 +1566,10 @@ fn required_module_schema_error_blocks_launch() {
 }
 
 #[test]
-fn top_level_dry_run_flag_is_rejected() {
-    // --dry-run/--with-ambient/--verbose no longer exist on the top-level
-    // Cli struct: they moved to `nopal cli`. This pins the
-    // deliberate breaking change as a clap usage error.
-    let out = nopal(&["--dry-run"]);
-    assert_eq!(out.status.code(), Some(2));
+fn top_level_dry_run_previews_the_canonical_bare_launch() {
+    let out = nopal(&["--json", "--dry-run"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(json(&out)["kind"], "nopal.launch/v1");
 }
 
 #[test]
@@ -1572,7 +1579,7 @@ fn cli_execs_the_stub_binary_with_expected_argv_and_cwd() {
 
     let temp = tempfile::tempdir().unwrap();
     write_portable_project(temp.path());
-    write_bundle(temp.path(), "{ \"version\": \"nopal.bundle/v1\" }");
+    write_enforcement_bundle(temp.path());
 
     let stub = temp.path().join("pi-stub.sh");
     fs::write(
@@ -1597,8 +1604,9 @@ fn cli_execs_the_stub_binary_with_expected_argv_and_cwd() {
         "exec_pi should have chdir'd into --dir before exec-ing the stub"
     );
     let stdout = stdout(&out);
+    assert!(stdout.contains("argv=--no-extensions"), "{stdout}");
     assert!(
-        stdout.contains("argv=--no-extensions --no-skills --no-prompt-templates --no-themes"),
+        stdout.contains("extensions/policy-gate/index.ts"),
         "{stdout}"
     );
     assert!(
@@ -1611,7 +1619,7 @@ fn cli_execs_the_stub_binary_with_expected_argv_and_cwd() {
         "the verbose summary line should be opt-in via --verbose, not printed by default: {stderr}"
     );
     assert!(
-        stderr.contains("nopal: hermetic launch - no ambient, no pinned resources"),
+        stderr.contains("nopal: 1 pinned resource; ambient: none"),
         "the resource-surface notice is always-on, not gated by --verbose: {stderr}"
     );
 }
@@ -1623,7 +1631,7 @@ fn verbose_flag_prints_the_stderr_summary_before_exec() {
 
     let temp = tempfile::tempdir().unwrap();
     write_portable_project(temp.path());
-    write_bundle(temp.path(), "{ \"version\": \"nopal.bundle/v1\" }");
+    write_enforcement_bundle(temp.path());
 
     let stub = temp.path().join("pi-stub.sh");
     fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
@@ -1651,26 +1659,212 @@ fn verbose_flag_prints_the_stderr_summary_before_exec() {
 }
 
 #[test]
-fn bare_nopal_without_tty_fails_closed_pointing_at_nopal_cli() {
-    // No subcommand at all, piped stdio (the default for
-    // std::process::Command in tests, i.e. non-tty): bare `nopal` must
-    // refuse to start a TUI and point the operator at `nopal cli` instead.
-    let temp = tempfile::tempdir().unwrap();
-    write_project(temp.path());
+#[cfg(unix)]
+fn bare_nopal_launches_pi_with_initialized_enforcement_without_a_tty() {
+    use std::os::unix::fs::PermissionsExt;
 
+    let temp = tempfile::tempdir().unwrap();
+    write_portable_project(temp.path());
+    write_enforcement_bundle(temp.path());
     let state = temp.path().join("state");
+    let stub = temp.path().join("pi-stub.sh");
+    fs::write(
+        &stub,
+        "#!/bin/sh\ntest -n \"$NOPAL_ENFORCEMENT_RUN_ID\" || exit 41\ntest -z \"$NOPAL_ENFORCEMENT_RECEIPT_KEY\" || exit 42\ntest -n \"$NOPAL_ENFORCEMENT_ADAPTER_DIR\" || exit 43\ntest -x \"$NOPAL_ENFORCEMENT_CLI\" || exit 44\nexit 9\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&stub).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&stub, permissions).unwrap();
+
     let out = Command::new(env!("CARGO_BIN_EXE_nopal"))
         .args(["--dir", temp.path().to_str().unwrap()])
-        .env("NOPAL_STATE_DIR", &state)
+        .env("NOPAL_PI_BIN", &stub)
+        .env("BEISLID_STATE_DIR", &state)
+        .env("NOPAL_CONFIG_DIR", isolated_config_dir())
         .output()
         .unwrap();
 
-    assert_eq!(out.status.code(), Some(2));
-    assert!(stderr(&out).contains("nopal cli"), "{}", stderr(&out));
+    assert_eq!(out.status.code(), Some(9), "{out:?}");
+    let runs = state.join("runs/enforcement");
     assert!(
-        !state.join("plots").exists(),
-        "the terminal guard must run before Plot bootstrap"
+        runs.exists(),
+        "bare launch must initialize the enforcement ledger"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn bare_nopal_rejects_adapter_source_with_only_the_expected_filename() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    write_portable_project(temp.path());
+    let adapter = temp.path().join("extensions/policy-gate");
+    fs::create_dir_all(&adapter).unwrap();
+    for file in ["index.ts", "classifier.ts", "nopal-cli.ts"] {
+        fs::write(adapter.join(file), "export default function () {}\n").unwrap();
+    }
+    write_bundle(
+        temp.path(),
+        &format!(
+            "{{ \"version\": \"nopal.bundle/v1\", \"extensions\": [{{ \"source\": \"enforcement\", \"path\": {:?} }}] }}",
+            adapter.join("index.ts").display().to_string()
+        ),
+    );
+    let marker = temp.path().join("pi-was-here");
+    let stub = temp.path().join("pi-stub.sh");
+    fs::write(&stub, format!("#!/bin/sh\ntouch {:?}\n", marker)).unwrap();
+    let mut permissions = fs::metadata(&stub).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&stub, permissions).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", temp.path().to_str().unwrap()])
+        .env("NOPAL_PI_BIN", &stub)
+        .env("NOPAL_CONFIG_DIR", isolated_config_dir())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(stderr(&out).contains("adapter identity mismatch"));
+    assert!(
+        !marker.exists(),
+        "Pi must not start with an untrusted adapter"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn bare_nopal_rejects_untrusted_or_ambient_sibling_extensions() {
+    let temp = tempfile::tempdir().unwrap();
+    write_portable_project(temp.path());
+    let enforcement = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../extensions/policy-gate/index.ts")
+        .canonicalize()
+        .unwrap();
+    let sibling = temp.path().join("sibling.ts");
+    fs::write(&sibling, "export default function sibling() {}\n").unwrap();
+    write_bundle(
+        temp.path(),
+        &format!(
+            "{{ \"version\": \"nopal.bundle/v1\", \"extensions\": [{{ \"source\": \"enforcement\", \"path\": {:?} }}, {{ \"source\": \"sibling\", \"path\": {:?} }}] }}",
+            enforcement.display().to_string(),
+            sibling.display().to_string()
+        ),
+    );
+    let untrusted = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", temp.path().to_str().unwrap()])
+        .env("NOPAL_PI_BIN", "/bin/false")
+        .env("NOPAL_CONFIG_DIR", isolated_config_dir())
+        .output()
+        .unwrap();
+    assert_eq!(untrusted.status.code(), Some(2), "{untrusted:?}");
+    assert!(stderr(&untrusted).contains("untrusted executable Pi extension"));
+
+    write_enforcement_bundle(temp.path());
+    let ambient = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", temp.path().to_str().unwrap(), "--with-ambient"])
+        .env("NOPAL_PI_BIN", "/bin/false")
+        .env("NOPAL_CONFIG_DIR", isolated_config_dir())
+        .output()
+        .unwrap();
+    assert_eq!(ambient.status.code(), Some(2), "{ambient:?}");
+    assert!(stderr(&ambient).contains("ambient Pi extensions"));
+
+    let injected = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args([
+            "--dir",
+            temp.path().to_str().unwrap(),
+            "--",
+            "--extension",
+            sibling.to_str().unwrap(),
+        ])
+        .env("NOPAL_PI_BIN", "/bin/false")
+        .env("NOPAL_CONFIG_DIR", isolated_config_dir())
+        .output()
+        .unwrap();
+    assert_eq!(injected.status.code(), Some(2), "{injected:?}");
+    assert!(stderr(&injected).contains("must be declared in the byte-verified Nopal bundle"));
+}
+
+#[test]
+fn public_help_hides_internal_and_legacy_launch_routes() {
+    let out = nopal(&["--help"]);
+    assert!(out.status.success());
+    let help = stdout(&out);
+    assert!(help.contains("Opinionated Pi distribution with deterministic enforcement"));
+    for hidden in ["plot", "bridge", "rondo", "run", "field", "enforcement"] {
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with(hidden)),
+            "{help}"
+        );
+    }
+    assert!(!help.contains("cli "), "{help}");
+
+    let info = nopal(&["--json", "info"]);
+    assert!(info.status.success());
+    let info_json = json(&info);
+    let capabilities = info_json["capabilities"].as_array().unwrap();
+    for hidden in [
+        "plot",
+        "bridge",
+        "rondo",
+        "run",
+        "field",
+        "enforcement",
+        "cli",
+    ] {
+        assert!(
+            !capabilities.iter().any(|value| value == hidden),
+            "{capabilities:?}"
+        );
+    }
+}
+
+#[test]
+fn bare_nopal_rejects_invalid_recognized_beislid_blocks_before_pi_starts() {
+    let temp = tempfile::tempdir().unwrap();
+    write_portable_project(temp.path());
+    write_enforcement_bundle(temp.path());
+    fs::create_dir_all(temp.path().join(".beislid")).unwrap();
+    fs::write(
+        temp.path().join(".beislid/workflow.md"),
+        "```beislid:action_policy\nmodes:\n  supervised-auto:\n    actions:\n      git.push: allow\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", temp.path().to_str().unwrap()])
+        .env("NOPAL_PI_BIN", temp.path().join("must-not-run"))
+        .env("NOPAL_CONFIG_DIR", isolated_config_dir())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("beislid_import_parse_error"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn bare_nopal_rejects_a_bundle_without_the_enforcement_extension() {
+    let temp = tempfile::tempdir().unwrap();
+    write_portable_project(temp.path());
+    write_bundle(temp.path(), "{ \"version\": \"nopal.bundle/v1\" }");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", temp.path().to_str().unwrap()])
+        .env("NOPAL_PI_BIN", temp.path().join("must-not-run"))
+        .env("NOPAL_CONFIG_DIR", isolated_config_dir())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(stderr(&out).contains("enforcement initialization failed"));
 }
 
 #[cfg(unix)]
@@ -3580,13 +3774,13 @@ fn installed_layout_discovers_the_packaged_sibling_rondo_without_an_override() {
 
 #[cfg(unix)]
 #[test]
-fn real_cli_launch_starts_core_silently_and_core_survives_pi_exit() {
+fn real_cli_launch_does_not_start_the_removed_rondo_integration() {
     use std::os::unix::fs::PermissionsExt;
 
     let fixture = LifecycleFixture::new();
     let repo = tempfile::tempdir().unwrap();
     write_portable_project(repo.path());
-    write_bundle(repo.path(), "{ \"version\": \"nopal.bundle/v1\" }");
+    write_enforcement_bundle(repo.path());
     let stub = repo.path().join("pi-stub.sh");
     fs::write(&stub, "#!/bin/sh\nexit 9\n").unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3600,21 +3794,18 @@ fn real_cli_launch_starts_core_silently_and_core_survives_pi_exit() {
 
     assert_eq!(out.status.code(), Some(9), "stderr: {}", stderr(&out));
     assert!(!stderr(&out).contains("Rondo Core is unavailable"));
-    assert!(fixture.state().join("runtime.json").is_file());
-    let health = fixture.nopal(&["--json", "rondo", "health"]);
-    assert_eq!(health.status.code(), Some(0), "stderr: {}", stderr(&health));
-    assert_eq!(json(&health)["status"], "running");
+    assert!(!fixture.state().join("runtime.json").exists());
 }
 
 #[cfg(unix)]
 #[test]
-fn real_cli_launch_warns_once_and_continues_when_core_is_unavailable() {
+fn real_cli_launch_ignores_unavailable_removed_rondo_integration() {
     use std::os::unix::fs::PermissionsExt;
 
     let repo = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     write_portable_project(repo.path());
-    write_bundle(repo.path(), "{ \"version\": \"nopal.bundle/v1\" }");
+    write_enforcement_bundle(repo.path());
     let stub = repo.path().join("pi-stub.sh");
     fs::write(&stub, "#!/bin/sh\nexit 9\n").unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
@@ -3629,12 +3820,7 @@ fn real_cli_launch_warns_once_and_continues_when_core_is_unavailable() {
 
     assert_eq!(out.status.code(), Some(9), "stderr: {}", stderr(&out));
     let launch_stderr = stderr(&out);
-    assert_eq!(
-        launch_stderr.matches("Rondo Core is unavailable").count(),
-        1
-    );
-    assert!(launch_stderr.contains("nopal rondo start"));
-    assert!(launch_stderr.contains("nopal rondo health"));
+    assert!(!launch_stderr.contains("Rondo Core is unavailable"));
     assert!(!state.path().join("runtime.json").exists());
 }
 
@@ -3663,10 +3849,10 @@ fn guarded_noninteractive_invalid_and_dry_run_paths_never_start_core() {
 
 #[cfg(all(unix, target_os = "macos"))]
 #[test]
-fn bare_nopal_and_field_launch_ensure_core_after_the_terminal_guard() {
+fn legacy_field_launch_ensures_core_after_the_terminal_guard() {
     use std::os::unix::fs::PermissionsExt;
 
-    for field_args in [false, true] {
+    {
         let fixture = LifecycleFixture::new();
         let repo = tempfile::tempdir().unwrap();
         write_portable_project(repo.path());
@@ -3686,9 +3872,7 @@ fn bare_nopal_and_field_launch_ensure_core_after_the_terminal_guard() {
             "--dir",
             repo.path().to_str().unwrap(),
         ];
-        if field_args {
-            args.push("field");
-        }
+        args.push("field");
         let path = format!(
             "{}:{}",
             tools.path().display(),
@@ -3706,7 +3890,7 @@ fn bare_nopal_and_field_launch_ensure_core_after_the_terminal_guard() {
 
         assert!(
             fixture.state().join("runtime.json").is_file(),
-            "field_args={field_args}, stdout={}, stderr={}",
+            "stdout={}, stderr={}",
             stdout(&output),
             stderr(&output)
         );

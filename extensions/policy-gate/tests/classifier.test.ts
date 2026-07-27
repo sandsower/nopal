@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { test } from "node:test";
 import {
 	classifyBashCommand,
+	classifyBashCommandSet,
+	commandReferencesEnforcementAuthority,
 	isProtectedCredentialPath,
+	isProtectedEnforcementPath,
 	redactSecrets,
 	redactToolContent,
 	shouldBlockProtectedCredentialPath,
@@ -20,6 +26,12 @@ test("classifyBashCommand: git status is git_local", () => {
 	assert.equal(result.action, "git.read");
 });
 
+test("classifyBashCommand: compound workspace changes fail closed", () => {
+	const result = classifyBashCommandSet("printf changed\\n >> source.txt && git add source.txt && git commit -m changed");
+	assert.equal(result.complete, false);
+	assert.match(result.reason ?? "", /operator|supported/);
+});
+
 test("classifyBashCommand: git commit is git_local", () => {
 	const result = classifyBashCommand('git commit -m "message"');
 	assert.equal(result.class, "git_local");
@@ -30,6 +42,26 @@ test("classifyBashCommand: git reset --hard is destructive", () => {
 	const result = classifyBashCommand("git reset --hard HEAD~1");
 	assert.equal(result.class, "destructive");
 	assert.equal(result.action, "git.reset_hard");
+});
+
+test("classifyBashCommand: force push has a distinct denyable action", () => {
+	for (const command of [
+		"git push --force origin main",
+		"git push -f",
+		"git push origin +main:main",
+		"/usr/bin/git push --force origin main",
+		"git --no-pager push --force origin main",
+		"git -C . push --force origin main",
+		"command /usr/bin/git push --force origin main",
+	]) {
+		assert.deepEqual(classifyBashCommand(command), {
+			action: "git.push_force",
+			class: "git_remote",
+		}, command);
+	}
+	assert.equal(classifyBashCommandSet("git push origin $REFSPEC").complete, false);
+	assert.equal(classifyBashCommandSet("env git push --force origin main").complete, false);
+	assert.equal(classifyBashCommandSet("git -c alias.ship='push --force' ship").complete, false);
 });
 
 test("classifyBashCommand: rm -rf is destructive", () => {
@@ -133,16 +165,33 @@ test("classifyBashCommand: unrecognized command is unknown, not silently allowed
 	assert.equal(result.action, "some-totally-unknown-tool.exec");
 });
 
-test("classifyBashCommand: bash -c wrapper unwraps to the inner command", () => {
-	const result = classifyBashCommand('bash -c "git push origin main"');
-	assert.equal(result.class, "git_remote");
-	assert.equal(result.action, "git.push");
+test("classifyBashCommandSet: nested shell wrappers and grouping fail closed", () => {
+	for (const command of [
+		'bash -c "git push origin main"',
+		"sh -c 'git status && git push --force origin main'",
+		"/bin/sh -c 'git push --force origin main'",
+		"bash -lc 'git push --force origin main'",
+		"env sh -c 'git push --force origin main'",
+		"(git push --force origin main)",
+	]) assert.equal(classifyBashCommandSet(command).complete, false, command);
 });
 
-test("classifyBashCommand: compound command matches the first high-severity segment", () => {
-	const result = classifyBashCommand("git status && git push origin main");
-	assert.equal(result.class, "git_remote");
-	assert.equal(result.action, "git.push");
+test("classifyBashCommandSet: compound shell envelopes fail closed before any segment executes", () => {
+	for (const command of [
+		"git push origin main && git push --force origin main",
+		"git push origin main && rm -rf /tmp/proof",
+		"git status & git push --force origin main",
+		"git status\ngit push --force origin main",
+		"git push --force origin main > push.log",
+	]) {
+		assert.equal(classifyBashCommandSet(command).complete, false, command);
+	}
+});
+
+test("classifyBashCommandSet: dynamic shell evaluation fails closed", () => {
+	const result = classifyBashCommandSet('ls "$(git push --force origin main)"');
+	assert.equal(result.complete, false);
+	assert.match(result.reason ?? "", /dynamic shell/);
 });
 
 test("classifyBashCommand: empty command is unknown", () => {
@@ -154,6 +203,44 @@ test("isProtectedCredentialPath: matches .env and ssh keys", () => {
 	assert.equal(isProtectedCredentialPath("/repo/.env"), true);
 	assert.equal(isProtectedCredentialPath("/home/user/.ssh/id_rsa"), true);
 	assert.equal(isProtectedCredentialPath("/repo/src/index.ts"), false);
+});
+
+test("enforcement authority paths are protected from direct tools and shell references", () => {
+	const authority = {
+		projectRoot: "/repo",
+		stateDir: "/state/nopal",
+		configDir: "/config/nopal",
+		adapterDir: "/distribution/policy-gate",
+		nopalBin: "/distribution/bin/nopal",
+		runId: "run-secret",
+	};
+	for (const candidate of ["/repo/.nopal/policy.jsonc", "/repo/.beislid/workflow.md", "/state/nopal/runs/x", "/config/nopal/policy.jsonc"]) {
+		assert.equal(isProtectedEnforcementPath(candidate, "/repo", authority), true, candidate);
+	}
+	assert.equal(isProtectedEnforcementPath("/repo/src/main.rs", "/repo", authority), false);
+	assert.equal(commandReferencesEnforcementAuthority("cat /state/nopal/runs/x", "/repo", authority), true);
+	assert.equal(commandReferencesEnforcementAuthority("head .no'pal'/policy.jsonc", "/repo", authority), true);
+	assert.equal(commandReferencesEnforcementAuthority("nopal enforcement plan", "/repo", authority), false);
+});
+
+test("enforcement authority follows symlinked nearest existing ancestors", () => {
+	const temp = mkdtempSync(path.join(os.tmpdir(), "nopal-authority-"));
+	try {
+		const repo = path.join(temp, "repo");
+		mkdirSync(path.join(repo, ".nopal"), { recursive: true });
+		symlinkSync(path.join(repo, ".nopal"), path.join(repo, "authority-link"));
+		const authority = {
+			projectRoot: repo,
+			stateDir: path.join(temp, "state"),
+			adapterDir: path.join(temp, "adapter"),
+			nopalBin: path.join(temp, "bin/nopal"),
+			runId: "run-secret",
+		};
+		assert.equal(isProtectedEnforcementPath("authority-link/new/deep/file", repo, authority), true);
+		assert.equal(commandReferencesEnforcementAuthority("mkdir -p authority-link/new/deep", repo, authority), true);
+	} finally {
+		rmSync(temp, { recursive: true, force: true });
+	}
 });
 
 test("shouldBlockProtectedCredentialPath: only write/edit tools are gated", () => {

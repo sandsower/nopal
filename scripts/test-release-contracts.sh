@@ -171,6 +171,11 @@ printf '%s\n' \
   "$stem/Rondo-LICENSE" \
   "$stem/Rondo-NOTICE" \
   "$stem/THIRD_PARTY_LICENSES.html" \
+  "$stem/extensions" \
+  "$stem/extensions/policy-gate" \
+  "$stem/extensions/policy-gate/classifier.ts" \
+  "$stem/extensions/policy-gate/index.ts" \
+  "$stem/extensions/policy-gate/nopal-cli.ts" \
   "$stem/nopal" \
   "$stem/rondo" \
   "$stem/rondo-runtime.json" \
@@ -193,6 +198,11 @@ cmp "$fake_rondo_source/NOTICE" "$unpacked/$stem/Rondo-NOTICE" \
   || fail "Rondo NOTICE bytes changed"
 cmp "$fake_third_party_licenses" "$unpacked/$stem/THIRD_PARTY_LICENSES.html" \
   || fail "third-party license report bytes changed"
+for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+  cmp "$repo_root/extensions/policy-gate/$adapter_file" \
+    "$unpacked/$stem/extensions/policy-gate/$adapter_file" \
+    || fail "enforcement adapter $adapter_file bytes changed"
+done
 [ -x "$unpacked/$stem/nopal" ] || fail "packaged binary is not executable"
 [ -x "$unpacked/$stem/rondo" ] || fail "packaged Rondo runtime is not executable"
 [ ! -x "$unpacked/$stem/rondo-runtime.json" ] \
@@ -206,6 +216,10 @@ cmp "$fake_third_party_licenses" "$unpacked/$stem/THIRD_PARTY_LICENSES.html" \
   || fail "packaged Rondo NOTICE is unexpectedly executable"
 [ ! -x "$unpacked/$stem/THIRD_PARTY_LICENSES.html" ] \
   || fail "packaged third-party license report is unexpectedly executable"
+for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+  [ ! -x "$unpacked/$stem/extensions/policy-gate/$adapter_file" ] \
+    || fail "packaged enforcement adapter $adapter_file is unexpectedly executable"
+done
 
 if NOPAL_RELEASE_BINARY="$fake_binary" NOPAL_RELEASE_RONDO_RUNTIME="$fake_rondo" \
   sh "$repo_root/scripts/package-release.sh" "$target" v9.9.9 "$tmp/mismatch" \

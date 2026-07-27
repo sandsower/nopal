@@ -99,10 +99,23 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_include_info_and_field() {
+    fn capabilities_hide_internal_and_legacy_product_routes() {
         let report = info_report(&cli_command());
         assert!(report.capabilities.iter().any(|name| name == "info"));
-        assert!(report.capabilities.iter().any(|name| name == "field"));
+        for hidden in [
+            "enforcement",
+            "field",
+            "cli",
+            "plot",
+            "bridge",
+            "rondo",
+            "run",
+        ] {
+            assert!(
+                !report.capabilities.iter().any(|name| name == hidden),
+                "{hidden} must not be advertised as a v0.3 capability"
+            );
+        }
     }
 
     #[test]

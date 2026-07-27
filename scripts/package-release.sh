@@ -77,6 +77,12 @@ for required_file in LICENSE README.md NOTICE.md; do
     exit 1
   fi
 done
+for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+  if [ ! -f "$source_root/extensions/policy-gate/$adapter_file" ]; then
+    echo "release enforcement adapter file not found: $source_root/extensions/policy-gate/$adapter_file" >&2
+    exit 1
+  fi
+done
 
 mkdir -p "$output_dir"
 stem="nopal-$tag-$target"
@@ -85,7 +91,7 @@ stage_root="$output_dir/.$stem.stage.$$"
 tar_path="$output_dir/.$stem.tar.$$"
 archive_tmp="$output_dir/.$stem.tar.gz.$$"
 trap 'rm -rf "$stage_root"; rm -f "$tar_path" "$archive_tmp"' EXIT HUP INT TERM
-mkdir -p "$stage_root/$stem"
+mkdir -p "$stage_root/$stem/extensions/policy-gate"
 cp "$binary" "$stage_root/$stem/nopal"
 cp "$rondo_runtime" "$stage_root/$stem/rondo"
 cp "$rondo_provenance" "$stage_root/$stem/rondo-runtime.json"
@@ -95,7 +101,12 @@ cp "$source_root/NOTICE.md" "$stage_root/$stem/NOTICE.md"
 cp "$rondo_source/LICENSE" "$stage_root/$stem/Rondo-LICENSE"
 cp "$rondo_source/NOTICE" "$stage_root/$stem/Rondo-NOTICE"
 cp "$third_party_licenses" "$stage_root/$stem/THIRD_PARTY_LICENSES.html"
+for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+  cp "$source_root/extensions/policy-gate/$adapter_file" \
+    "$stage_root/$stem/extensions/policy-gate/$adapter_file"
+done
 chmod 0755 "$stage_root/$stem"
+chmod 0755 "$stage_root/$stem/extensions" "$stage_root/$stem/extensions/policy-gate"
 chmod 0755 "$stage_root/$stem/nopal"
 chmod 0755 "$stage_root/$stem/rondo"
 chmod 0644 \
@@ -105,7 +116,10 @@ chmod 0644 \
   "$stage_root/$stem/Rondo-LICENSE" \
   "$stage_root/$stem/Rondo-NOTICE" \
   "$stage_root/$stem/THIRD_PARTY_LICENSES.html" \
-  "$stage_root/$stem/rondo-runtime.json"
+  "$stage_root/$stem/rondo-runtime.json" \
+  "$stage_root/$stem/extensions/policy-gate/index.ts" \
+  "$stage_root/$stem/extensions/policy-gate/classifier.ts" \
+  "$stage_root/$stem/extensions/policy-gate/nopal-cli.ts"
 
 # Normalize every ustar field that can vary across runs. The fixed timestamp
 # is representable by POSIX touch and both tar implementations on the release
@@ -121,19 +135,24 @@ TZ=UTC touch -t 200001010000.00 \
   "$stage_root/$stem/Rondo-LICENSE" \
   "$stage_root/$stem/Rondo-NOTICE" \
   "$stage_root/$stem/THIRD_PARTY_LICENSES.html" \
-  "$stage_root/$stem/rondo-runtime.json"
+  "$stage_root/$stem/rondo-runtime.json" \
+  "$stage_root/$stem/extensions" \
+  "$stage_root/$stem/extensions/policy-gate" \
+  "$stage_root/$stem/extensions/policy-gate/index.ts" \
+  "$stage_root/$stem/extensions/policy-gate/classifier.ts" \
+  "$stage_root/$stem/extensions/policy-gate/nopal-cli.ts"
 
 case $(tar --version 2>/dev/null | head -1) in
   *GNU*)
     tar --format=ustar --owner=root:0 --group=root:0 --no-recursion \
       -cf "$tar_path" -C "$stage_root" \
-      "$stem" "$stem/nopal" "$stem/rondo" "$stem/rondo-runtime.json" "$stem/LICENSE" "$stem/README.md" "$stem/NOTICE.md" "$stem/Rondo-LICENSE" "$stem/Rondo-NOTICE" "$stem/THIRD_PARTY_LICENSES.html"
+      "$stem" "$stem/nopal" "$stem/rondo" "$stem/rondo-runtime.json" "$stem/LICENSE" "$stem/README.md" "$stem/NOTICE.md" "$stem/Rondo-LICENSE" "$stem/Rondo-NOTICE" "$stem/THIRD_PARTY_LICENSES.html" "$stem/extensions" "$stem/extensions/policy-gate" "$stem/extensions/policy-gate/index.ts" "$stem/extensions/policy-gate/classifier.ts" "$stem/extensions/policy-gate/nopal-cli.ts"
     ;;
   *)
     COPYFILE_DISABLE=1 tar --format ustar \
       --uid 0 --gid 0 --uname root --gname root --no-recursion \
       -cf "$tar_path" -C "$stage_root" \
-      "$stem" "$stem/nopal" "$stem/rondo" "$stem/rondo-runtime.json" "$stem/LICENSE" "$stem/README.md" "$stem/NOTICE.md" "$stem/Rondo-LICENSE" "$stem/Rondo-NOTICE" "$stem/THIRD_PARTY_LICENSES.html"
+      "$stem" "$stem/nopal" "$stem/rondo" "$stem/rondo-runtime.json" "$stem/LICENSE" "$stem/README.md" "$stem/NOTICE.md" "$stem/Rondo-LICENSE" "$stem/Rondo-NOTICE" "$stem/THIRD_PARTY_LICENSES.html" "$stem/extensions" "$stem/extensions/policy-gate" "$stem/extensions/policy-gate/index.ts" "$stem/extensions/policy-gate/classifier.ts" "$stem/extensions/policy-gate/nopal-cli.ts"
     ;;
 esac
 gzip -n -9 -c "$tar_path" > "$archive_tmp"

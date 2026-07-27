@@ -1,3 +1,6 @@
+import { realpathSync } from "node:fs";
+import path from "node:path";
+
 /**
  * Pure classification and protected-floor logic for policy-gate.
  *
@@ -20,6 +23,12 @@ export type Classification = {
 	class: string;
 };
 
+export type CommandClassifications = {
+	classifications: Classification[];
+	complete: boolean;
+	reason?: string;
+};
+
 type Segment = {
 	raw: string;
 	argv: string[];
@@ -37,9 +46,8 @@ type ClassRule = {
 const SECRET_KEY_RE = /\b(?:[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PRIVATE[_-]?KEY|API[_-]?KEY|AWS_SECRET|AWS_SESSION)[A-Z0-9_]*)\b/i;
 
 // ---------------------------------------------------------------------------
-// Protected floors: local, deterministic, never routed through nopal policy
-// decide. These stay active even when the policy-gate roundtrip is toggled
-// off (see index.ts's `/policy-gate off`).
+// Protected floors: local, deterministic, and never routed through Nopal
+// policy. They remain active for the entire Nopal-launched Pi process.
 // ---------------------------------------------------------------------------
 
 const protectedPathFragments = [
@@ -64,6 +72,96 @@ export function isProtectedCredentialPath(path: string): boolean {
 
 export function shouldBlockProtectedCredentialPath(toolName: string, path: string): boolean {
 	return (toolName === "write" || toolName === "edit") && isProtectedCredentialPath(path);
+}
+
+export type EnforcementAuthority = {
+	projectRoot: string;
+	stateDir: string;
+	configDir?: string;
+	adapterDir: string;
+	nopalBin: string;
+	runId: string;
+};
+
+function isWithin(candidate: string, root: string): boolean {
+	return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+function resolvedPathIsProtected(resolved: string, authority: EnforcementAuthority): boolean {
+	const projectRoot = resolveThroughExistingAncestor(path.resolve(authority.projectRoot)) ?? path.resolve(authority.projectRoot);
+	const stateDir = resolveThroughExistingAncestor(path.resolve(authority.stateDir)) ?? path.resolve(authority.stateDir);
+	if (isWithin(resolved, path.join(projectRoot, ".nopal"))) return true;
+	if (resolved === path.join(projectRoot, ".beislid", "workflow.md")) return true;
+	if (isWithin(resolved, stateDir)) return true;
+	const adapterDir = resolveThroughExistingAncestor(path.resolve(authority.adapterDir)) ?? path.resolve(authority.adapterDir);
+	const nopalBin = resolveThroughExistingAncestor(path.resolve(authority.nopalBin)) ?? path.resolve(authority.nopalBin);
+	if (isWithin(resolved, adapterDir)) return true;
+	if (resolved === nopalBin) return true;
+	if (authority.configDir) {
+		const configDir = resolveThroughExistingAncestor(path.resolve(authority.configDir)) ?? path.resolve(authority.configDir);
+		if (resolved === path.join(configDir, "policy.jsonc")) return true;
+	}
+	return false;
+}
+
+export function isProtectedEnforcementPath(candidate: string, cwd: string, authority: EnforcementAuthority): boolean {
+	const resolved = path.resolve(cwd, candidate.replace(/^@/, ""));
+	if (resolvedPathIsProtected(resolved, authority)) return true;
+	const throughExistingAncestor = resolveThroughExistingAncestor(resolved);
+	return Boolean(throughExistingAncestor && resolvedPathIsProtected(throughExistingAncestor, authority));
+}
+
+function resolveThroughExistingAncestor(candidate: string): string | undefined {
+	let cursor = candidate;
+	const suffix: string[] = [];
+	while (true) {
+		try {
+			return path.join(realpathSync(cursor), ...suffix.reverse());
+		} catch {
+			const parent = path.dirname(cursor);
+			if (parent === cursor) return undefined;
+			suffix.push(path.basename(cursor));
+			cursor = parent;
+		}
+	}
+}
+
+export function commandReferencesEnforcementAuthority(command: string, cwd: string, authority: EnforcementAuthority): boolean {
+	const normalized = command.replaceAll("\\", "/");
+	const protectedStrings = [
+		authority.projectRoot,
+		authority.stateDir,
+		authority.configDir,
+		authority.adapterDir,
+		authority.nopalBin,
+		authority.runId,
+		"NOPAL_ENFORCEMENT_RUN_ID",
+		"NOPAL_ENFORCEMENT_STATE_DIR",
+		"NOPAL_ENFORCEMENT_ROOT",
+		"NOPAL_ENFORCEMENT_ADAPTER_DIR",
+		"NOPAL_ENFORCEMENT_CLI",
+		"BEISLID_STATE_DIR",
+		"NOPAL_CONFIG_DIR",
+	]
+		.filter((value): value is string => Boolean(value))
+		.map((value) => value.replaceAll("\\", "/"));
+	if (
+		/(^|[\s'"`])(?:\.\/)?\.nopal(?:\/|[\s'"`]|$)/.test(normalized)
+		|| /\.beislid\/workflow\.md/.test(normalized)
+		|| protectedStrings.some((value) => normalized.includes(value))
+	) return true;
+
+	for (const segment of parseShellSegments(command)) {
+		for (const rawArgument of segment.argv.slice(1)) {
+			const argument = rawArgument.includes("=") && rawArgument.startsWith("--")
+				? rawArgument.slice(rawArgument.indexOf("=") + 1)
+				: rawArgument;
+			if (isProtectedEnforcementPath(argument, cwd, authority)) return true;
+			const resolved = resolveThroughExistingAncestor(path.resolve(cwd, argument.replace(/^@/, "")));
+			if (resolved && isProtectedEnforcementPath(resolved, cwd, authority)) return true;
+		}
+	}
+	return false;
 }
 
 export function redactSecrets(input: string): string {
@@ -168,6 +266,45 @@ function stripEnvAssignments(argv: string[]): string[] {
 	return argv.slice(index);
 }
 
+function unsupportedShellSyntax(command: string): string | undefined {
+	if (/[\r\n]/.test(command)) return "multi-command newlines are not supported";
+	const topLevelArgv = stripEnvAssignments(shellWords(command));
+	const shellNames = new Set(["bash", "sh", "dash", "zsh", "ksh", "fish"]);
+	for (let index = 0; index < topLevelArgv.length; index++) {
+		if (!shellNames.has(path.basename(topLevelArgv[index]))) continue;
+		if (topLevelArgv.slice(index + 1).some((argument) => /^-[^-]*c/.test(argument))) {
+			return "nested shell evaluation is not supported";
+		}
+	}
+	let quote: "'" | '"' | null = null;
+	for (let index = 0; index < command.length; index++) {
+		const character = command[index];
+		if (character === "\\") {
+			index += 1;
+			continue;
+		}
+		if ((character === "'" || character === '"') && quote === null) {
+			quote = character;
+			continue;
+		}
+		if (character === quote) {
+			quote = null;
+			continue;
+		}
+		if (quote === "'") continue;
+		if (character === "$" || character === "`") return "dynamic shell evaluation is not supported";
+		if (quote === null && character === "{" && command[index + 1] === "}") {
+			index += 1;
+			continue;
+		}
+		if (quote === null && "&;|<>*?[]{}()".includes(character)) {
+			return `shell operator or expansion ${JSON.stringify(character)} is not supported`;
+		}
+	}
+	if (quote !== null) return "unterminated shell quoting is not supported";
+	return undefined;
+}
+
 function parseShellSegments(command: string): Segment[] {
 	const rawSegments = splitShell(command, ["&&", "||", ";", "|"]);
 	const segments: Segment[] = [];
@@ -184,6 +321,47 @@ function parseShellSegments(command: string): Segment[] {
 		segments.push({ raw: raw.trim(), argv });
 	}
 	return segments;
+}
+
+function normalizeExecutableSegment(segment: Segment): { segment?: Segment; reason?: string } {
+	const [rawCommand, ...rawArgs] = segment.argv;
+	if (!rawCommand) return { reason: "missing executable" };
+	const command = path.basename(rawCommand);
+	if (command === "env" && rawArgs.length > 0) {
+		return { reason: "environment command wrappers are not supported" };
+	}
+	if (command !== "git" && rawArgs.some((argument) => path.basename(argument) === "git")) {
+		return { reason: "nested executable wrappers are not supported" };
+	}
+	if (command !== "git") return { segment: { ...segment, argv: [command, ...rawArgs] } };
+
+	const args = [...rawArgs];
+	while (args[0]?.startsWith("-")) {
+		const option = args[0];
+		if (["--no-pager", "--paginate", "-P", "-p", "--literal-pathspecs", "--no-literal-pathspecs", "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs"].includes(option)) {
+			args.shift();
+			continue;
+		}
+		if (option === "-C" && args[1]) {
+			args.splice(0, 2);
+			continue;
+		}
+		if (option.startsWith("-C") && option.length > 2) {
+			args.shift();
+			continue;
+		}
+		if (["--git-dir", "--work-tree", "--namespace", "--super-prefix"].includes(option) && args[1]) {
+			args.splice(0, 2);
+			continue;
+		}
+		if (["--git-dir=", "--work-tree=", "--namespace=", "--super-prefix="].some((prefix) => option.startsWith(prefix))) {
+			args.shift();
+			continue;
+		}
+		return { reason: `unsupported Git global option ${JSON.stringify(option)}` };
+	}
+	if (!args[0]) return { reason: "Git subcommand is missing" };
+	return { segment: { ...segment, argv: ["git", ...args] } };
 }
 
 function isNetworkTransferCommand(command: string | undefined): boolean {
@@ -254,6 +432,13 @@ function classifyCredentialCommand(segment: Segment): Classification | null {
 // ---------------------------------------------------------------------------
 
 const HIGH_SEVERITY_RULES: ClassRule[] = [
+	{
+		id: "nopal-enforcement-internal",
+		command: "nopal",
+		argsPrefixAny: [["enforcement"], ["--json", "enforcement"]],
+		class: "destructive",
+		action: "nopal.enforcement_internal",
+	},
 	{ id: "git-reset-hard", command: "git", argsPrefixAny: [["reset", "--hard"]], class: "destructive", action: "git.reset_hard" },
 	{
 		id: "git-clean-force",
@@ -262,7 +447,23 @@ const HIGH_SEVERITY_RULES: ClassRule[] = [
 		class: "destructive",
 		action: "git.clean_force",
 	},
-	{ id: "git-push", command: "git", argsPrefixAny: [["push"]], class: "git_remote", action: "git.push" },
+	{
+		id: "git-push",
+		command: "git",
+		argsPrefixAny: [["push"]],
+		class: "git_remote",
+		action: (segment) =>
+			segment.argv.slice(2).some((arg) =>
+				arg === "-f"
+				|| arg === "--force"
+				|| arg.startsWith("--force-with-lease")
+				|| arg.startsWith("+")
+				|| /[$`*?\[]/.test(arg)
+			)
+				? "git.push_force"
+				: "git.push",
+	},
+	{ id: "git-add", command: "git", argsPrefixAny: [["add"]], class: "git_local", action: "git.add" },
 	{ id: "git-commit", command: "git", argsPrefixAny: [["commit"]], class: "git_local", action: "git.commit" },
 	{
 		id: "rm-recursive",
@@ -399,30 +600,78 @@ function resolveAction(action: ClassRule["action"], segment: Segment): string {
  * default is "let the core decide", and the core treats unknown classes as
  * protected/unsafe.
  */
-export function classifyBashCommand(command: string): Classification {
+export function classifyBashCommandSet(command: string): CommandClassifications {
+	const unsupported = unsupportedShellSyntax(command);
+	if (unsupported) return { classifications: [], complete: false, reason: unsupported };
 	const inspectionCommand = stripHeredocsAndProse(command);
+	const parsedSegments = parseShellSegments(inspectionCommand);
+	if (parsedSegments.length > 1) {
+		return { classifications: [], complete: false, reason: "multiple executable shell segments are not supported" };
+	}
+	const normalized = parsedSegments.map(normalizeExecutableSegment);
+	const normalizationFailure = normalized.find((entry) => entry.reason)?.reason;
+	if (normalizationFailure) {
+		return { classifications: [], complete: false, reason: normalizationFailure };
+	}
+	const segments = normalized.flatMap((entry) => entry.segment ? [entry.segment] : []);
+	if (segments.length > 1) {
+		return { classifications: [], complete: false, reason: "multiple executable shell segments are not supported" };
+	}
+	if (segments.length === 0) {
+		return { classifications: [], complete: false, reason: "no executable shell segment was found" };
+	}
 
+	const classifications: Classification[] = [];
 	const exfil = classifyNetworkCredentialExfil(inspectionCommand);
-	if (exfil) return exfil;
-
-	const segments = parseShellSegments(inspectionCommand);
-	if (segments.length === 0) return { action: "bash.exec", class: "unknown" };
+	if (exfil) classifications.push(exfil);
 
 	for (const segment of segments) {
 		const credential = classifyCredentialCommand(segment);
-		if (credential) return credential;
+		if (credential) {
+			classifications.push(credential);
+			continue;
+		}
+		const highSeverity = firstMatchingRule(segment, HIGH_SEVERITY_RULES);
+		if (highSeverity) {
+			classifications.push({ action: resolveAction(highSeverity.action, segment), class: highSeverity.class });
+			continue;
+		}
+		const routine = firstMatchingRule(segment, ROUTINE_RULES);
+		if (routine) {
+			classifications.push({ action: resolveAction(routine.action, segment), class: routine.class });
+			continue;
+		}
+		const [cmd] = segment.argv;
+		classifications.push({ action: cmd ? `${cmd}.exec` : "bash.exec", class: "unknown" });
 	}
 
-	for (const segment of segments) {
-		const rule = firstMatchingRule(segment, HIGH_SEVERITY_RULES);
-		if (rule) return { action: resolveAction(rule.action, segment), class: rule.class };
-	}
+	return {
+		classifications: classifications.filter((candidate, index, all) =>
+			all.findIndex((entry) => entry.action === candidate.action && entry.class === candidate.class) === index
+		),
+		complete: true,
+	};
+}
 
-	for (const segment of segments) {
-		const rule = firstMatchingRule(segment, ROUTINE_RULES);
-		if (rule) return { action: resolveAction(rule.action, segment), class: rule.class };
+/**
+ * Compatibility projection for callers that can consume only one action.
+ * Enforcement uses `classifyBashCommandSet`, which rejects compound or
+ * unsupported shell syntax before returning its complete classifications.
+ * This projection exists for diagnostics and must not authorize a command.
+ */
+export function classifyBashCommand(command: string): Classification {
+	const result = classifyBashCommandSet(command);
+	if (!result.complete || result.classifications.length === 0) {
+		return { action: "bash.exec", class: "unknown" };
 	}
-
-	const [cmd] = segments[0].argv;
-	return { action: cmd ? `${cmd}.exec` : "bash.exec", class: "unknown" };
+	const priority = ["nopal.enforcement_internal", "git.push_force"];
+	for (const action of priority) {
+		const match = result.classifications.find((candidate) => candidate.action === action);
+		if (match) return match;
+	}
+	for (const className of ["destructive", "secret_bearing", "network_write", "git_remote", "git_local", "network_read", "read", "unknown"]) {
+		const match = result.classifications.find((candidate) => candidate.class === className);
+		if (match) return match;
+	}
+	return result.classifications[0];
 }
