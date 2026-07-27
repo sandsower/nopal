@@ -99,12 +99,23 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_include_enforcement_and_hide_legacy_launch_routes() {
+    fn capabilities_hide_internal_and_legacy_product_routes() {
         let report = info_report(&cli_command());
         assert!(report.capabilities.iter().any(|name| name == "info"));
-        assert!(report.capabilities.iter().any(|name| name == "enforcement"));
-        assert!(!report.capabilities.iter().any(|name| name == "field"));
-        assert!(!report.capabilities.iter().any(|name| name == "cli"));
+        for hidden in [
+            "enforcement",
+            "field",
+            "cli",
+            "plot",
+            "bridge",
+            "rondo",
+            "run",
+        ] {
+            assert!(
+                !report.capabilities.iter().any(|name| name == hidden),
+                "{hidden} must not be advertised as a v0.3 capability"
+            );
+        }
     }
 
     #[test]

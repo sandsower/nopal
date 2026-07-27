@@ -1,20 +1,12 @@
 {
-  // Nopal's public, repository-local extension bundle.
-  //
-  // Skills are NOT pinned here: inherit_ambient ["skills"] keeps pi's normal
-  // skill discovery on, so contributors can use their existing local skills.
-  // Extensions/prompt-templates/themes stay hermetic (explicit pins only), since
-  // those carry code/behavior that should be curated, not inherited.
+  // Nopal's repository-local v0.3 bundle keeps executable extension code to
+  // the byte-verified enforcement adapter. Skills remain ambient prose and
+  // lifecycle resources; other extensions must wait for an enforcement-aware
+  // profile instead of bypassing the tool-call assurance boundary.
   "version": "nopal.bundle/v1",
   "inherit_ambient": ["skills"],
   "extensions": [
-    { "source": "nopal", "path": "extensions/nopal/index.ts" },
-    { "source": "policy-gate", "path": "extensions/policy-gate/index.ts" },
-    { "source": "show-me", "path": "extensions/show-me/index.ts" },
-    { "source": "usage-tracker", "path": "extensions/usage-tracker/index.ts" },
-    { "source": "task-state", "path": "extensions/task-state/index.ts" },
-    { "source": "subagent-runner", "path": "extensions/subagent-runner/index.ts" },
-    { "source": "mcp-bridge", "path": "extensions/mcp-bridge/index.ts" }
+    { "source": "policy-gate", "path": "extensions/policy-gate/index.ts" }
   ],
   "themes": [
     { "source": "nopal-dark", "path": ".nopal/theme.json" }

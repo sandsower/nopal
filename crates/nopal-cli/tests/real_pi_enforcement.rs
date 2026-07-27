@@ -51,10 +51,7 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
     let pi = executable("PI");
     let nopal = PathBuf::from(env!("CARGO_BIN_EXE_nopal"));
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let enforcement = source_root
-        .join("extensions/policy-gate/index.ts")
-        .canonicalize()
-        .unwrap();
+    let enforcement_source = source_root.join("extensions/policy-gate");
     let provider = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/deterministic-enforcement-provider.mjs")
         .canonicalize()
@@ -73,10 +70,19 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
     let home = temp.path().join("home");
     let agent = temp.path().join("agent");
     let bin = temp.path().join("bin");
-    for directory in [&repo, &state, &home, &agent, &bin] {
+    let adapter = temp.path().join("distribution/extensions/policy-gate");
+    for directory in [&repo, &state, &home, &agent, &bin, &adapter] {
         fs::create_dir_all(directory).unwrap();
     }
-    fs::copy(&nopal, bin.join("nopal")).unwrap();
+    for file in ["index.ts", "classifier.ts", "nopal-cli.ts"] {
+        fs::copy(enforcement_source.join(file), adapter.join(file)).unwrap();
+    }
+    let enforcement = adapter.join("index.ts").canonicalize().unwrap();
+    let substituted_cli_marker = temp.path().join("substituted-cli-ran");
+    write(
+        &bin.join("nopal"),
+        &format!("#!/bin/sh\ntouch {:?}\nexit 99\n", substituted_cli_marker),
+    );
     fs::set_permissions(bin.join("nopal"), fs::Permissions::from_mode(0o755)).unwrap();
 
     command(
@@ -111,7 +117,7 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
           "modes": { "supervised_auto": { "rules": [
             { "id": "allow-push", "actions": ["git.push"], "decision": "allow" },
             { "id": "deny-force", "actions": ["git.push_force"], "decision": "deny" },
-            { "id": "allow-commit", "actions": ["git.commit"], "decision": "allow" }
+            { "id": "allow-workspace-change", "actions": ["fs.write", "git.add", "git.commit"], "decision": "allow" }
           ] } }
         }"#,
     );
@@ -126,6 +132,8 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
           }]
         }"#,
     );
+    std::os::unix::fs::symlink(".nopal/policy.jsonc", repo.join("policy-link")).unwrap();
+    std::os::unix::fs::symlink(".nopal", repo.join("authority-dir-link")).unwrap();
     write(
         &repo.join(".nopal/bundle.jsonc"),
         &format!(
@@ -152,7 +160,7 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
             "-p",
             "--no-session",
             "--tools",
-            "bash",
+            "bash,write",
             "--offline",
             "--approve",
             "--provider",
@@ -167,6 +175,9 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
         .env("PI_CODING_AGENT_DIR", &agent)
         .env("HOME", &home)
         .env("GATE_COUNT_FILE", &gate_count)
+        .env("AUTHORITY_FILE", ".nopal/policy.jsonc")
+        .env("PROOF_ADAPTER_INDEX", &enforcement)
+        .env("PROOF_GIT_BIN", &git)
         .env("PATH", path)
         .output()
         .unwrap();
@@ -176,6 +187,18 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let pi_events = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "not supported",
+        "reserved for the trusted Pi adapter",
+        "Nopal enforcement authority is not accessible to agent tools",
+        "contract and evidence store are reserved",
+    ] {
+        assert!(
+            pi_events.contains(expected),
+            "missing blocked-tool evidence {expected:?}: {pi_events}"
+        );
+    }
 
     assert_eq!(fs::read_to_string(&gate_count).unwrap().trim(), "2");
     let local_head = Command::new(&git)
@@ -188,9 +211,32 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
         .current_dir(&remote)
         .output()
         .unwrap();
+    let authorized_head = Command::new(&git)
+        .args(["rev-parse", "HEAD~1"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
     assert_eq!(
+        authorized_head.stdout, remote_head.stdout,
+        "the stale-receipt push must land before every adversarial force-push form is blocked"
+    );
+    assert_ne!(
         local_head.stdout, remote_head.stdout,
-        "normal stale push must land while force push remains blocked"
+        "compound authorization must block the whole shell envelope before its normal-push prefix executes"
+    );
+    assert!(
+        !fs::read_to_string(repo.join("source.txt"))
+            .unwrap()
+            .contains("hidden")
+    );
+    let policy = fs::read_to_string(repo.join(".nopal/policy.jsonc")).unwrap();
+    assert!(policy.contains("deny-force"));
+    assert!(!policy.contains("forged"));
+    assert!(!repo.join(".nopal/new/deep/forged.jsonc").exists());
+    assert!(
+        fs::read_to_string(&enforcement)
+            .unwrap()
+            .contains("policyGate")
     );
 
     let events = find_file(&state, "events.jsonl").expect("enforcement ledger events");
@@ -200,6 +246,10 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
     assert!(events.contains("gate_receipt"));
     assert!(events.contains("git.push_force"));
     assert!(events.contains("\"decision\": \"deny\""));
+    assert!(
+        !substituted_cli_marker.exists(),
+        "the adapter must invoke the resolved launch binary instead of a PATH substitute"
+    );
 }
 
 fn find_file(root: &Path, name: &str) -> Option<PathBuf> {

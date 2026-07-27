@@ -113,12 +113,15 @@ export type EnforcementGate = {
 	id: string;
 	run: GateRun;
 	cwd?: string;
+	definitionDigest: string;
 };
 
 export type EnforcementPlanResult = PolicyDecisionResult & {
 	ok: boolean;
 	root: string;
 	requiredGates: EnforcementGate[];
+	contractDigest: string;
+	workspaceFingerprint: string;
 };
 
 export type EnforcementParams = {
@@ -126,6 +129,7 @@ export type EnforcementParams = {
 	action: string;
 	class: string;
 	runId: string;
+	nopalBin: string;
 	cwd?: string;
 	timeoutMs?: number;
 };
@@ -163,7 +167,8 @@ function validGateRun(value: unknown): value is GateRun {
 
 export function parseEnforcementPlanOutput(stdout: string, code: number): EnforcementPlanResult {
 	const fallback = failClosed(`nopal enforcement plan exited with code ${code}; treating as ask (fail closed)`);
-	if (code !== 0) return { ...fallback, ok: false, root: "", requiredGates: [] };
+	const empty = { ok: false, root: "", requiredGates: [], contractDigest: "", workspaceFingerprint: "" };
+	if (code !== 0) return { ...fallback, ...empty };
 	try {
 		const value = JSON.parse(stdout) as {
 			kind?: unknown;
@@ -171,18 +176,37 @@ export function parseEnforcementPlanOutput(stdout: string, code: number): Enforc
 			root?: unknown;
 			decision?: unknown;
 			required_gates?: unknown;
+			receipts?: unknown;
+			contract_digest?: unknown;
+			workspace_fingerprint?: unknown;
 		};
-		if (value.kind !== "nopal.enforcement.plan/v1" || value.ok !== true || typeof value.root !== "string" || !isPolicyDecision(value.decision)) {
-			throw new Error("invalid enforcement envelope");
+		if (
+			value.kind !== "nopal.enforcement.plan/v1"
+			|| value.ok !== true
+			|| typeof value.root !== "string"
+			|| !isPolicyDecision(value.decision)
+			|| typeof value.contract_digest !== "string"
+			|| typeof value.workspace_fingerprint !== "string"
+		) throw new Error("invalid enforcement envelope");
+		if (!Array.isArray(value.required_gates) || !Array.isArray(value.receipts)) throw new Error("invalid gate evidence");
+		const definitions = new Map<string, string>();
+		for (const entry of value.receipts) {
+			if (!entry || typeof entry !== "object") throw new Error("invalid receipt status");
+			const receipt = entry as { gate_id?: unknown; gate_definition_digest?: unknown };
+			if (typeof receipt.gate_id !== "string" || typeof receipt.gate_definition_digest !== "string") {
+				throw new Error("invalid receipt status");
+			}
+			definitions.set(receipt.gate_id, receipt.gate_definition_digest);
 		}
-		if (!Array.isArray(value.required_gates)) throw new Error("invalid gate list");
 		const requiredGates = value.required_gates.map((entry) => {
 			if (!entry || typeof entry !== "object") throw new Error("invalid gate");
 			const gate = entry as { id?: unknown; run?: unknown; cwd?: unknown };
 			if (typeof gate.id !== "string" || !validGateRun(gate.run) || (gate.cwd !== undefined && typeof gate.cwd !== "string")) {
 				throw new Error("invalid gate");
 			}
-			return { id: gate.id, run: gate.run, ...(gate.cwd === undefined ? {} : { cwd: gate.cwd }) };
+			const definitionDigest = definitions.get(gate.id);
+			if (!definitionDigest) throw new Error("missing gate definition digest");
+			return { id: gate.id, run: gate.run, definitionDigest, ...(gate.cwd === undefined ? {} : { cwd: gate.cwd }) };
 		});
 		return {
 			ok: true,
@@ -191,11 +215,28 @@ export function parseEnforcementPlanOutput(stdout: string, code: number): Enforc
 			explanation: `effective decision ${value.decision}`,
 			failClosed: false,
 			requiredGates,
+			contractDigest: value.contract_digest,
+			workspaceFingerprint: value.workspace_fingerprint,
 		};
 	} catch {
 		const invalid = failClosed("nopal enforcement plan produced an invalid envelope; treating as ask (fail closed)");
-		return { ...invalid, ok: false, root: "", requiredGates: [] };
+		return { ...invalid, ...empty };
 	}
+}
+
+export function reauthorizationIsCurrent(
+	initial: EnforcementPlanResult,
+	reauthorized: EnforcementPlanResult,
+	approvedAsk: boolean,
+): boolean {
+	const contextUnchanged = reauthorized.contractDigest === initial.contractDigest
+		&& reauthorized.workspaceFingerprint === initial.workspaceFingerprint;
+	const decisionAuthorized = reauthorized.decision === "allow"
+		|| (reauthorized.decision === "ask" && approvedAsk);
+	return contextUnchanged
+		&& !reauthorized.failClosed
+		&& decisionAuthorized
+		&& reauthorized.requiredGates.length === 0;
 }
 
 export async function planEnforcement(exec: ExecFn, params: EnforcementParams): Promise<EnforcementPlanResult> {
@@ -204,26 +245,35 @@ export async function planEnforcement(exec: ExecFn, params: EnforcementParams): 
 		"--class", params.class, "--run-id", params.runId,
 	];
 	try {
-		const result = await exec("nopal", args, { cwd: params.cwd, timeout: params.timeoutMs ?? DEFAULT_TIMEOUT_MS });
+		const result = await exec(params.nopalBin, args, { cwd: params.cwd, timeout: params.timeoutMs ?? DEFAULT_TIMEOUT_MS });
 		return parseEnforcementPlanOutput(result.stdout, result.code);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		const fallback = failClosed(`nopal binary could not be executed (${message}); treating as ask (fail closed)`);
-		return { ...fallback, ok: false, root: "", requiredGates: [] };
+		return { ...fallback, ok: false, root: "", requiredGates: [], contractDigest: "", workspaceFingerprint: "" };
 	}
 }
 
 export async function recordEnforcementGate(
 	exec: ExecFn,
-	params: EnforcementParams & { gateId: string; exitCode: number },
+	params: EnforcementParams & {
+		gateId: string;
+		exitCode: number;
+		contractDigest: string;
+		workspaceFingerprint: string;
+		gateDefinitionDigest: string;
+	},
 ): Promise<boolean> {
 	const args = [
 		"--json", "enforcement", "record-gate", "--mode", params.mode, "--action", params.action,
-		"--class", params.class, "--run-id", params.runId, "--gate-id", params.gateId,
-		"--exit-code", String(params.exitCode),
+		"--class", params.class, "--run-id", params.runId,
+		"--gate-id", params.gateId, "--exit-code", String(params.exitCode),
+		"--contract-digest", params.contractDigest,
+		"--workspace-fingerprint", params.workspaceFingerprint,
+		"--gate-definition-digest", params.gateDefinitionDigest,
 	];
 	try {
-		const result = await exec("nopal", args, { cwd: params.cwd, timeout: params.timeoutMs ?? DEFAULT_TIMEOUT_MS });
+		const result = await exec(params.nopalBin, args, { cwd: params.cwd, timeout: params.timeoutMs ?? DEFAULT_TIMEOUT_MS });
 		if (result.code !== 0) return false;
 		const value = JSON.parse(result.stdout) as { kind?: unknown; ok?: unknown };
 		return value.kind === "nopal.enforcement.record_gate/v1" && value.ok === true;

@@ -1751,20 +1751,15 @@ fn info_json_reports_version_and_capabilities() {
         capabilities,
         vec![
             "ask",
-            "bridge",
-            "enforcement",
             "export",
             "gates",
             "import",
             "info",
             "ledger",
             "placement",
-            "plot",
             "policy",
             "preflights",
             "review-risk",
-            "rondo",
-            "run",
             "status",
             "validate",
             "workflow",
@@ -1782,14 +1777,11 @@ fn info_toon_and_json_come_from_the_same_report() {
     let json_out = nopal(&["info", "--json"]);
     let doc = json(&json_out);
     assert_eq!(doc["kind"], "nopal.info/v1");
-    // Consumer-style feature detection: membership, never help/version parsing.
-    assert!(
-        doc["capabilities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|v| v == "enforcement")
-    );
+    // Consumer-style feature detection exposes public deterministic seams,
+    // never hidden adapter or legacy coordination commands.
+    let capabilities = doc["capabilities"].as_array().unwrap();
+    assert!(capabilities.iter().any(|value| value == "policy"));
+    assert!(!capabilities.iter().any(|value| value == "enforcement"));
 }
 
 #[test]

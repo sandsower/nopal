@@ -1670,7 +1670,7 @@ fn bare_nopal_launches_pi_with_initialized_enforcement_without_a_tty() {
     let stub = temp.path().join("pi-stub.sh");
     fs::write(
         &stub,
-        "#!/bin/sh\ntest -n \"$NOPAL_ENFORCEMENT_RUN_ID\" || exit 41\nexit 9\n",
+        "#!/bin/sh\ntest -n \"$NOPAL_ENFORCEMENT_RUN_ID\" || exit 41\ntest -z \"$NOPAL_ENFORCEMENT_RECEIPT_KEY\" || exit 42\ntest -n \"$NOPAL_ENFORCEMENT_ADAPTER_DIR\" || exit 43\ntest -x \"$NOPAL_ENFORCEMENT_CLI\" || exit 44\nexit 9\n",
     )
     .unwrap();
     let mut permissions = fs::metadata(&stub).unwrap().permissions();
@@ -1691,6 +1691,137 @@ fn bare_nopal_launches_pi_with_initialized_enforcement_without_a_tty() {
         runs.exists(),
         "bare launch must initialize the enforcement ledger"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn bare_nopal_rejects_adapter_source_with_only_the_expected_filename() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    write_portable_project(temp.path());
+    let adapter = temp.path().join("extensions/policy-gate");
+    fs::create_dir_all(&adapter).unwrap();
+    for file in ["index.ts", "classifier.ts", "nopal-cli.ts"] {
+        fs::write(adapter.join(file), "export default function () {}\n").unwrap();
+    }
+    write_bundle(
+        temp.path(),
+        &format!(
+            "{{ \"version\": \"nopal.bundle/v1\", \"extensions\": [{{ \"source\": \"enforcement\", \"path\": {:?} }}] }}",
+            adapter.join("index.ts").display().to_string()
+        ),
+    );
+    let marker = temp.path().join("pi-was-here");
+    let stub = temp.path().join("pi-stub.sh");
+    fs::write(&stub, format!("#!/bin/sh\ntouch {:?}\n", marker)).unwrap();
+    let mut permissions = fs::metadata(&stub).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&stub, permissions).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", temp.path().to_str().unwrap()])
+        .env("NOPAL_PI_BIN", &stub)
+        .env("NOPAL_CONFIG_DIR", isolated_config_dir())
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(stderr(&out).contains("adapter identity mismatch"));
+    assert!(
+        !marker.exists(),
+        "Pi must not start with an untrusted adapter"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn bare_nopal_rejects_untrusted_or_ambient_sibling_extensions() {
+    let temp = tempfile::tempdir().unwrap();
+    write_portable_project(temp.path());
+    let enforcement = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../extensions/policy-gate/index.ts")
+        .canonicalize()
+        .unwrap();
+    let sibling = temp.path().join("sibling.ts");
+    fs::write(&sibling, "export default function sibling() {}\n").unwrap();
+    write_bundle(
+        temp.path(),
+        &format!(
+            "{{ \"version\": \"nopal.bundle/v1\", \"extensions\": [{{ \"source\": \"enforcement\", \"path\": {:?} }}, {{ \"source\": \"sibling\", \"path\": {:?} }}] }}",
+            enforcement.display().to_string(),
+            sibling.display().to_string()
+        ),
+    );
+    let untrusted = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", temp.path().to_str().unwrap()])
+        .env("NOPAL_PI_BIN", "/bin/false")
+        .env("NOPAL_CONFIG_DIR", isolated_config_dir())
+        .output()
+        .unwrap();
+    assert_eq!(untrusted.status.code(), Some(2), "{untrusted:?}");
+    assert!(stderr(&untrusted).contains("untrusted executable Pi extension"));
+
+    write_enforcement_bundle(temp.path());
+    let ambient = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", temp.path().to_str().unwrap(), "--with-ambient"])
+        .env("NOPAL_PI_BIN", "/bin/false")
+        .env("NOPAL_CONFIG_DIR", isolated_config_dir())
+        .output()
+        .unwrap();
+    assert_eq!(ambient.status.code(), Some(2), "{ambient:?}");
+    assert!(stderr(&ambient).contains("ambient Pi extensions"));
+
+    let injected = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args([
+            "--dir",
+            temp.path().to_str().unwrap(),
+            "--",
+            "--extension",
+            sibling.to_str().unwrap(),
+        ])
+        .env("NOPAL_PI_BIN", "/bin/false")
+        .env("NOPAL_CONFIG_DIR", isolated_config_dir())
+        .output()
+        .unwrap();
+    assert_eq!(injected.status.code(), Some(2), "{injected:?}");
+    assert!(stderr(&injected).contains("must be declared in the byte-verified Nopal bundle"));
+}
+
+#[test]
+fn public_help_hides_internal_and_legacy_launch_routes() {
+    let out = nopal(&["--help"]);
+    assert!(out.status.success());
+    let help = stdout(&out);
+    assert!(help.contains("Opinionated Pi distribution with deterministic enforcement"));
+    for hidden in ["plot", "bridge", "rondo", "run", "field", "enforcement"] {
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.trim_start().starts_with(hidden)),
+            "{help}"
+        );
+    }
+    assert!(!help.contains("cli "), "{help}");
+
+    let info = nopal(&["--json", "info"]);
+    assert!(info.status.success());
+    let info_json = json(&info);
+    let capabilities = info_json["capabilities"].as_array().unwrap();
+    for hidden in [
+        "plot",
+        "bridge",
+        "rondo",
+        "run",
+        "field",
+        "enforcement",
+        "cli",
+    ] {
+        assert!(
+            !capabilities.iter().any(|value| value == hidden),
+            "{capabilities:?}"
+        );
+    }
 }
 
 #[test]

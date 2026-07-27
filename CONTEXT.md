@@ -59,8 +59,9 @@ The Pi adapter executes the command and returns the observed result.
 _Avoid_: executing gate commands inside Nopal Core or treating successful process startup as gate evidence
 
 **Gate receipt**:
-Durable evidence that one exact gate definition passed against one effective contract and one workspace content fingerprint.
-A workspace or contract change makes the receipt stale.
+Durable, session-authenticated evidence that one exact gate definition passed against one effective contract and one workspace content fingerprint.
+The receipt capability is ephemeral, stored in a mode-0600 protected run file, and never enters Pi extension state, subprocess arguments, project data, or ledger events.
+A workspace, contract, or gate-definition change makes the receipt stale or rejects the in-flight result.
 _Avoid_: session-wide booleans, command-string caches, or receipts detached from repository content
 
 **Workflow Run Ledger**:
@@ -82,8 +83,9 @@ _Avoid_: retroactively describing external work as enforced
 - Unrecognized Beislið-owned blocks remain diagnostic-only.
 - Policy composition can only become more restrictive.
 - Nopal Core selects and validates but never executes gates.
-- The Pi adapter executes only the gate plan returned by Core.
-- A protected action cannot run with missing, failed, or stale required gate evidence.
+- The Pi adapter accepts only one completely classifiable command per shell tool call and executes only the gate plan returned by Core.
+- Compound, dynamic, redirected, expanded, or otherwise unsupported shell execution fails closed before any segment runs.
+- A protected action cannot run with missing, failed, stale, or unauthenticated required gate evidence.
 - Decisions, attempts, and receipts are durably recorded.
 - Enforcement has no session bypass or daemon dependency.
 - Field, Cockpit, desktop, Plot coordination, Rondo, Memento, and Herdr are outside the v0.3 product.

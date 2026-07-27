@@ -34,10 +34,15 @@ Gate declarations accumulate, and conflicting definitions fail closed.
 
 Nopal Core compiles typed declarations, evaluates policy, selects gates, validates receipt freshness, and records evidence.
 Nopal Core never executes gate commands.
-The bundled Pi adapter intercepts protected tool calls, executes exactly the gate plan returned by Core, and allows the original call only after Core observes current passing receipts.
+The bundled Pi adapter intercepts protected tool calls, requires each shell tool call to contain one completely classifiable command, executes exactly the gate plan returned by Core, and allows the original call only after Core observes current passing receipts.
+Compound, dynamically constructed, redirected, expanded, or otherwise unsupported shell execution fails closed before any segment runs.
 The adapter has no disable switch and internal enforcement commands are not agent-callable actions.
 
 A gate receipt is bound to repository and workspace content, the effective enforcement contract, and the exact gate definition.
+Each receipt is authenticated with an ephemeral session capability stored in a mode-0600 file inside the protected run directory and omitted from the Pi environment, extension state, subprocess arguments, project data, and ledger events.
+The launcher verifies every executable extension against identities embedded in the Nopal executable, rejects ambient or injected extensions, and makes the enforcement adapter the only executable extension in the default bundle.
+Adapter subprocesses invoke the resolved Nopal executable rather than a PATH lookup.
+Gate recording rejects results when the contract, workspace, or gate definition differs from the execution plan.
 A relevant workspace or contract change makes the receipt stale.
 Decisions, gate attempts, and receipts are recorded in the Workflow Run Ledger.
 

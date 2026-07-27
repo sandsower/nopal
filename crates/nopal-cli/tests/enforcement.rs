@@ -7,6 +7,8 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 
+const RECEIPT_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
 fn write(path: &Path, text: &str) {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap();
@@ -76,6 +78,11 @@ fn cli_records_decisions_and_reuses_only_current_gate_receipts() {
         ],
     );
     assert!(initialized.status.success(), "{initialized:?}");
+    let run_root = state.path().join("runs/enforcement/unknown-repo/cli-proof");
+    write(
+        &run_root.join("artifacts/enforcement/receipt-capability"),
+        RECEIPT_KEY,
+    );
 
     let plan_args = [
         "enforcement",
@@ -91,7 +98,17 @@ fn cli_records_decisions_and_reuses_only_current_gate_receipts() {
     ];
     let first = run(temp.path(), state.path(), &plan_args);
     assert!(first.status.success(), "{first:?}");
-    assert_eq!(json(&first)["required_gates"][0]["id"], "proof");
+    let first_json = json(&first);
+    assert_eq!(first_json["required_gates"][0]["id"], "proof");
+    let contract_digest = first_json["contract_digest"].as_str().unwrap().to_owned();
+    let workspace_fingerprint = first_json["workspace_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let gate_definition_digest = first_json["receipts"][0]["gate_definition_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     let recorded = run(
         temp.path(),
@@ -111,6 +128,12 @@ fn cli_records_decisions_and_reuses_only_current_gate_receipts() {
             "proof",
             "--exit-code",
             "0",
+            "--contract-digest",
+            &contract_digest,
+            "--workspace-fingerprint",
+            &workspace_fingerprint,
+            "--gate-definition-digest",
+            &gate_definition_digest,
         ],
     );
     assert!(recorded.status.success(), "{recorded:?}");
@@ -142,7 +165,6 @@ fn cli_records_decisions_and_reuses_only_current_gate_receipts() {
     assert!(force.status.success(), "{force:?}");
     assert_eq!(json(&force)["decision"], "deny");
 
-    let run_root = state.path().join("runs/enforcement/unknown-repo/cli-proof");
     let events = fs::read_to_string(run_root.join("events.jsonl")).unwrap();
     assert!(events.contains("action_decision"));
     assert!(events.contains("gate_attempt"));

@@ -41,7 +41,7 @@ mod launch;
 #[command(
     name = "nopal",
     version,
-    about = "Deterministic process/config core and Rondo Core coordinator"
+    about = "Opinionated Pi distribution with deterministic enforcement"
 )]
 struct Cli {
     /// Starting directory for project discovery (walks up to the git root
@@ -96,6 +96,7 @@ enum Cmd {
         command: PolicyCmd,
     },
     /// Machine API used by the bundled Pi enforcement adapter
+    #[command(hide = true)]
     Enforcement {
         #[command(subcommand)]
         command: EnforcementCmd,
@@ -128,12 +129,14 @@ enum Cmd {
         #[command(subcommand)]
         command: AskCmd,
     },
-    /// Establish a provisional Plot from an authoritative repository snapshot
+    /// Legacy Plot coordination retained only until the removal slice
+    #[command(hide = true)]
     Plot {
         #[command(subcommand)]
         command: PlotCmd,
     },
-    /// Bridge Nopal's versioned coordination feeds into external hosts
+    /// Legacy host bridge retained only until the removal slice
+    #[command(hide = true)]
     Bridge {
         #[command(subcommand)]
         command: BridgeCmd,
@@ -150,12 +153,14 @@ enum Cmd {
     Info,
     /// Explain the runtime placement Nopal would use for an action
     Placement(CoordinatorPlacementArgs),
-    /// Manage the local execution-contract-shaped Rondo Core service stub
+    /// Legacy Rondo service retained only until the removal slice
+    #[command(hide = true)]
     Rondo {
         #[command(subcommand)]
         command: RondoCmd,
     },
-    /// Start or preview Nopal run coordination
+    /// Legacy run coordination retained only until the removal slice
+    #[command(hide = true)]
     Run {
         #[command(subcommand)]
         command: RunCmd,
@@ -683,6 +688,12 @@ struct RecordGateArgs {
     gate_id: String,
     #[arg(long)]
     exit_code: i32,
+    #[arg(long)]
+    contract_digest: String,
+    #[arg(long)]
+    workspace_fingerprint: String,
+    #[arg(long)]
+    gate_definition_digest: String,
 }
 
 #[derive(clap::Args)]
@@ -1018,6 +1029,7 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
             )
             .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
             let config_dir = resolve_config_dir();
+            let receipt_key = enforcement::load_receipt_capability(&run_dir)?;
             let request = enforcement::EnforcementRequest {
                 root: &root,
                 config_dir: config_dir.as_deref(),
@@ -1025,6 +1037,7 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
                 action: &args.action,
                 classes: &args.classes,
                 run_dir: Some(&run_dir),
+                receipt_key: Some(receipt_key.as_bytes()),
             };
             match command {
                 EnforcementCmd::Plan(_) => {
@@ -1041,7 +1054,17 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
                     )
                 }
                 EnforcementCmd::RecordGate(record) => {
-                    enforcement::record_gate(request, &run_dir, &record.gate_id, record.exit_code)?;
+                    enforcement::record_gate(
+                        request,
+                        &run_dir,
+                        &record.gate_id,
+                        record.exit_code,
+                        &enforcement::GateExecutionContext {
+                            contract_digest: record.contract_digest.clone(),
+                            workspace_fingerprint: record.workspace_fingerprint.clone(),
+                            gate_definition_digest: record.gate_definition_digest.clone(),
+                        },
+                    )?;
                     let report = serde_json::json!({
                         "kind": "nopal.enforcement.record_gate/v1",
                         "ok": true,
@@ -1727,17 +1750,25 @@ fn dispatch_launch(
     if let Some(source) = &created_source {
         eprintln!("{}", scaffold_notice(source));
     }
-    let enforcement_extension_pinned = plan.pi_argv.windows(2).any(|pair| {
-        (pair[0] == "-e" || pair[0] == "--extension")
-            && pair[1]
-                .replace('\\', "/")
-                .ends_with("/extensions/policy-gate/index.ts")
-    });
-    if !enforcement_extension_pinned {
+    if plan.ambient_kinds.contains(&"extensions") {
         return Err(std::io::Error::other(
-            "enforcement initialization failed: the pinned bundle does not contain extensions/policy-gate/index.ts",
+            "enforcement initialization failed: ambient Pi extensions are not part of the trusted executable bundle",
         ));
     }
+    if cli.pi_args.iter().any(|argument| {
+        argument == "-e" || argument == "--extension" || argument.starts_with("--extension=")
+    }) {
+        return Err(std::io::Error::other(
+            "enforcement initialization failed: Pi extensions must be declared in the byte-verified Nopal bundle",
+        ));
+    }
+    let enforcement_extension = verify_trusted_extensions(&plan.pi_argv)?;
+    let enforcement_adapter_dir = enforcement_extension.parent().ok_or_else(|| {
+        std::io::Error::other(
+            "enforcement initialization failed: adapter path has no parent directory",
+        )
+    })?;
+    let enforcement_cli = std::env::current_exe()?.canonicalize()?;
 
     let config_dir = resolve_config_dir();
     let enforcement_plan = enforcement::plan(enforcement::EnforcementRequest {
@@ -1747,6 +1778,7 @@ fn dispatch_launch(
         action: "git.push",
         classes: &[policy::ActionClass::GitRemote],
         run_dir: None,
+        receipt_key: None,
     })?;
     if !enforcement_plan.ok {
         return print_report_and_exit(
@@ -1787,9 +1819,100 @@ fn dispatch_launch(
     // absolutized (`bundle::bundle_report` absolutizes `root` before
     // resolving them), so this split is safe - nothing in pi's argv depends
     // on `cli.dir`.
+    enforcement::initialize_receipt_capability(&run.run_dir)?;
     let mut pi_argv = plan.pi_argv;
     pi_argv.extend(cli.pi_args.iter().cloned());
-    exec_pi(&cli.dir, &pi_argv, &run.run_id)
+    exec_pi(
+        &cli.dir,
+        &pi_argv,
+        &EnforcementLaunchEnv {
+            run_id: &run.run_id,
+            root,
+            state_dir: &ledger_env.state_dir,
+            config_dir: config_dir.as_deref(),
+            adapter_dir: enforcement_adapter_dir,
+            cli: &enforcement_cli,
+        },
+    )
+}
+
+fn verify_trusted_extensions(pi_argv: &[String]) -> std::io::Result<PathBuf> {
+    let mut enforcement_extension = None;
+    for pair in pi_argv
+        .windows(2)
+        .filter(|pair| pair[0] == "-e" || pair[0] == "--extension")
+    {
+        let path = PathBuf::from(&pair[1]);
+        let normalized = pair[1].replace('\\', "/");
+        if normalized.ends_with("/extensions/policy-gate/index.ts") {
+            if enforcement_extension.is_some() {
+                return Err(std::io::Error::other(
+                    "enforcement initialization failed: the trusted adapter is pinned more than once",
+                ));
+            }
+            verify_enforcement_adapter(&path)?;
+            enforcement_extension = Some(path);
+        } else if normalized.ends_with("/tests/fixtures/deterministic-enforcement-provider.mjs") {
+            verify_exact_source(
+                &path,
+                include_bytes!("../tests/fixtures/deterministic-enforcement-provider.mjs"),
+                "deterministic enforcement proof provider",
+            )?;
+        } else {
+            return Err(std::io::Error::other(format!(
+                "enforcement initialization failed: untrusted executable Pi extension {}",
+                path.display()
+            )));
+        }
+    }
+    enforcement_extension.ok_or_else(|| {
+        std::io::Error::other(
+            "enforcement initialization failed: the pinned bundle does not contain extensions/policy-gate/index.ts",
+        )
+    })
+}
+
+fn verify_exact_source(path: &Path, expected: &[u8], label: &str) -> std::io::Result<()> {
+    let actual = std::fs::read(path).map_err(|error| {
+        std::io::Error::other(format!(
+            "enforcement initialization failed: could not read trusted {label} file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if actual != expected {
+        return Err(std::io::Error::other(format!(
+            "enforcement initialization failed: {label} identity mismatch for {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_enforcement_adapter(index_path: &Path) -> std::io::Result<()> {
+    const SOURCES: [(&str, &[u8]); 3] = [
+        (
+            "index.ts",
+            include_bytes!("../../../extensions/policy-gate/index.ts"),
+        ),
+        (
+            "classifier.ts",
+            include_bytes!("../../../extensions/policy-gate/classifier.ts"),
+        ),
+        (
+            "nopal-cli.ts",
+            include_bytes!("../../../extensions/policy-gate/nopal-cli.ts"),
+        ),
+    ];
+    let adapter_dir = index_path.parent().ok_or_else(|| {
+        std::io::Error::other(
+            "enforcement initialization failed: adapter path has no parent directory",
+        )
+    })?;
+    for (name, expected) in SOURCES {
+        let path = adapter_dir.join(name);
+        verify_exact_source(&path, expected, "adapter")?;
+    }
+    Ok(())
 }
 
 fn warn_for_interactive_rondo(root: &Path) {
@@ -1809,22 +1932,39 @@ fn scaffold_notice(source: &scaffold::ScaffoldSource) -> String {
     )
 }
 
+struct EnforcementLaunchEnv<'a> {
+    run_id: &'a str,
+    root: &'a std::path::Path,
+    state_dir: &'a std::path::Path,
+    config_dir: Option<&'a std::path::Path>,
+    adapter_dir: &'a std::path::Path,
+    cli: &'a std::path::Path,
+}
+
 #[cfg(unix)]
 fn exec_pi(
     dir: &std::path::Path,
     argv: &[String],
-    enforcement_run_id: &str,
+    enforcement: &EnforcementLaunchEnv<'_>,
 ) -> std::io::Result<ExitCode> {
     use std::os::unix::process::CommandExt;
     let pi_bin = std::env::var("NOPAL_PI_BIN").unwrap_or_else(|_| "pi".to_owned());
-    let err = std::process::Command::new(&pi_bin)
+    let mut command = std::process::Command::new(&pi_bin);
+    command
         .args(argv)
         .current_dir(dir)
         // Pi's own update-check network call and banner are noise nopal
         // already owns readiness reporting for; skip it every launch.
         .env("PI_SKIP_VERSION_CHECK", "1")
-        .env("NOPAL_ENFORCEMENT_RUN_ID", enforcement_run_id)
-        .exec();
+        .env("NOPAL_ENFORCEMENT_RUN_ID", enforcement.run_id)
+        .env("NOPAL_ENFORCEMENT_ROOT", enforcement.root)
+        .env("NOPAL_ENFORCEMENT_STATE_DIR", enforcement.state_dir)
+        .env("NOPAL_ENFORCEMENT_ADAPTER_DIR", enforcement.adapter_dir)
+        .env("NOPAL_ENFORCEMENT_CLI", enforcement.cli);
+    if let Some(config_dir) = enforcement.config_dir {
+        command.env("NOPAL_ENFORCEMENT_CONFIG_DIR", config_dir);
+    }
+    let err = command.exec();
     // `exec` only returns on failure; success replaces this process image.
     Err(std::io::Error::new(
         err.kind(),
@@ -1836,7 +1976,7 @@ fn exec_pi(
 fn exec_pi(
     _dir: &std::path::Path,
     _argv: &[String],
-    _enforcement_run_id: &str,
+    _enforcement: &EnforcementLaunchEnv<'_>,
 ) -> std::io::Result<ExitCode> {
     Err(std::io::Error::other(
         "nopal cli requires a unix platform; there is no non-unix spawn fallback (D7)",

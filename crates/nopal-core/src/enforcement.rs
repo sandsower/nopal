@@ -5,7 +5,8 @@
 //! of executing them.
 
 use std::fs;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -25,6 +26,7 @@ const WORKFLOW_PATH: &str = ".beislid/workflow.md";
 const REPOSITORY_POLICY_PATH: &str = ".nopal/policy.jsonc";
 const REPOSITORY_GATES_PATH: &str = ".nopal/gates.jsonc";
 const USER_POLICY_FILE: &str = "policy.jsonc";
+const RECEIPT_CAPABILITY_PATH: &str = "artifacts/enforcement/receipt-capability";
 
 pub struct EnforcementRequest<'a> {
     pub root: &'a Path,
@@ -35,6 +37,10 @@ pub struct EnforcementRequest<'a> {
     /// Active Workflow Run Ledger directory. Without one every selected gate
     /// is conservatively reported as pending.
     pub run_dir: Option<&'a Path>,
+    /// Ephemeral run capability used to authenticate receipts. The CLI loads
+    /// it from protected run state; it is never serialized into evidence,
+    /// contracts, subprocess arguments, or the project tree.
+    pub receipt_key: Option<&'a [u8]>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +54,14 @@ pub struct DecisionSource {
 pub struct ReceiptStatus {
     pub gate_id: String,
     pub current: bool,
+    pub gate_definition_digest: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GateExecutionContext {
+    pub contract_digest: String,
+    pub workspace_fingerprint: String,
+    pub gate_definition_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -127,8 +141,18 @@ pub fn plan(request: EnforcementRequest<'_>) -> io::Result<EnforcementPlan> {
         .map(|gate| ReceiptStatus {
             gate_id: gate.id.clone(),
             current: request.run_dir.is_some_and(|run_dir| {
-                receipt_is_current(run_dir, gate, &contract_digest, &workspace_fingerprint)
+                request.receipt_key.is_some_and(|receipt_key| {
+                    receipt_is_current(
+                        run_dir,
+                        request.action,
+                        gate,
+                        &contract_digest,
+                        &workspace_fingerprint,
+                        receipt_key,
+                    )
+                })
             }),
+            gate_definition_digest: gate_digest(gate),
         })
         .collect();
     let required_gates = selected_gates
@@ -171,7 +195,17 @@ pub fn record_gate(
     run_dir: &Path,
     gate_id: &str,
     exit_code: i32,
+    expected: &GateExecutionContext,
 ) -> io::Result<()> {
+    let receipt_key = request.receipt_key.ok_or_else(|| {
+        io::Error::other("recording a gate requires the active adapter receipt capability")
+    })?;
+    if receipt_key.len() < 32 {
+        return Err(io::Error::other(
+            "the adapter receipt capability must contain at least 256 bits",
+        ));
+    }
+
     let mut validation_request = request;
     validation_request.run_dir = None;
     let plan = plan(validation_request)?;
@@ -188,6 +222,24 @@ pub fn record_gate(
             io::Error::other(format!("gate {gate_id:?} is not required for this action"))
         })?;
     let definition_digest = gate_digest(gate);
+    if plan.contract_digest != expected.contract_digest
+        || plan.workspace_fingerprint != expected.workspace_fingerprint
+        || definition_digest != expected.gate_definition_digest
+    {
+        return Err(io::Error::other(
+            "the enforcement contract, workspace, or gate definition changed during execution",
+        ));
+    }
+
+    let signature = receipt_signature(
+        receipt_key,
+        &plan.action,
+        &plan.contract_digest,
+        &plan.workspace_fingerprint,
+        gate_id,
+        &definition_digest,
+        exit_code,
+    );
     let payload = ledger_json::json!({
         "action": plan.action,
         "contract_digest": plan.contract_digest,
@@ -195,6 +247,7 @@ pub fn record_gate(
         "gate_id": gate_id,
         "gate_definition_digest": definition_digest,
         "workspace_fingerprint": plan.workspace_fingerprint,
+        "signature": signature,
     });
     crate::run_ledger_store::append_event(run_dir, "gate_attempt", &payload, None)
         .map_err(store_error)?;
@@ -436,11 +489,27 @@ fn contract_digest(root: &Path, config_dir: Option<&Path>) -> io::Result<String>
 /// Fingerprint the revision and every pending Git-visible content change.
 /// Ignored build artifacts stay outside the proof surface, while untracked
 /// source files are hashed by path and content instead of status alone.
+/// Git-visible symlinks may point within the repository, where their targets
+/// are already covered, but external targets fail closed because Git cannot
+/// provide stable evidence for their changing content.
 pub fn workspace_fingerprint(root: &Path) -> io::Result<String> {
     let head = git_output(root, &["rev-parse", "HEAD"]);
     let diff = git_output(root, &["diff", "--binary", "HEAD", "--"]);
     let untracked = git_output_bytes(root, &["ls-files", "--others", "--exclude-standard", "-z"]);
-    if let (Some(head), Some(diff), Some(untracked)) = (head, diff, untracked) {
+    let visible = git_output_bytes(
+        root,
+        &[
+            "ls-files",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "-z",
+        ],
+    );
+    if let (Some(head), Some(diff), Some(untracked), Some(visible)) =
+        (head, diff, untracked, visible)
+    {
+        reject_external_symlinks(root, &visible)?;
         let mut hasher = Sha256::new();
         hasher.update(head);
         hasher.update(diff);
@@ -450,8 +519,13 @@ pub fn workspace_fingerprint(root: &Path) -> io::Result<String> {
         {
             hasher.update(path_bytes);
             let path = String::from_utf8_lossy(path_bytes);
-            match fs::read(root.join(path.as_ref())) {
-                Ok(bytes) => hasher.update(bytes),
+            let full_path = root.join(path.as_ref());
+            match fs::symlink_metadata(&full_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    hasher.update(b"<symlink>");
+                    hasher.update(fs::read_link(full_path)?.to_string_lossy().as_bytes());
+                }
+                Ok(_) => hasher.update(fs::read(full_path)?),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     hasher.update(b"<missing>")
                 }
@@ -466,15 +540,63 @@ pub fn workspace_fingerprint(root: &Path) -> io::Result<String> {
     collect_files(root, root, &mut files)?;
     files.sort();
     let mut hasher = Sha256::new();
+    let visible = files
+        .iter()
+        .filter_map(|path| path.strip_prefix(root).ok())
+        .flat_map(|path| {
+            let mut bytes = path.to_string_lossy().as_bytes().to_vec();
+            bytes.push(0);
+            bytes
+        })
+        .collect::<Vec<_>>();
+    reject_external_symlinks(root, &visible)?;
     for path in files {
         let relative = path.strip_prefix(root).unwrap_or(&path);
         if relative.starts_with(".nopal") || relative.starts_with(".beislid") {
             continue;
         }
         hasher.update(relative.to_string_lossy().as_bytes());
-        hasher.update(fs::read(path)?);
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            hasher.update(b"<symlink>");
+            hasher.update(fs::read_link(path)?.to_string_lossy().as_bytes());
+        } else {
+            hasher.update(fs::read(path)?);
+        }
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn reject_external_symlinks(root: &Path, nul_paths: &[u8]) -> io::Result<()> {
+    let canonical_root = fs::canonicalize(root)?;
+    for path_bytes in nul_paths
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let relative = String::from_utf8_lossy(path_bytes);
+        let path = root.join(relative.as_ref());
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+        let target = fs::canonicalize(&path).map_err(|error| {
+            io::Error::other(format!(
+                "workspace symlink {} cannot provide stable gate evidence: {error}",
+                path.display()
+            ))
+        })?;
+        if target != canonical_root && !target.starts_with(&canonical_root) {
+            return Err(io::Error::other(format!(
+                "workspace symlink {} escapes the repository proof surface",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -495,6 +617,11 @@ fn collect_files(root: &Path, current: &Path, files: &mut Vec<PathBuf>) -> io::R
         let entry = entry?;
         let path = entry.path();
         let relative = path.strip_prefix(root).unwrap_or(&path);
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            files.push(path);
+            continue;
+        }
         if path.is_dir() {
             if matches!(
                 relative
@@ -533,17 +660,30 @@ fn receipt_path(run_dir: &Path, gate_id: &str) -> PathBuf {
 
 fn receipt_is_current(
     run_dir: &Path,
+    action: &str,
     gate: &SelectedGate,
     contract_digest: &str,
     workspace_fingerprint: &str,
+    receipt_key: &[u8],
 ) -> bool {
     let Ok(receipt) = crate::run_ledger_store::read_json(&receipt_path(run_dir, &gate.id)) else {
         return false;
     };
-    receipt
-        .get("exit_code")
-        .and_then(ledger_json::Value::as_i64)
-        == Some(0)
+    let definition_digest = gate_digest(gate);
+    let expected_signature = receipt_signature(
+        receipt_key,
+        action,
+        contract_digest,
+        workspace_fingerprint,
+        &gate.id,
+        &definition_digest,
+        0,
+    );
+    receipt.get("action").and_then(ledger_json::Value::as_str) == Some(action)
+        && receipt
+            .get("exit_code")
+            .and_then(ledger_json::Value::as_i64)
+            == Some(0)
         && receipt
             .get("contract_digest")
             .and_then(ledger_json::Value::as_str)
@@ -555,7 +695,110 @@ fn receipt_is_current(
         && receipt
             .get("gate_definition_digest")
             .and_then(ledger_json::Value::as_str)
-            == Some(gate_digest(gate).as_str())
+            == Some(definition_digest.as_str())
+        && receipt
+            .get("signature")
+            .and_then(ledger_json::Value::as_str)
+            .is_some_and(|actual| {
+                constant_time_eq(actual.as_bytes(), expected_signature.as_bytes())
+            })
+}
+
+fn receipt_signature(
+    key: &[u8],
+    action: &str,
+    contract_digest: &str,
+    workspace_fingerprint: &str,
+    gate_id: &str,
+    gate_definition_digest: &str,
+    exit_code: i32,
+) -> String {
+    let mut normalized_key = [0_u8; 64];
+    if key.len() > normalized_key.len() {
+        normalized_key[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized_key[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for index in 0..normalized_key.len() {
+        inner_pad[index] ^= normalized_key[index];
+        outer_pad[index] ^= normalized_key[index];
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    for component in [
+        action,
+        contract_digest,
+        workspace_fingerprint,
+        gate_id,
+        gate_definition_digest,
+    ] {
+        inner.update((component.len() as u64).to_be_bytes());
+        inner.update(component.as_bytes());
+    }
+    inner.update(exit_code.to_be_bytes());
+    let inner_digest = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    format!("{:x}", outer.finalize())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+pub fn initialize_receipt_capability(run_dir: &Path) -> io::Result<()> {
+    let path = run_dir.join(RECEIPT_CAPABILITY_PATH);
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("receipt capability path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path)?;
+    file.write_all(generate_receipt_key()?.as_bytes())?;
+    file.sync_all()?;
+    if let Ok(directory) = fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
+}
+
+pub fn load_receipt_capability(run_dir: &Path) -> io::Result<String> {
+    let capability = fs::read_to_string(run_dir.join(RECEIPT_CAPABILITY_PATH))?;
+    if capability.len() != 64 || !capability.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(io::Error::other(
+            "enforcement receipt capability is malformed",
+        ));
+    }
+    Ok(capability)
+}
+
+pub fn generate_receipt_key() -> io::Result<String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| {
+        io::Error::other(format!(
+            "could not initialize enforcement receipt capability: {error}"
+        ))
+    })?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
