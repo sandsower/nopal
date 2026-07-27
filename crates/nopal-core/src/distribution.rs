@@ -184,7 +184,7 @@ pub fn build_lock_from_local_sources(
                 ));
                 continue;
             }
-            SourceSpec::Workspace { root, .. } => {
+            SourceSpec::Workspace { package, root } => {
                 let relative = match safe_relative_path(root) {
                     Ok(path) => path,
                     Err(message) => {
@@ -197,7 +197,27 @@ pub fn build_lock_from_local_sources(
                         continue;
                     }
                 };
-                (project_root.join(relative), request.requirement.clone())
+                let package_root = project_root.join(relative);
+                let resolved = match workspace_version(&package_root, package, request) {
+                    Ok(version) => version,
+                    Err(diagnostic) => {
+                        diagnostics.push(diagnostic);
+                        continue;
+                    }
+                };
+                if !requirement_accepts_exact(&request.requirement, &resolved) {
+                    diagnostics.push(package_error(
+                        Code::DistributionPackageInvalid,
+                        request,
+                        "resolution",
+                        format!(
+                            "workspace manifest version {resolved:?} does not satisfy exact requirement {:?}",
+                            request.requirement
+                        ),
+                    ));
+                    continue;
+                }
+                (package_root, resolved)
             }
             SourceSpec::Npm { .. } => {
                 diagnostics.push(package_error(
@@ -461,6 +481,7 @@ pub fn inspect_texts(
         resolved_resources.extend(package_resources);
     }
 
+    let inherit_ambient = parse_ambient(&bundle.inherit_ambient, &mut diagnostics);
     diagnostics::sort(&mut diagnostics);
     let ok = diagnostics
         .iter()
@@ -472,7 +493,7 @@ pub fn inspect_texts(
     Ok(DistributionReport {
         kind: "nopal.distribution/v1",
         ok,
-        inherit_ambient: parse_ambient(&bundle.inherit_ambient, &mut diagnostics),
+        inherit_ambient,
         packages: resolved_packages,
         resources: resolved_resources,
         diagnostics,
@@ -666,6 +687,14 @@ fn validate_bundle(bundle: &BundleDocument, path: &str, diagnostics: &mut Vec<Di
                 format!("duplicate distribution package id {:?}", request.id),
             ));
         }
+        if request.source.package().trim().is_empty() {
+            diagnostics.push(package_error(
+                Code::DistributionPackageInvalid,
+                request,
+                "contract",
+                "package source identity must not be empty",
+            ));
+        }
         if request.requirement.trim().is_empty() {
             diagnostics.push(package_error(
                 Code::DistributionPackageInvalid,
@@ -674,7 +703,58 @@ fn validate_bundle(bundle: &BundleDocument, path: &str, diagnostics: &mut Vec<Di
                 "requirement must not be empty",
             ));
         }
+        match &request.source {
+            SourceSpec::Workspace { root, .. } => {
+                if let Err(message) = safe_relative_path(root) {
+                    diagnostics.push(package_error(
+                        Code::DistributionPackageInvalid,
+                        request,
+                        "contract",
+                        message,
+                    ));
+                }
+            }
+            SourceSpec::Npm { registry, .. }
+                if !registry.starts_with("https://")
+                    || registry.contains('@')
+                    || registry.contains('?')
+                    || registry.contains('#') =>
+            {
+                diagnostics.push(package_error(
+                    Code::DistributionPackageInvalid,
+                    request,
+                    "contract",
+                    "npm registry must be a credential-free HTTPS origin without query or fragment",
+                ));
+            }
+            _ => {}
+        }
+        let mut resources = BTreeSet::new();
         for resource in &request.resources {
+            if !resources.insert((resource.kind, resource.path.as_str())) {
+                diagnostics.push(package_error(
+                    Code::DistributionPackageInvalid,
+                    request,
+                    "resource_export",
+                    format!(
+                        "duplicate {:?} resource path {:?}",
+                        resource.kind, resource.path
+                    ),
+                ));
+            }
+            if resource.kind == ResourceKind::Extension
+                && !matches!(
+                    &request.source,
+                    SourceSpec::Builtin { package } if package == "nopal"
+                )
+            {
+                diagnostics.push(package_error(
+                    Code::DistributionSourceUnsupported,
+                    request,
+                    "launch_adapter",
+                    "third-party executable Pi extensions are not supported by the enforced v0.3 profile",
+                ));
+            }
             if let Err(message) = safe_relative_path(&resource.path) {
                 diagnostics.push(package_error(
                     Code::DistributionPackageInvalid,
@@ -747,6 +827,56 @@ fn contract_digest(bundle: &BundleDocument) -> String {
 
 fn requirement_accepts_exact(requirement: &str, version: &str) -> bool {
     requirement.trim() == version || requirement.trim() == format!("={version}")
+}
+
+fn workspace_version(
+    root: &Path,
+    expected_name: &str,
+    request: &PackageRequest,
+) -> Result<String, Diagnostic> {
+    #[derive(Deserialize)]
+    struct Manifest {
+        name: String,
+        version: String,
+    }
+
+    let path = root.join("package.json");
+    let text = fs::read_to_string(&path).map_err(|error| {
+        package_error(
+            Code::DistributionPackageMissing,
+            request,
+            "workspace_manifest",
+            format!("cannot read {}: {error}", path.display()),
+        )
+    })?;
+    let manifest: Manifest = serde_json::from_str(&text).map_err(|error| {
+        package_error(
+            Code::DistributionPackageInvalid,
+            request,
+            "workspace_manifest",
+            format!("invalid {}: {error}", path.display()),
+        )
+    })?;
+    if manifest.name != expected_name {
+        return Err(package_error(
+            Code::DistributionPackageInvalid,
+            request,
+            "workspace_manifest",
+            format!(
+                "manifest package name {:?} does not match source identity {expected_name:?}",
+                manifest.name
+            ),
+        ));
+    }
+    if manifest.version.trim().is_empty() {
+        return Err(package_error(
+            Code::DistributionPackageInvalid,
+            request,
+            "workspace_manifest",
+            "manifest version must not be empty",
+        ));
+    }
+    Ok(manifest.version)
 }
 
 fn safe_relative_path(value: &str) -> Result<PathBuf, String> {

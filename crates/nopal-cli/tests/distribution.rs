@@ -78,3 +78,95 @@ fn fresh_bare_launch_writes_complete_baseline_and_executes_pi_offline() {
     assert!(args.lines().any(|arg| arg == "--no-session"), "{args}");
     assert_eq!(fs::read_to_string(env_file).unwrap().trim(), "1");
 }
+
+#[test]
+fn workspace_update_previews_then_writes_exact_lock_and_sync_never_rewrites_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let package = repo.join("packages/guidance");
+    fs::create_dir_all(repo.join(".nopal")).unwrap();
+    fs::create_dir_all(package.join("skills/review")).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(
+        repo.join(".nopal/nopal.jsonc"),
+        r#"{ "version": "nopal.project/v1", "profile": "minimal" }"#,
+    )
+    .unwrap();
+    fs::write(
+        package.join("package.json"),
+        r#"{ "name": "@team/guidance", "version": "2.3.4" }"#,
+    )
+    .unwrap();
+    fs::write(package.join("skills/review/SKILL.md"), "# Review\n").unwrap();
+    fs::write(
+        repo.join(".nopal/bundle.jsonc"),
+        format!(
+            r#"{{
+  "version": "nopal.bundle/v2",
+  "packages": [
+    {{
+      "id": "nopal",
+      "source": {{ "type": "builtin", "package": "nopal" }},
+      "requirement": "={}",
+      "resources": [{{ "kind": "extension", "path": "index.ts" }}]
+    }},
+    {{
+      "id": "guidance",
+      "source": {{ "type": "workspace", "package": "@team/guidance", "root": "packages/guidance" }},
+      "requirement": "=2.3.4",
+      "resources": [{{ "kind": "skill", "path": "skills/review" }}]
+    }}
+  ]
+}}"#,
+            env!("CARGO_PKG_VERSION")
+        ),
+    )
+    .unwrap();
+
+    let command = |extra: &[&str]| {
+        let mut args = vec!["--dir", repo.to_str().unwrap(), "--json"];
+        args.extend_from_slice(extra);
+        Command::new(env!("CARGO_BIN_EXE_nopal"))
+            .args(args)
+            .env("NOPAL_DATA_DIR", temp.path().join("data"))
+            .output()
+            .unwrap()
+    };
+
+    let preview = command(&["update"]);
+    assert_eq!(preview.status.code(), Some(0), "{preview:?}");
+    let preview_doc: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview_doc["wrote"], false);
+    assert!(!repo.join(".nopal/nopal.lock").exists());
+
+    let update = command(&["update", "--write"]);
+    assert_eq!(update.status.code(), Some(0), "{update:?}");
+    let update_doc: serde_json::Value = serde_json::from_slice(&update.stdout).unwrap();
+    assert_eq!(update_doc["wrote"], true);
+    assert_eq!(update_doc["packages"][0]["id"], "guidance");
+    assert_eq!(update_doc["packages"][0]["resolved"], "2.3.4");
+    let original_lock = fs::read(repo.join(".nopal/nopal.lock")).unwrap();
+
+    let sync = command(&["sync"]);
+    assert_eq!(sync.status.code(), Some(0), "{sync:?}");
+    assert_eq!(
+        fs::read(repo.join(".nopal/nopal.lock")).unwrap(),
+        original_lock
+    );
+
+    fs::write(package.join("skills/review/SKILL.md"), "tampered\n").unwrap();
+    let invalid = command(&["sync"]);
+    assert_eq!(invalid.status.code(), Some(1), "{invalid:?}");
+    let invalid_doc: serde_json::Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert!(
+        invalid_doc["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "distribution_integrity_mismatch")
+    );
+    assert_eq!(
+        fs::read(repo.join(".nopal/nopal.lock")).unwrap(),
+        original_lock
+    );
+}

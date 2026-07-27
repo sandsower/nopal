@@ -33,6 +33,7 @@ use nopal_core::scaffold;
 use nopal_core::{gates::GateStage, policy};
 
 mod coordinator;
+mod distribution_adapter;
 mod herdr_bridge;
 mod info;
 mod launch;
@@ -78,6 +79,14 @@ enum Cmd {
     /// Deprecated internal spelling for the canonical bare launch
     #[command(hide = true)]
     Cli(CliLaunchArgs),
+    /// Materialize and verify the exact checked-in distribution lock
+    Sync,
+    /// Resolve the distribution contract into an exact lock proposal
+    Update {
+        /// Atomically replace .nopal/nopal.lock with the proposal
+        #[arg(long)]
+        write: bool,
+    },
     /// Validate the nopal.project/v1 manifest and profile-required modules
     Validate,
     /// Inspect nopal.gates/v1 preflights
@@ -786,6 +795,8 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
         Some(Cmd::Cli(args)) => {
             dispatch_launch(cli, &root, args.dry_run, args.with_ambient, args.verbose)
         }
+        Some(Cmd::Sync) => run_distribution_sync(cli, &root),
+        Some(Cmd::Update { write }) => run_distribution_update(cli, &root, *write),
         Some(Cmd::Validate) => {
             let report = nopal_core::status::validation_report(&root)?;
             print_report_and_exit(
@@ -1710,10 +1721,10 @@ fn resolve_builtin_adapter_root() -> std::io::Result<PathBuf> {
         candidates.push(root.clone());
         candidates.push(root.join("extensions/policy-gate"));
     }
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(parent) = executable.parent() {
-            candidates.push(parent.join("extensions/policy-gate"));
-        }
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(parent) = executable.parent()
+    {
+        candidates.push(parent.join("extensions/policy-gate"));
     }
     candidates.push(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1729,6 +1740,43 @@ fn resolve_builtin_adapter_root() -> std::io::Result<PathBuf> {
         std::io::ErrorKind::NotFound,
         "cannot locate the built-in Nopal enforcement adapter package",
     ))
+}
+
+fn run_distribution_update(cli: &Cli, root: &Path, write: bool) -> std::io::Result<ExitCode> {
+    let builtin_root = resolve_builtin_adapter_root()?;
+    let report = distribution_adapter::update(
+        root,
+        nopal_core::distribution::BuiltinDistribution {
+            version: env!("CARGO_PKG_VERSION"),
+            root: &builtin_root,
+        },
+        write,
+    )?;
+    print_report_and_exit(
+        report.ok,
+        cli.json,
+        || serde_json::to_string_pretty(&report),
+        || distribution_adapter::human_update(&report),
+    )
+}
+
+fn run_distribution_sync(cli: &Cli, root: &Path) -> std::io::Result<ExitCode> {
+    let builtin_root = resolve_builtin_adapter_root()?;
+    let store_root = resolve_data_dir()?.join("packages");
+    let report = distribution_adapter::sync(nopal_core::distribution::DistributionContext {
+        project_root: root,
+        store_root: &store_root,
+        builtin: nopal_core::distribution::BuiltinDistribution {
+            version: env!("CARGO_PKG_VERSION"),
+            root: &builtin_root,
+        },
+    })?;
+    print_report_and_exit(
+        report.ok,
+        cli.json,
+        || serde_json::to_string_pretty(&report),
+        || distribution_adapter::human_sync(&report),
+    )
 }
 
 /// Runs the cold `nopal.launch/v1` gates for `nopal cli`. On `--dry-run` or
