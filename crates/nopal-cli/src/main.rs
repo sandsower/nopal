@@ -1665,21 +1665,70 @@ fn run_ask_cmd(
 /// `tests/coordinator.rs`, which sets `NOPAL_CONFIG_DIR` on every spawned
 /// `nopal` subprocess for exactly this reason.
 fn resolve_config_dir() -> Option<PathBuf> {
-    // Empty env values are treated as unset (XDG convention). Without the
-    // filter, `NOPAL_CONFIG_DIR=` would make the template path the bare
-    // relative `bundle-default.jsonc`, resolved against the process cwd -
-    // letting a repo-local file of that name in whatever directory nopal
-    // runs from silently become the user's standing template.
     if let Some(dir) = std::env::var("NOPAL_CONFIG_DIR")
         .ok()
-        .filter(|v| !v.is_empty())
+        .filter(|value| !value.is_empty())
     {
         return Some(PathBuf::from(dir));
     }
     std::env::var("HOME")
         .ok()
-        .filter(|v| !v.is_empty())
+        .filter(|value| !value.is_empty())
         .map(|home| Path::new(&home).join(".config").join("nopal"))
+}
+
+fn resolve_data_dir() -> std::io::Result<PathBuf> {
+    if let Some(dir) = std::env::var("NOPAL_DATA_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(dir) = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Path::new(&dir).join("nopal"));
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|home| Path::new(&home).join(".local/share/nopal"))
+        .ok_or_else(|| {
+            std::io::Error::other("cannot resolve Nopal data directory; set NOPAL_DATA_DIR or HOME")
+        })
+}
+
+/// Resolve the built-in adapter package from an explicit distribution root,
+/// the packaged executable layout, or the source checkout used for local
+/// builds. Every candidate is still byte-verified before Pi launch, so this
+/// locator cannot turn an environment path into executable authority.
+fn resolve_builtin_adapter_root() -> std::io::Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(root) = std::env::var_os("NOPAL_DISTRIBUTION_ROOT") {
+        let root = PathBuf::from(root);
+        candidates.push(root.clone());
+        candidates.push(root.join("extensions/policy-gate"));
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            candidates.push(parent.join("extensions/policy-gate"));
+        }
+    }
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("extensions/policy-gate"),
+    );
+    for candidate in candidates {
+        if candidate.join("index.ts").is_file() {
+            return candidate.canonicalize();
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "cannot locate the built-in Nopal enforcement adapter package",
+    ))
 }
 
 /// Runs the cold `nopal.launch/v1` gates for `nopal cli`. On `--dry-run` or
@@ -1711,8 +1760,22 @@ fn dispatch_launch(
     with_ambient: bool,
     verbose: bool,
 ) -> std::io::Result<ExitCode> {
-    let config_dir = resolve_config_dir();
-    let plan = launch::plan(root, with_ambient, config_dir.as_deref())?;
+    if with_ambient {
+        return Err(std::io::Error::other(
+            "ambient Pi resources may only be enabled by the checked-in distribution contract; --with-ambient is not an authority source",
+        ));
+    }
+    let store_root = resolve_data_dir()?.join("packages");
+    let builtin_root = resolve_builtin_adapter_root()?;
+    let builtin = nopal_core::distribution::BuiltinDistribution {
+        version: env!("CARGO_PKG_VERSION"),
+        root: &builtin_root,
+    };
+    let context = launch::LaunchContext {
+        store_root: &store_root,
+        builtin,
+    };
+    let plan = launch::plan(root, context)?;
     if dry_run || !plan.ok {
         return print_report_and_exit(
             plan.ok,
@@ -1722,17 +1785,14 @@ fn dispatch_launch(
         );
     }
 
-    let mut created_source = None;
+    let mut created_paths = None;
     let plan = if plan.scaffold == launch::Scaffold::WouldCreate {
-        let scaffolded = scaffold::write_defaults(root, config_dir.as_deref())?;
-        let rescaffolded = launch::plan(root, with_ambient, config_dir.as_deref())?;
-        if !rescaffolded.ok {
-            // Even a failing re-plan must record that this launch just wrote
-            // two files into the repo: mark the report and print the
-            // created-notice, or the one path that scaffolded and then
-            // failed would be the one path with no visible record of it.
-            eprintln!("{}", scaffold_notice(&scaffolded.source));
-            let marked = launch::mark_scaffolded(rescaffolded, &scaffolded.source);
+        let baseline = scaffold::build_baseline(root, builtin)?;
+        let scaffolded = scaffold::write_baseline(root, builtin)?;
+        let rescaffolded = launch::plan(root, context)?;
+        let marked = launch::mark_scaffolded(rescaffolded, &baseline);
+        eprintln!("{}", scaffold_notice(&scaffolded));
+        if !marked.ok {
             return print_report_and_exit(
                 false,
                 cli.json,
@@ -1740,26 +1800,28 @@ fn dispatch_launch(
                 || launch::launch_toon(&marked),
             );
         }
-        let marked = launch::mark_scaffolded(rescaffolded, &scaffolded.source);
-        created_source = Some(scaffolded.source);
+        created_paths = Some(scaffolded.rel_paths);
         marked
     } else {
         plan
     };
 
-    if let Some(source) = &created_source {
-        eprintln!("{}", scaffold_notice(source));
-    }
     if plan.ambient_kinds.contains(&"extensions") {
         return Err(std::io::Error::other(
             "enforcement initialization failed: ambient Pi extensions are not part of the trusted executable bundle",
         ));
     }
     if cli.pi_args.iter().any(|argument| {
-        argument == "-e" || argument == "--extension" || argument.starts_with("--extension=")
+        matches!(
+            argument.as_str(),
+            "-e" | "--extension" | "--skill" | "--prompt-template" | "--theme"
+        ) || argument.starts_with("--extension=")
+            || argument.starts_with("--skill=")
+            || argument.starts_with("--prompt-template=")
+            || argument.starts_with("--theme=")
     }) {
         return Err(std::io::Error::other(
-            "enforcement initialization failed: Pi extensions must be declared in the byte-verified Nopal bundle",
+            "enforcement initialization failed: Pi resources must come from the checked-in Nopal distribution contract",
         ));
     }
     let enforcement_extension = verify_trusted_extensions(&plan.pi_argv)?;
@@ -1808,17 +1870,16 @@ fn dispatch_launch(
         ))
     })?;
 
+    if let Some(paths) = created_paths {
+        eprintln!(
+            "nopal: check in generated project baseline: {}",
+            paths.join(", ")
+        );
+    }
     eprintln!("{}", launch::resource_surface_line(&plan));
     if verbose {
         eprintln!("{}", launch::summary_line(&plan));
     }
-    // exec_pi's cwd is the ORIGINAL invocation dir (`cli.dir`, as given),
-    // not the discovered `root`: config/gates/bundle
-    // resolve at the discovered project root, but pi itself starts where
-    // the user stands. Bundle resource paths in `plan.pi_argv` are already
-    // absolutized (`bundle::bundle_report` absolutizes `root` before
-    // resolving them), so this split is safe - nothing in pi's argv depends
-    // on `cli.dir`.
     enforcement::initialize_receipt_capability(&run.run_dir)?;
     let mut pi_argv = plan.pi_argv;
     pi_argv.extend(cli.pi_args.iter().cloned());
@@ -1923,12 +1984,11 @@ fn warn_for_interactive_rondo(root: &Path) {
 
 /// The always-on created-notice, shared by the success path and the
 /// scaffolded-then-failed re-plan path so a write is never silent.
-fn scaffold_notice(source: &scaffold::ScaffoldSource) -> String {
+fn scaffold_notice(scaffolded: &scaffold::Scaffolded) -> String {
     format!(
-        "nopal: created {} + {} ({})",
-        discover::manifest_rel_path(),
-        nopal_core::bundle::bundle_rel_path(),
-        source.describe()
+        "nopal: created complete project baseline [{}] ({})",
+        scaffolded.rel_paths.join(", "),
+        scaffolded.source.describe()
     )
 }
 
@@ -1956,6 +2016,7 @@ fn exec_pi(
         // Pi's own update-check network call and banner are noise nopal
         // already owns readiness reporting for; skip it every launch.
         .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("PI_OFFLINE", "1")
         .env("NOPAL_ENFORCEMENT_RUN_ID", enforcement.run_id)
         .env("NOPAL_ENFORCEMENT_ROOT", enforcement.root)
         .env("NOPAL_ENFORCEMENT_STATE_DIR", enforcement.state_dir)

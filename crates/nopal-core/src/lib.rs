@@ -17,6 +17,7 @@ pub mod bundle;
 pub mod config;
 pub mod diagnostics;
 pub mod discover;
+pub mod distribution;
 pub mod enforcement;
 pub mod field;
 pub mod field_store;

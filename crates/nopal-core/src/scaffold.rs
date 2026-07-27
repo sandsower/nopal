@@ -40,8 +40,8 @@ use std::path::{Path, PathBuf};
 
 use crate::bundle::{self, BundleReport};
 use crate::diagnostics::{Code, Diagnostic, Severity};
-use crate::discover;
 use crate::run_ledger_store::token_hex;
+use crate::{discover, distribution, gates, policy};
 
 const MANIFEST_DEFAULTS: &str = "{\n  \
     // Created by nopal on first launch in an unconfigured repo.\n  \
@@ -70,6 +70,51 @@ const BUNDLE_DEFAULTS: &str = "{\n  \
 /// resolved config dir.
 const TEMPLATE_FILE: &str = "bundle-default.jsonc";
 
+const BASELINE_MANIFEST: &str = r#"{
+  // Created by Nopal for a portable enforced Pi project.
+  "version": "nopal.project/v1",
+  "profile": "nopal",
+  "profiles": {
+    "nopal": { "required_modules": ["gates", "policy"] }
+  }
+}
+"#;
+
+const BASELINE_POLICY: &str = r#"{
+  "version": "nopal.policy/v1",
+  "modes": {
+    "supervised_auto": {
+      "rules": [
+        { "id": "normal-push", "actions": ["git.push"], "decision": "ask" },
+        { "id": "force-push", "actions": ["git.push_force"], "decision": "deny" }
+      ]
+    },
+    "unattended_auto": {
+      "rules": [
+        { "id": "normal-push", "actions": ["git.push"], "decision": "deny" },
+        { "id": "force-push", "actions": ["git.push_force"], "decision": "deny" }
+      ]
+    }
+  }
+}
+"#;
+
+const BASELINE_GATES: &str = r#"{
+  "version": "nopal.gates/v1",
+  "gates": [
+    { "id": "diff-check", "stage": "pre_pr", "command": "git diff --check" }
+  ]
+}
+"#;
+
+const BASELINE_WORKFLOW: &str = r#"<!-- beislid-workflow: v1 -->
+
+# Nopal project workflow
+
+This repository uses Nopal's checked-in policy, gate, and distribution contracts.
+Typed `beislid:*` enforcement blocks may tighten those contracts, but prose never grants authority.
+"#;
+
 /// Where a scaffolded `.nopal/bundle.jsonc`'s content came from.
 /// Carried on [`Scaffolded`] (a completed write) and folded into
 /// `nopal-cli::launch`'s `scaffold_defaults` diagnostic and always-on launch
@@ -82,6 +127,8 @@ pub enum ScaffoldSource {
     /// No template found (or no config dir at all); nopal's own
     /// [`BUNDLE_DEFAULTS`] constant was used.
     BuiltinHermetic,
+    /// The complete v0.3 baseline bound to the executing Nopal distribution.
+    BuiltinDistribution,
 }
 
 impl ScaffoldSource {
@@ -93,6 +140,7 @@ impl ScaffoldSource {
         match self {
             ScaffoldSource::Template(path) => format!("from {}", path.display()),
             ScaffoldSource::BuiltinHermetic => "built-in hermetic defaults".to_owned(),
+            ScaffoldSource::BuiltinDistribution => "the executing Nopal distribution".to_owned(),
         }
     }
 }
@@ -231,6 +279,178 @@ fn retarget_to_template(path: &Path, report: BundleReport) -> Vec<Diagnostic> {
         ..d
     }));
     diagnostics
+}
+
+#[derive(Debug, Clone)]
+pub struct BaselineFile {
+    pub rel_path: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct Baseline {
+    pub files: Vec<BaselineFile>,
+    pub source: ScaffoldSource,
+}
+
+impl Baseline {
+    pub fn text(&self, rel_path: &str) -> Option<&str> {
+        self.files
+            .iter()
+            .find(|file| file.rel_path == rel_path)
+            .map(|file| file.text.as_str())
+    }
+}
+
+/// Compile and validate the exact complete baseline before any destination is
+/// touched. Keeping this constructor shared by dry-run and the real write
+/// prevents first-run preview from describing a contract different from the
+/// one that will be committed.
+pub fn build_baseline(
+    root: &Path,
+    builtin: distribution::BuiltinDistribution<'_>,
+) -> io::Result<Baseline> {
+    let root = std::path::absolute(root)?;
+    let bundle_text = format!(
+        r#"{{
+  "version": "nopal.bundle/v2",
+  "inherit_ambient": [],
+  "packages": [
+    {{
+      "id": "nopal",
+      "source": {{ "type": "builtin", "package": "nopal" }},
+      "requirement": "={}",
+      "resources": [
+        {{ "kind": "extension", "path": "index.ts" }}
+      ]
+    }}
+  ]
+}}
+"#,
+        builtin.version
+    );
+    let lock = distribution::build_lock_from_local_sources(&root, &bundle_text, &builtin).map_err(
+        |diagnostics| {
+            io::Error::other(format!(
+                "generated distribution baseline is invalid: {}",
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))
+        },
+    )?;
+    let lock_text = distribution::lock_json(&lock).map_err(io::Error::other)?;
+
+    let (_, manifest_diagnostics) =
+        crate::config::parse_manifest(BASELINE_MANIFEST, &discover::manifest_rel_path());
+    let (_, gate_diagnostics) = gates::parse_gates(BASELINE_GATES, ".nopal/gates.jsonc");
+    let mut validation_diagnostics = manifest_diagnostics;
+    validation_diagnostics.extend(gate_diagnostics);
+    match crate::config::parse_jsonc(
+        BASELINE_POLICY,
+        ".nopal/policy.jsonc",
+        Code::ModuleParseError,
+    ) {
+        Ok(value) => {
+            let (_, diagnostics) = policy::validate_document(&value, ".nopal/policy.jsonc");
+            validation_diagnostics.extend(diagnostics);
+        }
+        Err(diagnostic) => validation_diagnostics.push(diagnostic),
+    }
+    if validation_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error)
+    {
+        return Err(io::Error::other(format!(
+            "generated project baseline is invalid: {}",
+            validation_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )));
+    }
+
+    Ok(Baseline {
+        files: vec![
+            BaselineFile {
+                rel_path: discover::manifest_rel_path(),
+                text: BASELINE_MANIFEST.to_owned(),
+            },
+            BaselineFile {
+                rel_path: ".nopal/policy.jsonc".to_owned(),
+                text: BASELINE_POLICY.to_owned(),
+            },
+            BaselineFile {
+                rel_path: ".nopal/gates.jsonc".to_owned(),
+                text: BASELINE_GATES.to_owned(),
+            },
+            BaselineFile {
+                rel_path: distribution::BUNDLE_PATH.to_owned(),
+                text: bundle_text,
+            },
+            BaselineFile {
+                rel_path: distribution::LOCK_PATH.to_owned(),
+                text: lock_text,
+            },
+            BaselineFile {
+                rel_path: ".beislid/workflow.md".to_owned(),
+                text: BASELINE_WORKFLOW.to_owned(),
+            },
+        ],
+        source: ScaffoldSource::BuiltinDistribution,
+    })
+}
+
+/// Write one complete portable baseline into a truly unconfigured repository.
+/// Existing Nopal, Beislið, or legacy product state is never merged with the
+/// generated files because doing so would silently assign authority to a
+/// partially understood configuration.
+pub fn write_baseline(
+    root: &Path,
+    builtin: distribution::BuiltinDistribution<'_>,
+) -> io::Result<Scaffolded> {
+    let root = std::path::absolute(root)?;
+    for existing in [
+        root.join(discover::NOPAL_DIR),
+        root.join(".beislid"),
+        root.join(".crust"),
+    ] {
+        if existing.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "refusing to scaffold over existing or legacy project state {}",
+                    existing.display()
+                ),
+            ));
+        }
+    }
+
+    let baseline = build_baseline(&root, builtin)?;
+    let mut committed = Vec::new();
+    for file in &baseline.files {
+        let path = root.join(&file.rel_path);
+        if let Err(error) = write_text_durable(&path, &file.text) {
+            for committed_path in committed.iter().rev() {
+                let _ = fs::remove_file(committed_path);
+            }
+            let _ = fs::remove_dir(root.join(".beislid"));
+            let _ = fs::remove_dir(root.join(discover::NOPAL_DIR));
+            return Err(error);
+        }
+        committed.push(path);
+    }
+    Ok(Scaffolded {
+        rel_paths: baseline
+            .files
+            .into_iter()
+            .map(|file| file.rel_path)
+            .collect(),
+        source: baseline.source,
+    })
 }
 
 /// Writes `.nopal/nopal.jsonc` and `.nopal/bundle.jsonc` with minimal
@@ -535,5 +755,56 @@ mod tests {
             ready.report.resources[0].resolved_path,
             root.join("skill.md")
         );
+    }
+
+    #[test]
+    fn complete_baseline_creates_every_checked_in_contract_file_and_valid_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let adapter = temp.path().join("distribution/extensions/policy-gate");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&adapter).unwrap();
+        fs::write(adapter.join("index.ts"), "export default 1;\n").unwrap();
+        fs::write(
+            adapter.join("classifier.ts"),
+            "export const classify = 1;\n",
+        )
+        .unwrap();
+        fs::write(adapter.join("nopal-cli.ts"), "export const cli = 1;\n").unwrap();
+
+        let written = write_baseline(
+            &root,
+            crate::distribution::BuiltinDistribution {
+                version: "0.3.0",
+                root: &adapter,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            written.rel_paths,
+            vec![
+                ".nopal/nopal.jsonc",
+                ".nopal/policy.jsonc",
+                ".nopal/gates.jsonc",
+                ".nopal/bundle.jsonc",
+                ".nopal/nopal.lock",
+                ".beislid/workflow.md",
+            ]
+        );
+        for path in &written.rel_paths {
+            assert!(root.join(path).is_file(), "missing scaffold output {path}");
+        }
+        let report = crate::distribution::inspect(crate::distribution::DistributionContext {
+            project_root: &root,
+            store_root: &temp.path().join("store"),
+            builtin: crate::distribution::BuiltinDistribution {
+                version: "0.3.0",
+                root: &adapter,
+            },
+        })
+        .unwrap();
+        assert!(report.ok, "{:?}", report.diagnostics);
+        assert_eq!(report.resources.len(), 1);
     }
 }
