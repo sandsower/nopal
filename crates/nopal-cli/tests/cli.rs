@@ -37,6 +37,15 @@ fn json(out: &Output) -> serde_json::Value {
     serde_json::from_str(&stdout(out)).expect("stdout is not valid JSON")
 }
 
+fn init_git(root: &Path) {
+    let status = Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(root)
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
 fn write_minimal_project(root: &Path, extra_manifest_fields: &str) {
     fs::create_dir_all(root.join(".nopal")).unwrap();
     fs::write(
@@ -51,6 +60,72 @@ fn write_minimal_project(root: &Path, extra_manifest_fields: &str) {
         ),
     )
     .unwrap();
+}
+
+#[test]
+fn doctor_explains_the_same_stable_rust_templates_without_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    init_git(temp.path());
+    fs::write(
+        temp.path().join("Cargo.toml"),
+        "[workspace]\nmembers = []\n",
+    )
+    .unwrap();
+
+    let out = nopal(&["--dir", temp.path().to_str().unwrap(), "--json", "doctor"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let doc = json(&out);
+    assert_eq!(doc["kind"], "nopal.doctor/v1");
+    assert_eq!(doc["gate_scaffold"]["readiness"], "ready");
+    assert_eq!(doc["gate_scaffold"]["templates"][1]["id"], "rust.cargo/v1");
+    assert!(!temp.path().join(".nopal").exists());
+}
+
+#[test]
+fn doctor_reports_unknown_projects_as_needing_configuration() {
+    let temp = tempfile::tempdir().unwrap();
+    init_git(temp.path());
+
+    let out = nopal(&["--dir", temp.path().to_str().unwrap(), "--json", "doctor"]);
+
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    let doc = json(&out);
+    assert_eq!(doc["gate_scaffold"]["readiness"], "needs_configuration");
+}
+
+#[test]
+fn doctor_reports_explicit_gate_precedence_and_is_deterministic() {
+    let temp = tempfile::tempdir().unwrap();
+    init_git(temp.path());
+    fs::write(
+        temp.path().join("Cargo.toml"),
+        "[workspace]\nmembers = []\n",
+    )
+    .unwrap();
+    fs::create_dir_all(temp.path().join(".nopal")).unwrap();
+    fs::write(
+        temp.path().join(".nopal/gates.jsonc"),
+        r#"{"version":"nopal.gates/v1","gates":[{"id":"explicit","stage":"pre_pr","argv":["true"]}]}"#,
+    )
+    .unwrap();
+
+    let args = ["--dir", temp.path().to_str().unwrap(), "--json", "doctor"];
+    let first = nopal(&args);
+    let second = nopal(&args);
+    assert_eq!(first.status.code(), Some(0), "{}", stdout(&first));
+    assert_eq!(first.stdout, second.stdout);
+    let doc = json(&first);
+    assert_eq!(doc["gate_scaffold"]["authority"], "explicit_nopal");
+    assert!(
+        doc["gate_scaffold"]["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|decision| {
+                decision["template_id"] == "rust.cargo/v1" && decision["outcome"] == "superseded"
+            })
+    );
 }
 
 #[test]
@@ -1729,6 +1804,7 @@ fn info_json_reports_version_and_capabilities() {
         capabilities,
         vec![
             "ask",
+            "doctor",
             "export",
             "gates",
             "import",

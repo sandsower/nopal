@@ -63,14 +63,22 @@ pub struct GatesSelectReport {
 /// gates config, unlike profile validation where absence can be fine.
 fn load(root: &Path) -> io::Result<(Option<GatesConfig>, Vec<Diagnostic>)> {
     let rel = discover::module_rel_path(Module::Gates);
-    match crate::validate::read_optional(&discover::module_path(root, Module::Gates))? {
-        Some(text) => Ok(gates::parse_gates(&text, &rel)),
-        None => Ok((
+    match crate::confined_read::read_utf8(root, Path::new(&rel), 1024 * 1024) {
+        Ok(Some(text)) => Ok(gates::parse_gates(&text, &rel)),
+        Ok(None) => Ok((
             None,
             vec![Diagnostic::error(
                 crate::diagnostics::Code::ModuleMissing,
                 rel.clone(),
                 format!("no {rel} found; the gates commands need one"),
+            )],
+        )),
+        Err(error) => Ok((
+            None,
+            vec![Diagnostic::error(
+                crate::diagnostics::Code::ModuleParseError,
+                rel,
+                format!("could not read confined gates authority: {error}"),
             )],
         )),
     }

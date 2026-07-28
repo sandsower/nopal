@@ -6,3 +6,4 @@ These records describe durable Nopal architecture decisions.
 - [ADR 0011: Pi authoritative session and model control](0011-pi-authoritative-session-model-control.md)
 - [ADR 0012: Reset Nopal to an enforced Pi distribution](0012-reset-nopal-to-an-enforced-pi-distribution.md)
 - [ADR 0013: Lock portable project distributions](0013-lock-portable-project-distributions.md)
+- [ADR 0014: Detect first-run gates from confined evidence](0014-detect-first-run-gates-from-confined-evidence.md)

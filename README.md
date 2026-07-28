@@ -32,7 +32,11 @@ From any supported Git repository:
 nopal
 ```
 
-A completely unconfigured repository receives the checked-in Nopal and Beislið baseline before Pi starts.
+A completely unconfigured repository receives a checked-in Nopal and Beislið baseline with evidence-backed validation gates.
+Nopal detects configured root ecosystems and only those workspaces explicitly declared by root manifests.
+Explicit repository tasks and package scripts take precedence over generated ecosystem defaults.
+Conflicting tool choices stop with actionable diagnostics.
+An unknown repository receives the baseline but does not start Pi until explicit gates are added.
 Partial Nopal, existing Beislið-only, and legacy pre-v0.3 project state is preserved and rejected rather than overwritten.
 
 Arguments after `--` pass directly to Pi:
@@ -45,6 +49,7 @@ Useful read-only inspection commands include:
 
 ```sh
 nopal --dry-run --json
+nopal doctor --json
 nopal sync --json
 nopal update --json
 nopal update --write --json
@@ -64,7 +69,7 @@ A configured project uses checked-in files under `.nopal/`:
 - `.nopal/bundle.jsonc` declares portable builtin, workspace, and npm package identities and their exported Pi resources.
 - `.nopal/nopal.lock` records exact versions and artifact, installed-tree, and resource integrity.
 - `.nopal/policy.jsonc` declares repository action policy.
-- `.nopal/gates.jsonc` declares deterministic gates.
+- `.nopal/gates.jsonc` declares deterministic gates and records versioned first-run template provenance when generated.
 - `.beislid/workflow.md` provides prose guidance and optional typed enforcement blocks.
 
 Nopal reads enforcement authority only from recognized typed `beislid:*` Markdown fences.

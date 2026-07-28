@@ -107,6 +107,11 @@ pub enum Code {
     PlotSessionWorkspaceConflict,
     ScaffoldDefaults,
     ScaffoldTemplateInvalid,
+    GateScaffoldEvidenceInvalid,
+    GateScaffoldAmbiguous,
+    GateConfigurationRequired,
+    GateWorkspaceInvalid,
+    GateScaffoldDrift,
 }
 
 impl Code {
@@ -190,6 +195,11 @@ impl Code {
             Code::PlotSessionWorkspaceConflict => "plot_session_workspace_conflict",
             Code::ScaffoldDefaults => "scaffold_defaults",
             Code::ScaffoldTemplateInvalid => "scaffold_template_invalid",
+            Code::GateScaffoldEvidenceInvalid => "gate_scaffold_evidence_invalid",
+            Code::GateScaffoldAmbiguous => "gate_scaffold_ambiguous",
+            Code::GateConfigurationRequired => "gate_configuration_required",
+            Code::GateWorkspaceInvalid => "gate_workspace_invalid",
+            Code::GateScaffoldDrift => "gate_scaffold_drift",
         }
     }
 }

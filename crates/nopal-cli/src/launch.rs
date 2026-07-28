@@ -13,6 +13,7 @@ use nopal_core::diagnostics::{self, Code, Diagnostic, Severity};
 use nopal_core::distribution::{
     self, BuiltinDistribution, DistributionContext, DistributionReport, ResolvedResource,
 };
+use nopal_core::gate_scaffold::{GateScaffoldPlan, Readiness};
 use nopal_core::process_artifact;
 use nopal_core::scaffold::{self, ScaffoldSource};
 use nopal_core::toon::{self, Value};
@@ -56,6 +57,12 @@ pub struct LaunchPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_artifact_note: Option<String>,
     pub scaffold: Scaffold,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_scaffold: Option<GateScaffoldPlan>,
+    /// The baseline is runtime preparation state, not report authority. It is
+    /// retained so publication uses the exact evidence snapshot just shown.
+    #[serde(skip)]
+    pub prepared_baseline: Option<scaffold::Baseline>,
     /// Kept under the historical `bundle` field so machine consumers receive
     /// a compatible report position while its content is now the stronger
     /// contract-plus-lock distribution report.
@@ -111,8 +118,17 @@ fn plan_configured(dir: &Path, context: LaunchContext<'_>) -> io::Result<LaunchP
     // old optional-module exception made invalid configuration depend on the
     // selected profile and contradicted fail-closed project portability.
     let validity_ok = validation.ok();
-    let ready = validation.ok();
     let mut diagnostics = validation.diagnostics;
+    let (gate_ready, gate_diagnostics) = checked_in_gates_ready(dir)?;
+    diagnostics.extend(gate_diagnostics);
+    if !gate_ready {
+        diagnostics.push(Diagnostic::error(
+            Code::GateConfigurationRequired,
+            ".nopal/gates.jsonc",
+            "detected project has only the baseline diff check; add explicit Nopal or typed Beislið gates before launch",
+        ));
+    }
+    let ready = validity_ok && gate_ready;
     let (process_artifact_ok, process_artifact_note) =
         check_process_artifact(dir, &mut diagnostics)?;
     let distribution = distribution::inspect(DistributionContext {
@@ -130,6 +146,70 @@ fn plan_configured(dir: &Path, context: LaunchContext<'_>) -> io::Result<LaunchP
         distribution,
         diagnostics,
     )
+}
+
+fn checked_in_gates_ready(dir: &Path) -> io::Result<(bool, Vec<Diagnostic>)> {
+    let gates_text =
+        nopal_core::confined_read::read_utf8(dir, Path::new(".nopal/gates.jsonc"), 1024 * 1024)?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "repository gates are missing")
+            })?;
+    let (config, mut diagnostics) =
+        nopal_core::gates::parse_gates(&gates_text, ".nopal/gates.jsonc");
+    let Some(config) = config else {
+        return Ok((false, diagnostics));
+    };
+
+    let workflow_text =
+        nopal_core::confined_read::read_utf8(dir, Path::new(".beislid/workflow.md"), 1024 * 1024)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "workflow is missing"))?;
+    let compiled = nopal_core::beislid_import::compile_text(&workflow_text, ".beislid/workflow.md");
+    let beislid_explicit = compiled.modules.get("gates").is_some_and(|value| {
+        let (gates, gate_diagnostics) =
+            nopal_core::gates::validate_document(value, ".beislid/workflow.md#beislid:gates");
+        diagnostics.extend(gate_diagnostics);
+        has_unscoped_explicit_pre_pr(&gates)
+    });
+    diagnostics.extend(compiled.diagnostics);
+
+    let ready = match &config.scaffold {
+        None => has_unscoped_explicit_pre_pr(&config) || beislid_explicit,
+        Some(provenance) => {
+            let nopal_explicit = has_unscoped_explicit_pre_pr(&config);
+            if nopal_explicit || beislid_explicit {
+                true
+            } else {
+                let detected = nopal_core::gate_scaffold::inspect(dir)?;
+                diagnostics.extend(detected.diagnostics.clone());
+                let matches_current_evidence = detected.matches_checked_generated(&gates_text);
+                if !matches_current_evidence {
+                    diagnostics.push(Diagnostic::error(
+                        Code::GateScaffoldDrift,
+                        ".nopal/gates.jsonc",
+                        "generated gates no longer match current root and declared-workspace evidence; add explicit gates or regenerate from `nopal doctor` evidence",
+                    ));
+                }
+                provenance.readiness == Readiness::Ready
+                    && detected.readiness == Readiness::Ready
+                    && matches_current_evidence
+            }
+        }
+    };
+    let diagnostics_ok = diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.severity != Severity::Error);
+    Ok((ready && diagnostics_ok, diagnostics))
+}
+
+/// Launch has no changed-file set to prove selector coverage.
+/// Only explicit proof selected without file evidence can replace generated
+/// readiness for the whole repository.
+fn has_unscoped_explicit_pre_pr(config: &nopal_core::gates::GatesConfig) -> bool {
+    let generated = config.generated_gate_ids();
+    nopal_core::selection::select(config, nopal_core::gates::GateStage::PrePr, &[])
+        .selected
+        .iter()
+        .any(|gate| !generated.contains(gate.id.as_str()))
 }
 
 fn plan_without_nopal(dir: &Path, context: LaunchContext<'_>) -> io::Result<LaunchPlan> {
@@ -174,18 +254,40 @@ fn plan_without_nopal(dir: &Path, context: LaunchContext<'_>) -> io::Result<Laun
         &baseline.source,
         &baseline.files,
     )];
+    let gate_plan = baseline.gate_scaffold.clone();
+    let gate_ready = gate_plan.readiness == Readiness::Ready;
+    let can_scaffold = gate_plan.readiness != Readiness::Blocked;
+    if !gate_ready {
+        diagnostics.push(Diagnostic::error(
+            Code::GateConfigurationRequired,
+            ".nopal/gates.jsonc",
+            "no evidence-backed validation template was detected; Nopal can create the baseline but will not launch Pi until explicit gates are added",
+        ));
+    }
+    diagnostics.extend(gate_plan.diagnostics.clone());
     diagnostics.extend(distribution.diagnostics.clone());
     let (process_artifact_ok, process_artifact_note) =
         check_process_artifact(dir, &mut diagnostics)?;
-    finish_plan(
+    let mut plan = finish_plan(
         true,
-        true,
+        gate_ready,
         process_artifact_ok,
         process_artifact_note,
-        Scaffold::WouldCreate,
+        Scaffold::None,
         distribution,
         diagnostics,
-    )
+    )?;
+    let can_scaffold = can_scaffold
+        && plan.diagnostics.iter().all(|diagnostic| {
+            diagnostic.severity != Severity::Error
+                || diagnostic.code == Code::GateConfigurationRequired
+        });
+    plan.gate_scaffold = Some(gate_plan);
+    if can_scaffold {
+        plan.scaffold = Scaffold::WouldCreate;
+        plan.prepared_baseline = Some(baseline);
+    }
+    Ok(plan)
 }
 
 fn finish_plan(
@@ -228,6 +330,8 @@ fn finish_plan(
         ambient_kinds,
         process_artifact_note,
         scaffold,
+        gate_scaffold: None,
+        prepared_baseline: None,
         bundle: distribution,
         pi_argv,
         diagnostics,
@@ -245,6 +349,8 @@ fn blocked_unconfigured_plan(diagnostic: Diagnostic) -> LaunchPlan {
         ambient_kinds: Vec::new(),
         process_artifact_note: None,
         scaffold: Scaffold::None,
+        gate_scaffold: None,
+        prepared_baseline: None,
         bundle: empty_distribution(vec![diagnostic.clone()]),
         pi_argv: Vec::new(),
         diagnostics: vec![diagnostic],
@@ -472,15 +578,20 @@ mod tests {
     }
 
     #[test]
-    fn fresh_git_project_plans_complete_offline_scaffold() {
+    fn unknown_git_project_plans_complete_scaffold_without_pi_launch() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join(".git")).unwrap();
         let plan = plan(temp.path(), context(&temp)).unwrap();
-        assert!(plan.ok, "{:?}", plan.diagnostics);
+        assert!(!plan.ok);
         assert_eq!(plan.scaffold, Scaffold::WouldCreate);
         assert_eq!(plan.bundle.packages.len(), 1);
         assert_eq!(plan.bundle.resources.len(), 1);
-        assert_eq!(plan.pi_argv.first().map(String::as_str), Some("--offline"));
+        assert!(plan.pi_argv.is_empty());
+        assert!(
+            plan.diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == Code::GateConfigurationRequired })
+        );
     }
 
     #[test]

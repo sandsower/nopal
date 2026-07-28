@@ -58,6 +58,21 @@ A deterministic check declared by configuration and selected by Nopal Core for a
 The Pi adapter executes the command and returns the observed result.
 _Avoid_: executing gate commands inside Nopal Core or treating successful process startup as gate evidence
 
+**Gate template**:
+A builtin, versioned recipe that maps proven repository evidence to conservative generated gates.
+Its stable identity, such as `rust.cargo/v1`, is recorded in the checked-in gate provenance.
+_Avoid_: inferring a template from installed executables, undeclared nested projects, or prose
+
+**Evidence scope**:
+The repository root or a symlink-free confined workspace explicitly declared by a root manifest.
+Only evidence inside these scopes may influence generated gates.
+_Avoid_: broad recursive discovery through fixtures, examples, vendors, generated output, caches, or dependency trees
+
+**Detection decision**:
+A stable explanation that records whether a gate template was selected, skipped, superseded, ambiguous, or blocked, together with its evidence and reason code.
+`nopal doctor` presents the same decisions that first-run scaffolding uses.
+_Avoid_: a separate advisory detector whose conclusions can drift from generated authority
+
 **Gate receipt**:
 Durable, session-authenticated evidence that one exact gate definition passed against one effective contract and one workspace content fingerprint.
 The receipt capability is ephemeral, stored in a mode-0600 protected run file, and never enters Pi extension state, subprocess arguments, project data, or ledger events.
@@ -83,6 +98,8 @@ _Avoid_: retroactively describing external work as enforced
 - Unrecognized Beislið-owned blocks remain diagnostic-only.
 - Policy composition can only become more restrictive.
 - Nopal Core selects and validates but never executes gates.
+- First-run gate detection reads only root and explicitly declared workspace evidence.
+- Unknown or ambiguous gate detection cannot start Pi.
 - The Pi adapter accepts only one completely classifiable command per shell tool call and executes only the gate plan returned by Core.
 - Compound, dynamic, redirected, expanded, or otherwise unsupported shell execution fails closed before any segment runs.
 - A protected action cannot run with missing, failed, stale, or unauthenticated required gate evidence.

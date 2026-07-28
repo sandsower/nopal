@@ -37,6 +37,160 @@ fn project(root: &Path) {
 }
 
 #[test]
+fn explicit_nopal_or_beislid_gates_supersede_generated_templates() {
+    for authority in ["nopal", "beislid"] {
+        let temp = tempfile::tempdir().unwrap();
+        project(temp.path());
+        write(&temp.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n");
+        let plan = nopal_core::gate_scaffold::inspect(temp.path()).unwrap();
+        let mut gates: serde_json::Value =
+            serde_json::from_str(&plan.gates_json().unwrap()).unwrap();
+        if authority == "nopal" {
+            gates["gates"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "id": "explicit-nopal",
+                    "stage": "pre_pr",
+                    "argv": ["true"]
+                }));
+        } else {
+            write(
+                &temp.path().join(".beislid/workflow.md"),
+                "```beislid:gates\n- name: explicit-beislid\n  command: 'cargo test'\n```\n",
+            );
+        }
+        write(
+            &temp.path().join(".nopal/gates.jsonc"),
+            &serde_json::to_string_pretty(&gates).unwrap(),
+        );
+
+        let report = enforcement::plan(EnforcementRequest {
+            root: temp.path(),
+            config_dir: None,
+            mode: Mode::SupervisedAuto,
+            action: "git.push",
+            classes: &[ActionClass::GitRemote],
+            run_dir: None,
+            receipt_key: None,
+        })
+        .unwrap();
+        assert!(report.ok, "{authority}: {:?}", report.diagnostics);
+        assert_eq!(report.required_gates.len(), 1, "{authority}");
+        assert_eq!(report.required_gates[0].id, format!("explicit-{authority}"));
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn symlinked_authority_files_and_directories_fail_closed_without_following_targets() {
+    use std::os::unix::fs::symlink;
+
+    for authority in ["gates", "gates-internal", "workflow", "directory"] {
+        let temp = tempfile::tempdir().unwrap();
+        project(temp.path());
+        let outside = temp.path().join(format!("outside-{authority}"));
+        if authority == "gates" {
+            write(
+                &outside,
+                r#"{"version":"nopal.gates/v1","gates":[{"id":"outside","stage":"pre_pr","argv":["true"]}]}"#,
+            );
+            fs::remove_file(temp.path().join(".nopal/gates.jsonc")).unwrap();
+            symlink(&outside, temp.path().join(".nopal/gates.jsonc")).unwrap();
+        } else if authority == "gates-internal" {
+            write(
+                &temp.path().join(".nopal/real-gates.jsonc"),
+                r#"{"version":"nopal.gates/v1","gates":[{"id":"inside","stage":"pre_pr","argv":["true"]}]}"#,
+            );
+            fs::remove_file(temp.path().join(".nopal/gates.jsonc")).unwrap();
+            symlink("real-gates.jsonc", temp.path().join(".nopal/gates.jsonc")).unwrap();
+        } else if authority == "workflow" {
+            write(
+                &outside,
+                "```beislid:gates\n- name: outside\n  command: 'cargo test'\n```\n",
+            );
+            fs::create_dir_all(temp.path().join(".beislid")).unwrap();
+            symlink(&outside, temp.path().join(".beislid/workflow.md")).unwrap();
+        } else {
+            write(
+                &outside.join("policy.jsonc"),
+                &fs::read_to_string(temp.path().join(".nopal/policy.jsonc")).unwrap(),
+            );
+            write(
+                &outside.join("gates.jsonc"),
+                r#"{"version":"nopal.gates/v1","gates":[{"id":"outside","stage":"pre_pr","argv":["true"]}]}"#,
+            );
+            fs::remove_dir_all(temp.path().join(".nopal")).unwrap();
+            symlink(&outside, temp.path().join(".nopal")).unwrap();
+        }
+        let report = enforcement::plan(EnforcementRequest {
+            root: temp.path(),
+            config_dir: None,
+            mode: Mode::SupervisedAuto,
+            action: "git.push",
+            classes: &[ActionClass::GitRemote],
+            run_dir: None,
+            receipt_key: None,
+        })
+        .unwrap();
+        assert!(!report.ok, "{authority}: {:?}", report.diagnostics);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == nopal_core::diagnostics::Code::ModuleParseError
+        }));
+    }
+}
+
+#[test]
+fn selector_scoped_explicit_gate_cannot_suppress_all_generated_push_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path());
+    write(&temp.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n");
+    let generated = nopal_core::gate_scaffold::inspect(temp.path()).unwrap();
+    let mut gates: serde_json::Value =
+        serde_json::from_str(&generated.gates_json().unwrap()).unwrap();
+    gates["gates"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "explicit-rust",
+            "stage": "pre_pr",
+            "argv": ["cargo", "test"]
+        }));
+    gates["gate_sets"] = serde_json::json!({
+        "rust": {"gates": ["explicit-rust"]}
+    });
+    gates["selectors"] = serde_json::json!([{
+        "name": "rust",
+        "paths": ["**/*.rs"],
+        "gate_sets": ["rust"]
+    }]);
+    write(
+        &temp.path().join(".nopal/gates.jsonc"),
+        &serde_json::to_string_pretty(&gates).unwrap(),
+    );
+
+    let report = enforcement::plan(EnforcementRequest {
+        root: temp.path(),
+        config_dir: None,
+        mode: Mode::SupervisedAuto,
+        action: "git.push",
+        classes: &[ActionClass::GitRemote],
+        run_dir: None,
+        receipt_key: None,
+    })
+    .unwrap();
+
+    assert!(report.ok, "{:?}", report.diagnostics);
+    assert!(!report.required_gates.is_empty());
+    assert!(
+        report
+            .required_gates
+            .iter()
+            .all(|gate| gate.id.starts_with("detected."))
+    );
+}
+
+#[test]
 fn normal_push_requires_pre_pr_gate_while_force_push_is_denied() {
     let temp = tempfile::tempdir().unwrap();
     project(temp.path());

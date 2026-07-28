@@ -1,4 +1,4 @@
-//! `nopal.gates/v1` module parsing and validation.
+//! `nopal.gates/v1` explicit and `nopal.gates/v2` generated module validation.
 //!
 //! The gates module declares *what* checks exist and *when* they apply;
 //! nopal selects, decides, and explains but never executes them.
@@ -6,14 +6,16 @@
 //! every problem it can see, and `config` is `None` only when the file
 //! itself did not parse.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
 use crate::config;
 use crate::diagnostics::{Code, Diagnostic};
+use crate::gate_scaffold::{self, ScaffoldProvenance};
 
 pub const GATES_KIND: &str = "nopal.gates/v1";
+pub const GENERATED_GATES_KIND: &str = "nopal.gates/v2";
 
 /// Placeholder names an executor is expected to substitute. v1 keeps this
 /// deliberately small; growing it is additive and cheap.
@@ -179,12 +181,49 @@ pub struct Selector {
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct GatesConfig {
+    /// Present only on generated v2 documents. V1 remains explicit checked-in
+    /// authority and cannot carry launch-readiness metadata that old readers
+    /// would ignore.
+    pub scaffold: Option<ScaffoldProvenance>,
     pub preflights: Vec<Preflight>,
     pub gates: Vec<Gate>,
     /// Set name -> set, iterated in name order (BTreeMap) for determinism;
     /// selection order comes from selectors, not from this map.
     pub gate_sets: BTreeMap<String, GateSet>,
     pub selectors: Vec<Selector>,
+}
+
+impl GatesConfig {
+    pub fn generated_gate_ids(&self) -> BTreeSet<&str> {
+        self.scaffold
+            .as_ref()
+            .map(|provenance| {
+                provenance
+                    .generated_gate_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn has_explicit_gates(&self) -> bool {
+        let generated = self.generated_gate_ids();
+        if self.scaffold.is_none() {
+            return !self.gates.is_empty();
+        }
+        self.gates
+            .iter()
+            .any(|gate| !generated.contains(gate.id.as_str()))
+    }
+
+    pub fn has_explicit_gates_for_stage(&self, stage: &GateStage) -> bool {
+        let generated = self.generated_gate_ids();
+        self.gates.iter().any(|gate| {
+            &gate.stage == stage
+                && (self.scaffold.is_none() || !generated.contains(gate.id.as_str()))
+        })
+    }
 }
 
 /// Parse and validate gates module text. Entries with a usable `id` are kept
@@ -199,24 +238,29 @@ pub fn parse_gates(text: &str, path: &str) -> (Option<GatesConfig>, Vec<Diagnost
     (Some(config), diagnostics)
 }
 
-/// Validate a parsed `.nopal/gates.jsonc` value against the nopal.gates/v1
-/// schema. Diagnostic-accumulating like the policy validator: everything
+/// Validate a parsed `.nopal/gates.jsonc` value against the explicit v1 or
+/// generated v2 schema. Diagnostic-accumulating like the policy validator: everything
 /// understandable comes back as a best-effort config alongside every
 /// problem found.
 pub fn validate_document(root: &serde_json::Value, path: &str) -> (GatesConfig, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
 
-    match root.get("version").and_then(|v| v.as_str()) {
-        Some(GATES_KIND) => {}
+    let version = root.get("version").and_then(|value| value.as_str());
+    match version {
+        Some(GATES_KIND | GENERATED_GATES_KIND) => {}
         Some(other) => diagnostics.push(Diagnostic::error(
             Code::VersionUnsupported,
             path,
-            format!("unsupported gates version {other:?}; expected {GATES_KIND:?}"),
+            format!(
+                "unsupported gates version {other:?}; expected {GATES_KIND:?} or {GENERATED_GATES_KIND:?}"
+            ),
         )),
         None => diagnostics.push(Diagnostic::error(
             Code::VersionUnsupported,
             path,
-            format!("missing string field \"version\"; expected {GATES_KIND:?}"),
+            format!(
+                "missing string field \"version\"; expected {GATES_KIND:?} or {GENERATED_GATES_KIND:?}"
+            ),
         )),
     }
 
@@ -240,9 +284,11 @@ pub fn validate_document(root: &serde_json::Value, path: &str) -> (GatesConfig, 
 
     let gate_sets = parse_gate_sets(root, &gates, path, &mut diagnostics);
     let selectors = parse_selectors(root, &gate_sets, path, &mut diagnostics);
+    let scaffold = parse_scaffold_provenance(root, version, &gates, path, &mut diagnostics);
 
     (
         GatesConfig {
+            scaffold,
             preflights,
             gates,
             gate_sets,
@@ -250,6 +296,136 @@ pub fn validate_document(root: &serde_json::Value, path: &str) -> (GatesConfig, 
         },
         diagnostics,
     )
+}
+
+fn parse_scaffold_provenance(
+    root: &serde_json::Value,
+    version: Option<&str>,
+    gates: &[Gate],
+    path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<ScaffoldProvenance> {
+    if version == Some(GATES_KIND) {
+        if root.get("scaffold").is_some() {
+            diagnostics.push(Diagnostic::error(
+                Code::FieldInvalid,
+                path,
+                "nopal.gates/v1 cannot carry scaffold readiness metadata; use nopal.gates/v2",
+            ));
+        }
+        return None;
+    }
+    if version != Some(GENERATED_GATES_KIND) {
+        return None;
+    }
+    let Some(value) = root.get("scaffold") else {
+        diagnostics.push(Diagnostic::error(
+            Code::FieldInvalid,
+            path,
+            "nopal.gates/v2 requires an object field \"scaffold\"",
+        ));
+        return None;
+    };
+    let provenance: ScaffoldProvenance = match serde_json::from_value(value.clone()) {
+        Ok(provenance) => provenance,
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                Code::FieldInvalid,
+                path,
+                format!("invalid scaffold provenance: {error}"),
+            ));
+            return None;
+        }
+    };
+    if provenance.version != gate_scaffold::PLAN_KIND {
+        diagnostics.push(Diagnostic::error(
+            Code::VersionUnsupported,
+            path,
+            format!(
+                "unsupported scaffold provenance version {:?}; expected {:?}",
+                provenance.version,
+                gate_scaffold::PLAN_KIND
+            ),
+        ));
+    }
+    if provenance.templates.is_empty() {
+        diagnostics.push(Diagnostic::error(
+            Code::FieldInvalid,
+            path,
+            "scaffold provenance must identify at least the baseline template",
+        ));
+    }
+    if provenance.authority != gate_scaffold::Authority::Generated {
+        diagnostics.push(Diagnostic::error(
+            Code::FieldInvalid,
+            path,
+            "nopal.gates/v2 provenance authority must be \"generated\"; add explicit gates as ordinary gate entries",
+        ));
+    }
+    for template in &provenance.templates {
+        if !gate_scaffold::known_template_id(&template.id) {
+            diagnostics.push(Diagnostic::error(
+                Code::ScaffoldTemplateInvalid,
+                path,
+                format!("unknown generated gate template {:?}", template.id),
+            ));
+        }
+    }
+    let declared_gate_ids = gates
+        .iter()
+        .map(|gate| gate.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut generated_ids = BTreeSet::new();
+    for id in &provenance.generated_gate_ids {
+        if !generated_ids.insert(id.as_str()) {
+            diagnostics.push(Diagnostic::error(
+                Code::DuplicateId,
+                path,
+                format!("duplicate generated gate id {id:?} in scaffold provenance"),
+            ));
+        }
+        if !id.starts_with("detected.") {
+            diagnostics.push(Diagnostic::error(
+                Code::FieldInvalid,
+                path,
+                format!("generated gate id {id:?} must use the reserved detected.* namespace"),
+            ));
+        }
+        if !declared_gate_ids.contains(id.as_str()) {
+            diagnostics.push(Diagnostic::error(
+                Code::GateRefUnknown,
+                path,
+                format!("scaffold provenance references missing generated gate {id:?}"),
+            ));
+        }
+    }
+    for id in &declared_gate_ids {
+        if id.starts_with("detected.") && !generated_ids.contains(*id) {
+            diagnostics.push(Diagnostic::error(
+                Code::FieldInvalid,
+                path,
+                format!("generated gate {id:?} is missing from scaffold.generated_gate_ids"),
+            ));
+        }
+    }
+    let has_nonbaseline_template = provenance
+        .templates
+        .iter()
+        .any(|template| template.id != "baseline.git/v1");
+    let has_explicit_gate = declared_gate_ids
+        .iter()
+        .any(|id| !generated_ids.contains(*id));
+    if provenance.readiness == gate_scaffold::Readiness::Ready
+        && !has_nonbaseline_template
+        && !has_explicit_gate
+    {
+        diagnostics.push(Diagnostic::error(
+            Code::GateConfigurationRequired,
+            path,
+            "generated readiness cannot be \"ready\" with only the baseline diff template",
+        ));
+    }
+    Some(provenance)
 }
 
 /// Read a top-level array field; a missing field is an empty list, a
@@ -746,7 +922,7 @@ mod tests {
     fn missing_and_wrong_version_are_reported() {
         let (_, diagnostics) = parse(r#"{ "gates": [] }"#);
         assert_eq!(codes(&diagnostics), vec![Code::VersionUnsupported]);
-        let (_, diagnostics) = parse(r#"{ "version": "nopal.gates/v2" }"#);
+        let (_, diagnostics) = parse(r#"{ "version": "nopal.gates/v99" }"#);
         assert_eq!(codes(&diagnostics), vec![Code::VersionUnsupported]);
     }
 

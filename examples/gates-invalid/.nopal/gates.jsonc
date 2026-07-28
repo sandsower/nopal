@@ -1,6 +1,6 @@
 {
   // One of everything the validator must catch.
-  "version": "nopal.gates/v2",
+  "version": "nopal.gates/v99",
   "gates": [
     { "id": "fmt", "stage": "someday", "command": "cargo fmt" },
     { "id": "dup", "stage": "pre_pr", "command": "lint {typo}" },

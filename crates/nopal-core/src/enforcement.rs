@@ -84,6 +84,36 @@ struct EffectiveContract {
     policies: Vec<(String, PolicyDoc)>,
     gate_sources: Vec<(String, GatesConfig)>,
     diagnostics: Vec<Diagnostic>,
+    /// Digest of the exact confined bytes parsed into this contract.
+    contract_digest: String,
+}
+
+struct ContractDigest(Sha256);
+
+impl ContractDigest {
+    fn new() -> Self {
+        Self(Sha256::new())
+    }
+
+    /// Length-prefix every field so distinct source boundaries cannot hash to
+    /// the same concatenated byte stream. Missing authority is part of the
+    /// contract and is distinct from an empty file.
+    fn record(&mut self, label: &str, bytes: Option<&[u8]>) {
+        self.0.update((label.len() as u64).to_be_bytes());
+        self.0.update(label.as_bytes());
+        match bytes {
+            Some(bytes) => {
+                self.0.update([1]);
+                self.0.update((bytes.len() as u64).to_be_bytes());
+                self.0.update(bytes);
+            }
+            None => self.0.update([0]),
+        }
+    }
+
+    fn finish(self) -> String {
+        format!("{:x}", self.0.finalize())
+    }
 }
 
 pub fn plan(request: EnforcementRequest<'_>) -> io::Result<EnforcementPlan> {
@@ -134,7 +164,7 @@ pub fn plan(request: EnforcementRequest<'_>) -> io::Result<EnforcementPlan> {
     } else {
         select_required_gates(request.action, &contract.gate_sources, &mut diagnostics)
     };
-    let contract_digest = contract_digest(request.root, request.config_dir)?;
+    let contract_digest = contract.contract_digest;
     let workspace_fingerprint = workspace_fingerprint(request.root)?;
     let receipts: Vec<ReceiptStatus> = selected_gates
         .iter()
@@ -280,34 +310,42 @@ fn load_contract(root: &Path, config_dir: Option<&Path>) -> io::Result<Effective
     let mut policies = Vec::new();
     let mut gate_sources = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut digest = ContractDigest::new();
 
     if let Some(config_dir) = config_dir {
         load_policy_path(
-            &config_dir.join(USER_POLICY_FILE),
+            config_dir,
+            Path::new(USER_POLICY_FILE),
             "user policy",
             false,
             &mut policies,
             &mut diagnostics,
+            &mut digest,
         )?;
+    } else {
+        digest.record("user policy", None);
     }
     load_policy_path(
-        &root.join(REPOSITORY_POLICY_PATH),
+        root,
+        Path::new(REPOSITORY_POLICY_PATH),
         "repository policy",
         true,
         &mut policies,
         &mut diagnostics,
+        &mut digest,
     )?;
     load_gates_path(
-        &root.join(REPOSITORY_GATES_PATH),
+        root,
+        Path::new(REPOSITORY_GATES_PATH),
         "repository gates",
         true,
         &mut gate_sources,
         &mut diagnostics,
+        &mut digest,
     )?;
 
-    let workflow_path = root.join(WORKFLOW_PATH);
-    match fs::read_to_string(&workflow_path) {
-        Ok(text) => {
+    match read_contract_text(root, Path::new(WORKFLOW_PATH), "workflow", &mut digest) {
+        Ok(Some(text)) => {
             let compiled = beislid_import::compile_text(&text, WORKFLOW_PATH);
             diagnostics.extend(compiled.diagnostics);
             if let Some(value) = compiled.modules.get("policy") {
@@ -324,8 +362,12 @@ fn load_contract(root: &Path, config_dir: Option<&Path>) -> io::Result<Effective
                 gate_sources.push(("workflow gates".to_owned(), document));
             }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Ok(None) => {}
+        Err(error) => diagnostics.push(Diagnostic::error(
+            Code::ModuleParseError,
+            WORKFLOW_PATH,
+            format!("could not read confined workflow authority: {error}"),
+        )),
     }
 
     crate::diagnostics::sort(&mut diagnostics);
@@ -333,20 +375,40 @@ fn load_contract(root: &Path, config_dir: Option<&Path>) -> io::Result<Effective
         policies,
         gate_sources,
         diagnostics,
+        contract_digest: digest.finish(),
     })
 }
 
+fn read_contract_text(
+    directory: &Path,
+    relative: &Path,
+    label: &str,
+    digest: &mut ContractDigest,
+) -> io::Result<Option<String>> {
+    let bytes = crate::confined_read::read_bytes(directory, relative, 1024 * 1024)?;
+    digest.record(label, bytes.as_deref());
+    bytes
+        .map(|bytes| {
+            String::from_utf8(bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        })
+        .transpose()
+}
+
 fn load_policy_path(
-    path: &Path,
+    directory: &Path,
+    relative: &Path,
     source: &str,
     required: bool,
     policies: &mut Vec<(String, PolicyDoc)>,
     diagnostics: &mut Vec<Diagnostic>,
+    digest: &mut ContractDigest,
 ) -> io::Result<()> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound && !required => return Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    let path = directory.join(relative);
+    let text = match read_contract_text(directory, relative, source, digest) {
+        Ok(Some(text)) => text,
+        Ok(None) if !required => return Ok(()),
+        Ok(None) => {
             diagnostics.push(Diagnostic::error(
                 Code::ModuleMissing,
                 path.display().to_string(),
@@ -354,7 +416,14 @@ fn load_policy_path(
             ));
             return Ok(());
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                Code::ModuleParseError,
+                path.display().to_string(),
+                format!("could not read confined {source}: {error}"),
+            ));
+            return Ok(());
+        }
     };
     match crate::config::parse_jsonc(&text, &path.display().to_string(), Code::ModuleParseError) {
         Ok(value) => {
@@ -371,16 +440,19 @@ fn load_policy_path(
 }
 
 fn load_gates_path(
-    path: &Path,
+    directory: &Path,
+    relative: &Path,
     source: &str,
     required: bool,
     gates_out: &mut Vec<(String, GatesConfig)>,
     diagnostics: &mut Vec<Diagnostic>,
+    digest: &mut ContractDigest,
 ) -> io::Result<()> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound && !required => return Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    let path = directory.join(relative);
+    let text = match read_contract_text(directory, relative, source, digest) {
+        Ok(Some(text)) => text,
+        Ok(None) if !required => return Ok(()),
+        Ok(None) => {
             diagnostics.push(Diagnostic::error(
                 Code::ModuleMissing,
                 path.display().to_string(),
@@ -388,7 +460,14 @@ fn load_gates_path(
             ));
             return Ok(());
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                Code::ModuleParseError,
+                path.display().to_string(),
+                format!("could not read confined {source}: {error}"),
+            ));
+            return Ok(());
+        }
     };
     let (document, source_diagnostics) = gates::parse_gates(&text, &path.display().to_string());
     diagnostics.extend(source_diagnostics);
@@ -413,9 +492,28 @@ fn select_required_gates(
     let Some(stage) = action_stage(action) else {
         return Vec::new();
     };
+    let selections = gate_sources
+        .iter()
+        .map(|(source, gates)| (source, gates, selection::select(gates, stage.clone(), &[])))
+        .collect::<Vec<_>>();
+    // Authority suppresses generated defaults only when same-stage explicit
+    // proof was actually selected. Selector-scoped declarations that match no
+    // changed file cannot turn a protected action into a zero-gate action.
+    let selected_explicit_authority = selections.iter().any(|(_, gates, selection)| {
+        let generated = gates.generated_gate_ids();
+        selection
+            .selected
+            .iter()
+            .any(|gate| !generated.contains(gate.id.as_str()))
+    });
     let mut selected: Vec<(String, SelectedGate)> = Vec::new();
-    for (source, gates) in gate_sources {
-        for gate in selection::select(gates, stage.clone(), &[]).selected {
+    for (source, gates, selection) in selections {
+        let generated = gates.generated_gate_ids();
+        for gate in selection
+            .selected
+            .into_iter()
+            .filter(|gate| !(selected_explicit_authority && generated.contains(gate.id.as_str())))
+        {
             if let Some((previous_source, previous)) =
                 selected.iter().find(|(_, existing)| existing.id == gate.id)
             {
@@ -451,39 +549,6 @@ fn gate_semantics(gate: &SelectedGate) -> Value {
 
 fn gate_digest(gate: &SelectedGate) -> String {
     digest_bytes(&serde_json::to_vec(&gate_semantics(gate)).unwrap_or_default())
-}
-
-fn contract_digest(root: &Path, config_dir: Option<&Path>) -> io::Result<String> {
-    let mut hasher = Sha256::new();
-    let sources: [(PathBuf, &str); 3] = [
-        (
-            config_dir
-                .map(|directory| directory.join(USER_POLICY_FILE))
-                .unwrap_or_default(),
-            "user-policy",
-        ),
-        (root.join(REPOSITORY_POLICY_PATH), "repository-policy"),
-        (root.join(REPOSITORY_GATES_PATH), "repository-gates"),
-    ];
-    for (path, label) in sources {
-        hasher.update(label.as_bytes());
-        if !path.as_os_str().is_empty() {
-            match fs::read(path) {
-                Ok(bytes) => hasher.update(bytes),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    hasher.update(b"<missing>")
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-    hasher.update(WORKFLOW_PATH.as_bytes());
-    match fs::read(root.join(WORKFLOW_PATH)) {
-        Ok(bytes) => hasher.update(bytes),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => hasher.update(b"<missing>"),
-        Err(error) => return Err(error),
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Fingerprint the revision and every pending Git-visible content change.
@@ -803,4 +868,42 @@ pub fn generate_receipt_key() -> io::Result<String> {
 
 fn digest_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Path, text: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn loaded_contract_digest_is_bound_to_the_same_bytes_as_parsed_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        write(
+            &temp.path().join(REPOSITORY_POLICY_PATH),
+            r#"{"version":"nopal.policy/v1","modes":{}}"#,
+        );
+        let gates = temp.path().join(REPOSITORY_GATES_PATH);
+        write(
+            &gates,
+            r#"{"version":"nopal.gates/v1","gates":[{"id":"first","stage":"pre_pr","argv":["true"]}]}"#,
+        );
+
+        let first = load_contract(temp.path(), None).unwrap();
+        write(
+            &gates,
+            r#"{"version":"nopal.gates/v1","gates":[{"id":"second","stage":"pre_pr","argv":["false"]}]}"#,
+        );
+        let second = load_contract(temp.path(), None).unwrap();
+
+        assert_eq!(first.gate_sources[0].1.gates[0].id, "first");
+        assert_eq!(second.gate_sources[0].1.gates[0].id, "second");
+        assert_ne!(first.contract_digest, second.contract_digest);
+    }
 }

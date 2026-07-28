@@ -15,7 +15,7 @@ use same_file::Handle;
 
 use crate::diagnostics::{Code, Severity};
 use crate::run_ledger_store::token_hex;
-use crate::{discover, distribution, gates, policy};
+use crate::{discover, distribution, gate_scaffold, gates, policy};
 
 const BASELINE_MANIFEST: &str = r#"{
   // Created by Nopal for a portable enforced Pi project.
@@ -43,14 +43,6 @@ const BASELINE_POLICY: &str = r#"{
       ]
     }
   }
-}
-"#;
-
-const BASELINE_GATES: &str = r#"{
-  "version": "nopal.gates/v1",
-  "gates": [
-    { "id": "diff-check", "stage": "pre_pr", "command": "git diff --check" }
-  ]
 }
 "#;
 
@@ -91,6 +83,7 @@ pub struct BaselineFile {
 pub struct Baseline {
     pub files: Vec<BaselineFile>,
     pub source: ScaffoldSource,
+    pub gate_scaffold: gate_scaffold::GateScaffoldPlan,
 }
 
 impl Baseline {
@@ -140,10 +133,12 @@ pub fn build_baseline(
         },
     )?;
     let lock_text = distribution::lock_json(&lock).map_err(io::Error::other)?;
+    let gate_scaffold = gate_scaffold::inspect(&root)?;
+    let gates_text = gate_scaffold.gates_json().map_err(io::Error::other)?;
 
     let (_, manifest_diagnostics) =
         crate::config::parse_manifest(BASELINE_MANIFEST, &discover::manifest_rel_path());
-    let (_, gate_diagnostics) = gates::parse_gates(BASELINE_GATES, ".nopal/gates.jsonc");
+    let (_, gate_diagnostics) = gates::parse_gates(&gates_text, ".nopal/gates.jsonc");
     let mut validation_diagnostics = manifest_diagnostics;
     validation_diagnostics.extend(gate_diagnostics);
     match crate::config::parse_jsonc(
@@ -183,7 +178,7 @@ pub fn build_baseline(
             },
             BaselineFile {
                 rel_path: ".nopal/gates.jsonc".to_owned(),
-                text: BASELINE_GATES.to_owned(),
+                text: gates_text,
             },
             BaselineFile {
                 rel_path: distribution::BUNDLE_PATH.to_owned(),
@@ -199,6 +194,7 @@ pub fn build_baseline(
             },
         ],
         source: ScaffoldSource::BuiltinDistribution,
+        gate_scaffold,
     })
 }
 
@@ -213,6 +209,22 @@ pub fn write_baseline(
     reject_existing_project_state(&root)?;
 
     let baseline = build_baseline(&root, builtin)?;
+    write_planned_baseline(&root, baseline)
+}
+
+/// Persist the already-inspected baseline used by launch preview. Repository
+/// evidence is not rediscovered between the decision and the capability-based
+/// transaction.
+pub fn write_planned_baseline(root: &Path, baseline: Baseline) -> io::Result<Scaffolded> {
+    if !baseline.gate_scaffold.ok
+        || baseline.gate_scaffold.readiness == gate_scaffold::Readiness::Blocked
+    {
+        return Err(io::Error::other(
+            "refusing to publish a baseline with blocked gate detection",
+        ));
+    }
+    let root = std::path::absolute(root)?;
+    reject_existing_project_state(&root)?;
     write_built_baseline(&root, baseline)
 }
 
