@@ -5,7 +5,6 @@
 //! launch writes only when this plan reports `WouldCreate`, then re-runs this
 //! same planner against the committed files before executing anything.
 
-use std::fs;
 use std::io;
 use std::path::Path;
 
@@ -150,56 +149,51 @@ fn plan_configured(dir: &Path, context: LaunchContext<'_>) -> io::Result<LaunchP
 }
 
 fn checked_in_gates_ready(dir: &Path) -> io::Result<(bool, Vec<Diagnostic>)> {
-    let gates_path = dir.join(".nopal/gates.jsonc");
-    let gates_text = fs::read_to_string(&gates_path)?;
+    let gates_text =
+        nopal_core::confined_read::read_utf8(dir, Path::new(".nopal/gates.jsonc"), 1024 * 1024)?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "repository gates are missing")
+            })?;
     let (config, mut diagnostics) =
         nopal_core::gates::parse_gates(&gates_text, ".nopal/gates.jsonc");
     let Some(config) = config else {
         return Ok((false, diagnostics));
     };
 
-    let workflow_path = dir.join(".beislid/workflow.md");
-    let workflow_text = fs::read_to_string(&workflow_path)?;
+    let workflow_text =
+        nopal_core::confined_read::read_utf8(dir, Path::new(".beislid/workflow.md"), 1024 * 1024)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "workflow is missing"))?;
     let compiled = nopal_core::beislid_import::compile_text(&workflow_text, ".beislid/workflow.md");
     let beislid_explicit = compiled.modules.get("gates").is_some_and(|value| {
         value
             .get("gates")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|items| !items.is_empty())
-            || value
-                .get("preflights")
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|items| !items.is_empty())
+            .is_some_and(|items| {
+                items.iter().any(|gate| {
+                    gate.get("stage").and_then(serde_json::Value::as_str) == Some("pre_pr")
+                })
+            })
     });
     diagnostics.extend(compiled.diagnostics);
 
     let ready = match &config.scaffold {
-        None => !config.gates.is_empty() || !config.preflights.is_empty(),
+        None => config.has_explicit_gates_for_stage(&nopal_core::gates::GateStage::PrePr),
         Some(provenance) => {
             let generated = provenance
                 .generated_gate_ids
                 .iter()
                 .map(String::as_str)
                 .collect::<std::collections::BTreeSet<_>>();
-            let nopal_explicit = config
-                .gates
-                .iter()
-                .any(|gate| !generated.contains(gate.id.as_str()));
+            let nopal_explicit = config.gates.iter().any(|gate| {
+                gate.stage == nopal_core::gates::GateStage::PrePr
+                    && !generated.contains(gate.id.as_str())
+            });
             if nopal_explicit || beislid_explicit {
                 true
             } else {
                 let detected = nopal_core::gate_scaffold::inspect(dir)?;
                 diagnostics.extend(detected.diagnostics.clone());
-                let expected_text = detected.gates_json().map_err(io::Error::other)?;
-                let expected = serde_json::from_str::<serde_json::Value>(&expected_text)
-                    .map_err(io::Error::other)?;
-                let actual = nopal_core::config::parse_jsonc(
-                    &gates_text,
-                    ".nopal/gates.jsonc",
-                    Code::ModuleParseError,
-                );
-                let matches_current_evidence =
-                    actual.as_ref().is_ok_and(|actual| actual == &expected);
+                let matches_current_evidence = detected.matches_checked_generated(&gates_text);
                 if !matches_current_evidence {
                     diagnostics.push(Diagnostic::error(
                         Code::GateScaffoldDrift,

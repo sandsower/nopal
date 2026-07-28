@@ -144,11 +144,12 @@ pub fn select(config: &GatesConfig, stage: GateStage, changed_files: &[String]) 
         }
     }
 
-    let suppressed_generated = if config.has_explicit_gates() && config.scaffold.is_some() {
-        config.generated_gate_ids()
-    } else {
-        std::collections::BTreeSet::new()
-    };
+    let suppressed_generated =
+        if config.has_explicit_gates_for_stage(&stage) && config.scaffold.is_some() {
+            config.generated_gate_ids()
+        } else {
+            std::collections::BTreeSet::new()
+        };
     let mut selected = Vec::new();
     let mut skipped = Vec::new();
 

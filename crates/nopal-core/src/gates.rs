@@ -210,12 +210,19 @@ impl GatesConfig {
     pub fn has_explicit_gates(&self) -> bool {
         let generated = self.generated_gate_ids();
         if self.scaffold.is_none() {
-            return !self.gates.is_empty() || !self.preflights.is_empty();
+            return !self.gates.is_empty();
         }
         self.gates
             .iter()
             .any(|gate| !generated.contains(gate.id.as_str()))
-            || !self.preflights.is_empty()
+    }
+
+    pub fn has_explicit_gates_for_stage(&self, stage: &GateStage) -> bool {
+        let generated = self.generated_gate_ids();
+        self.gates.iter().any(|gate| {
+            &gate.stage == stage
+                && (self.scaffold.is_none() || !generated.contains(gate.id.as_str()))
+        })
     }
 }
 

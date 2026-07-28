@@ -283,7 +283,8 @@ fn load_contract(root: &Path, config_dir: Option<&Path>) -> io::Result<Effective
 
     if let Some(config_dir) = config_dir {
         load_policy_path(
-            &config_dir.join(USER_POLICY_FILE),
+            config_dir,
+            Path::new(USER_POLICY_FILE),
             "user policy",
             false,
             &mut policies,
@@ -291,23 +292,24 @@ fn load_contract(root: &Path, config_dir: Option<&Path>) -> io::Result<Effective
         )?;
     }
     load_policy_path(
-        &root.join(REPOSITORY_POLICY_PATH),
+        root,
+        Path::new(REPOSITORY_POLICY_PATH),
         "repository policy",
         true,
         &mut policies,
         &mut diagnostics,
     )?;
     load_gates_path(
-        &root.join(REPOSITORY_GATES_PATH),
+        root,
+        Path::new(REPOSITORY_GATES_PATH),
         "repository gates",
         true,
         &mut gate_sources,
         &mut diagnostics,
     )?;
 
-    let workflow_path = root.join(WORKFLOW_PATH);
-    match fs::read_to_string(&workflow_path) {
-        Ok(text) => {
+    match crate::confined_read::read_utf8(root, Path::new(WORKFLOW_PATH), 1024 * 1024) {
+        Ok(Some(text)) => {
             let compiled = beislid_import::compile_text(&text, WORKFLOW_PATH);
             diagnostics.extend(compiled.diagnostics);
             if let Some(value) = compiled.modules.get("policy") {
@@ -324,8 +326,12 @@ fn load_contract(root: &Path, config_dir: Option<&Path>) -> io::Result<Effective
                 gate_sources.push(("workflow gates".to_owned(), document));
             }
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+        Ok(None) => {}
+        Err(error) => diagnostics.push(Diagnostic::error(
+            Code::ModuleParseError,
+            WORKFLOW_PATH,
+            format!("could not read confined workflow authority: {error}"),
+        )),
     }
 
     crate::diagnostics::sort(&mut diagnostics);
@@ -337,16 +343,18 @@ fn load_contract(root: &Path, config_dir: Option<&Path>) -> io::Result<Effective
 }
 
 fn load_policy_path(
-    path: &Path,
+    directory: &Path,
+    relative: &Path,
     source: &str,
     required: bool,
     policies: &mut Vec<(String, PolicyDoc)>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> io::Result<()> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound && !required => return Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    let path = directory.join(relative);
+    let text = match crate::confined_read::read_utf8(directory, relative, 1024 * 1024) {
+        Ok(Some(text)) => text,
+        Ok(None) if !required => return Ok(()),
+        Ok(None) => {
             diagnostics.push(Diagnostic::error(
                 Code::ModuleMissing,
                 path.display().to_string(),
@@ -354,7 +362,14 @@ fn load_policy_path(
             ));
             return Ok(());
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                Code::ModuleParseError,
+                path.display().to_string(),
+                format!("could not read confined {source}: {error}"),
+            ));
+            return Ok(());
+        }
     };
     match crate::config::parse_jsonc(&text, &path.display().to_string(), Code::ModuleParseError) {
         Ok(value) => {
@@ -371,16 +386,18 @@ fn load_policy_path(
 }
 
 fn load_gates_path(
-    path: &Path,
+    directory: &Path,
+    relative: &Path,
     source: &str,
     required: bool,
     gates_out: &mut Vec<(String, GatesConfig)>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> io::Result<()> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound && !required => return Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    let path = directory.join(relative);
+    let text = match crate::confined_read::read_utf8(directory, relative, 1024 * 1024) {
+        Ok(Some(text)) => text,
+        Ok(None) if !required => return Ok(()),
+        Ok(None) => {
             diagnostics.push(Diagnostic::error(
                 Code::ModuleMissing,
                 path.display().to_string(),
@@ -388,7 +405,14 @@ fn load_gates_path(
             ));
             return Ok(());
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                Code::ModuleParseError,
+                path.display().to_string(),
+                format!("could not read confined {source}: {error}"),
+            ));
+            return Ok(());
+        }
     };
     let (document, source_diagnostics) = gates::parse_gates(&text, &path.display().to_string());
     diagnostics.extend(source_diagnostics);
@@ -415,7 +439,7 @@ fn select_required_gates(
     };
     let explicit_authority = gate_sources
         .iter()
-        .any(|(_, gates)| gates.has_explicit_gates());
+        .any(|(_, gates)| gates.has_explicit_gates_for_stage(&stage));
     let mut selected: Vec<(String, SelectedGate)> = Vec::new();
     for (source, gates) in gate_sources {
         let suppressed_generated = if explicit_authority && gates.scaffold.is_some() {

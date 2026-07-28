@@ -15,6 +15,7 @@ pub mod ask_store;
 pub mod beislid_import;
 pub mod bundle;
 pub mod config;
+pub mod confined_read;
 pub mod diagnostics;
 pub mod discover;
 pub mod distribution;

@@ -6,10 +6,9 @@
 //! workspaces.
 
 use std::fs;
-use std::io::{self, Read as _};
+use std::io;
 use std::path::Path;
 
-use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostics::{Code, Diagnostic, Severity};
@@ -209,6 +208,47 @@ impl GateScaffoldPlan {
             text
         })
     }
+
+    /// Compare only generated provenance and generated gate definitions.
+    /// Explicit gates and their selectors are separate checked-in authority and
+    /// must not look like detector drift merely because they share the document.
+    pub fn matches_checked_generated(&self, checked_text: &str) -> bool {
+        let Ok(actual) =
+            crate::config::parse_jsonc(checked_text, ".nopal/gates.jsonc", Code::ModuleParseError)
+        else {
+            return false;
+        };
+        let Ok(expected_text) = self.gates_json() else {
+            return false;
+        };
+        let Ok(expected) = serde_json::from_str::<serde_json::Value>(&expected_text) else {
+            return false;
+        };
+        let generated_ids = actual
+            .get("scaffold")
+            .and_then(|scaffold| scaffold.get("generated_gate_ids"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let generated_gates = |document: &serde_json::Value| {
+            document
+                .get("gates")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|gate| {
+                    gate.get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| generated_ids.contains(id))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        actual.get("scaffold") == expected.get("scaffold")
+            && generated_gates(&actual) == generated_gates(&expected)
+    }
 }
 
 /// Inspect root evidence and only those nested scopes named by root manifests.
@@ -260,74 +300,72 @@ pub fn inspect_with_checked_in_authority(root: &Path) -> io::Result<GateScaffold
     let mut generated_checked_text = None;
     let mut authority_diagnostics = Vec::new();
 
-    let gates_path = root.join(".nopal/gates.jsonc");
-    if gates_path.exists() {
-        match fs::read_to_string(&gates_path) {
-            Ok(text) => {
-                let (config, diagnostics) = crate::gates::parse_gates(&text, ".nopal/gates.jsonc");
-                authority_diagnostics.extend(diagnostics);
-                if let Some(config) = config {
-                    let generated = config
-                        .scaffold
-                        .as_ref()
-                        .map(|provenance| {
-                            provenance
-                                .generated_gate_ids
-                                .iter()
-                                .map(String::as_str)
-                                .collect::<std::collections::BTreeSet<_>>()
-                        })
-                        .unwrap_or_default();
-                    nopal_explicit.extend(
-                        config
-                            .gates
+    match crate::confined_read::read_utf8(root, Path::new(".nopal/gates.jsonc"), 1024 * 1024) {
+        Ok(Some(text)) => {
+            let (config, diagnostics) = crate::gates::parse_gates(&text, ".nopal/gates.jsonc");
+            authority_diagnostics.extend(diagnostics);
+            if let Some(config) = config {
+                let generated = config
+                    .scaffold
+                    .as_ref()
+                    .map(|provenance| {
+                        provenance
+                            .generated_gate_ids
                             .iter()
-                            .filter(|gate| {
-                                config.scaffold.is_none() || !generated.contains(gate.id.as_str())
-                            })
-                            .map(|gate| gate.id.clone()),
-                    );
-                    nopal_explicit.extend(config.preflights.iter().map(|gate| gate.id.clone()));
-                    if config.scaffold.is_some() && nopal_explicit.is_empty() {
-                        generated_checked_text = Some(text.clone());
-                    }
+                            .map(String::as_str)
+                            .collect::<std::collections::BTreeSet<_>>()
+                    })
+                    .unwrap_or_default();
+                nopal_explicit.extend(
+                    config
+                        .gates
+                        .iter()
+                        .filter(|gate| {
+                            gate.stage == crate::gates::GateStage::PrePr
+                                && (config.scaffold.is_none()
+                                    || !generated.contains(gate.id.as_str()))
+                        })
+                        .map(|gate| gate.id.clone()),
+                );
+                if config.scaffold.is_some() && nopal_explicit.is_empty() {
+                    generated_checked_text = Some(text.clone());
                 }
             }
-            Err(error) => authority_diagnostics.push(Diagnostic::error(
-                Code::GateScaffoldEvidenceInvalid,
-                ".nopal/gates.jsonc",
-                format!("could not read explicit Nopal gates: {error}"),
-            )),
         }
+        Ok(None) => {}
+        Err(error) => authority_diagnostics.push(Diagnostic::error(
+            Code::GateScaffoldEvidenceInvalid,
+            ".nopal/gates.jsonc",
+            format!("could not read explicit Nopal gates: {error}"),
+        )),
     }
 
-    let workflow_path = root.join(".beislid/workflow.md");
-    if workflow_path.exists() {
-        match fs::read_to_string(&workflow_path) {
-            Ok(text) => {
-                let compiled = crate::beislid_import::compile_text(&text, ".beislid/workflow.md");
-                authority_diagnostics.extend(compiled.diagnostics);
-                if let Some(value) = compiled.modules.get("gates") {
-                    for field in ["gates", "preflights"] {
-                        beislid_explicit.extend(
-                            value
-                                .get(field)
-                                .and_then(serde_json::Value::as_array)
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|entry| entry.get("id").or_else(|| entry.get("name")))
-                                .filter_map(serde_json::Value::as_str)
-                                .map(ToOwned::to_owned),
-                        );
-                    }
-                }
+    match crate::confined_read::read_utf8(root, Path::new(".beislid/workflow.md"), 1024 * 1024) {
+        Ok(Some(text)) => {
+            let compiled = crate::beislid_import::compile_text(&text, ".beislid/workflow.md");
+            authority_diagnostics.extend(compiled.diagnostics);
+            if let Some(value) = compiled.modules.get("gates") {
+                beislid_explicit.extend(
+                    value
+                        .get("gates")
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter(|entry| {
+                            entry.get("stage").and_then(serde_json::Value::as_str) == Some("pre_pr")
+                        })
+                        .filter_map(|entry| entry.get("id").or_else(|| entry.get("name")))
+                        .filter_map(serde_json::Value::as_str)
+                        .map(ToOwned::to_owned),
+                );
             }
-            Err(error) => authority_diagnostics.push(Diagnostic::error(
-                Code::GateScaffoldEvidenceInvalid,
-                ".beislid/workflow.md",
-                format!("could not read typed Beislið gate authority: {error}"),
-            )),
         }
+        Ok(None) => {}
+        Err(error) => authority_diagnostics.push(Diagnostic::error(
+            Code::GateScaffoldEvidenceInvalid,
+            ".beislid/workflow.md",
+            format!("could not read typed Beislið gate authority: {error}"),
+        )),
     }
 
     if !nopal_explicit.is_empty() || !beislid_explicit.is_empty() {
@@ -378,21 +416,13 @@ pub fn inspect_with_checked_in_authority(root: &Path) -> io::Result<GateScaffold
     if nopal_explicit.is_empty()
         && beislid_explicit.is_empty()
         && let Some(checked_text) = generated_checked_text
+        && !plan.matches_checked_generated(&checked_text)
     {
-        let expected = plan
-            .gates_json()
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
-        let actual =
-            crate::config::parse_jsonc(&checked_text, ".nopal/gates.jsonc", Code::ModuleParseError)
-                .ok();
-        if expected != actual {
-            authority_diagnostics.push(Diagnostic::error(
-                Code::GateScaffoldDrift,
-                ".nopal/gates.jsonc",
-                "checked-in generated gates do not match current detection evidence",
-            ));
-        }
+        authority_diagnostics.push(Diagnostic::error(
+            Code::GateScaffoldDrift,
+            ".nopal/gates.jsonc",
+            "checked-in generated gates do not match current detection evidence",
+        ));
     }
     plan.diagnostics.extend(authority_diagnostics);
     crate::diagnostics::sort(&mut plan.diagnostics);
@@ -625,8 +655,9 @@ fn hex_prefix(bytes: &[u8], count: usize) -> String {
 }
 
 fn root_package_manager_hint(root: &Path) -> Option<PackageManagerChoice> {
-    let package = fs::read_to_string(root.join("package.json"))
+    let package = crate::confined_read::read_utf8(root, Path::new("package.json"), 1024 * 1024)
         .ok()
+        .flatten()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
     let candidates = [
         ("javascript.npm/v1", "npm", "package-lock.json"),
@@ -638,8 +669,7 @@ fn root_package_manager_hint(root: &Path) -> Option<PackageManagerChoice> {
     let mut found = candidates
         .iter()
         .filter(|candidate| {
-            fs::symlink_metadata(root.join(candidate.2))
-                .is_ok_and(|metadata| metadata.file_type().is_file())
+            crate::confined_read::regular_file_exists(root, Path::new(candidate.2)).unwrap_or(false)
         })
         .collect::<Vec<_>>();
     found.dedup_by_key(|candidate| candidate.0);
@@ -2255,99 +2285,17 @@ fn read_optional_evidence(
     relative: &str,
     plan: &mut GateScaffoldPlan,
 ) -> io::Result<Option<String>> {
-    const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
-    let directory = match open_evidence_directory(root) {
-        Ok(directory) => directory,
+    match crate::confined_read::read_utf8(root, Path::new(relative), 1024 * 1024) {
+        Ok(text) => Ok(text),
         Err(error) => {
             block_invalid_evidence(
                 plan,
                 relative,
-                format!("could not hold the evidence scope directory: {error}"),
-            );
-            return Ok(None);
-        }
-    };
-    let mut options = CapOpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = match directory.open_with(relative, &options) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            block_invalid_evidence(
-                plan,
-                relative,
-                format!("could not open regular no-follow ecosystem evidence: {error}"),
-            );
-            return Ok(None);
-        }
-    };
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        block_invalid_evidence(
-            plan,
-            relative,
-            "ecosystem evidence must remain a regular non-symlink file".to_owned(),
-        );
-        return Ok(None);
-    }
-    let mut bytes = Vec::new();
-    file.by_ref()
-        .take((MAX_EVIDENCE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_EVIDENCE_BYTES {
-        block_invalid_evidence(
-            plan,
-            relative,
-            "ecosystem manifest exceeds the 1 MiB detection limit".to_owned(),
-        );
-        return Ok(None);
-    }
-    match String::from_utf8(bytes) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) => {
-            block_invalid_evidence(
-                plan,
-                relative,
-                format!("ecosystem manifest is not UTF-8: {error}"),
+                format!("could not read confined ecosystem evidence: {error}"),
             );
             Ok(None)
         }
     }
-}
-
-fn open_evidence_directory(root: &Path) -> io::Result<Dir> {
-    let metadata = fs::symlink_metadata(root)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(io::Error::other(
-            "evidence scope must be a regular non-symlink directory",
-        ));
-    }
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt as _;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let directory = options.open(root)?;
-    if !directory.metadata()?.is_dir() {
-        return Err(io::Error::other(
-            "evidence scope changed while it was opened",
-        ));
-    }
-    Ok(Dir::from_std_file(directory))
 }
 
 fn root_files_with_extensions(root: &Path, extensions: &[&str]) -> io::Result<Vec<String>> {

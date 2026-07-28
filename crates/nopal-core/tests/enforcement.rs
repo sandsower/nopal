@@ -82,6 +82,58 @@ fn explicit_nopal_or_beislid_gates_supersede_generated_templates() {
 }
 
 #[test]
+#[cfg(unix)]
+fn symlinked_authority_files_and_directories_fail_closed_without_following_targets() {
+    use std::os::unix::fs::symlink;
+
+    for authority in ["gates", "workflow", "directory"] {
+        let temp = tempfile::tempdir().unwrap();
+        project(temp.path());
+        let outside = temp.path().join(format!("outside-{authority}"));
+        if authority == "gates" {
+            write(
+                &outside,
+                r#"{"version":"nopal.gates/v1","gates":[{"id":"outside","stage":"pre_pr","argv":["true"]}]}"#,
+            );
+            fs::remove_file(temp.path().join(".nopal/gates.jsonc")).unwrap();
+            symlink(&outside, temp.path().join(".nopal/gates.jsonc")).unwrap();
+        } else if authority == "workflow" {
+            write(
+                &outside,
+                "```beislid:gates\n- name: outside\n  command: 'cargo test'\n```\n",
+            );
+            fs::create_dir_all(temp.path().join(".beislid")).unwrap();
+            symlink(&outside, temp.path().join(".beislid/workflow.md")).unwrap();
+        } else {
+            write(
+                &outside.join("policy.jsonc"),
+                &fs::read_to_string(temp.path().join(".nopal/policy.jsonc")).unwrap(),
+            );
+            write(
+                &outside.join("gates.jsonc"),
+                r#"{"version":"nopal.gates/v1","gates":[{"id":"outside","stage":"pre_pr","argv":["true"]}]}"#,
+            );
+            fs::remove_dir_all(temp.path().join(".nopal")).unwrap();
+            symlink(&outside, temp.path().join(".nopal")).unwrap();
+        }
+        let report = enforcement::plan(EnforcementRequest {
+            root: temp.path(),
+            config_dir: None,
+            mode: Mode::SupervisedAuto,
+            action: "git.push",
+            classes: &[ActionClass::GitRemote],
+            run_dir: None,
+            receipt_key: None,
+        })
+        .unwrap();
+        assert!(!report.ok, "{authority}: {:?}", report.diagnostics);
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == nopal_core::diagnostics::Code::ModuleParseError
+        }));
+    }
+}
+
+#[test]
 fn normal_push_requires_pre_pr_gate_while_force_push_is_denied() {
     let temp = tempfile::tempdir().unwrap();
     project(temp.path());

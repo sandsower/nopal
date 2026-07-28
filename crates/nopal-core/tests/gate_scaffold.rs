@@ -148,6 +148,76 @@ fn explicit_gate_selection_suppresses_generated_template_gates() {
 }
 
 #[test]
+fn preflight_only_authority_does_not_suppress_generated_pre_pr_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(temp.path(), &[("Cargo.toml", "[workspace]\nmembers=[]\n")]);
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&plan.gates_json().unwrap()).unwrap();
+    value["preflights"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "readiness",
+            "stage": "run_start",
+            "argv": ["true"]
+        }));
+    let (config, diagnostics) = nopal_core::gates::parse_gates(
+        &serde_json::to_string(&value).unwrap(),
+        ".nopal/gates.jsonc",
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let config = config.unwrap();
+    assert!(!config.has_explicit_gates());
+    let selected = nopal_core::selection::select(&config, nopal_core::gates::GateStage::PrePr, &[]);
+    assert!(
+        selected
+            .selected
+            .iter()
+            .any(|gate| gate.id.contains("cargo-test"))
+    );
+    assert!(
+        !selected
+            .skipped
+            .iter()
+            .any(|gate| { gate.reason.as_str() == "superseded_by_explicit_authority" })
+    );
+}
+
+#[test]
+fn explicit_gate_precedence_is_limited_to_the_same_stage() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(temp.path(), &[("Cargo.toml", "[workspace]\nmembers=[]\n")]);
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&plan.gates_json().unwrap()).unwrap();
+    value["gates"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "post-release",
+            "stage": "post_pr",
+            "argv": ["true"]
+        }));
+    let checked = serde_json::to_string(&value).unwrap();
+    assert!(plan.matches_checked_generated(&checked));
+    let (config, diagnostics) = nopal_core::gates::parse_gates(&checked, ".nopal/gates.jsonc");
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let selected =
+        nopal_core::selection::select(&config.unwrap(), nopal_core::gates::GateStage::PrePr, &[]);
+    assert!(
+        selected
+            .selected
+            .iter()
+            .any(|gate| gate.id.contains("cargo-test"))
+    );
+    assert!(
+        !selected
+            .skipped
+            .iter()
+            .any(|gate| { gate.reason.as_str() == "superseded_by_explicit_authority" })
+    );
+}
+
+#[test]
 fn generated_unknown_baseline_cannot_claim_ready_without_an_explicit_gate() {
     let temp = tempfile::tempdir().unwrap();
     let plan = gate_scaffold::inspect(temp.path()).unwrap();
@@ -824,6 +894,23 @@ fn workspace_traversal_and_symlink_boundaries_fail_closed() {
     assert!(evidence_plan.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == nopal_core::diagnostics::Code::GateScaffoldEvidenceInvalid
     }));
+
+    let authority_root = temp.path().join("authority-root");
+    fs::create_dir_all(authority_root.join(".nopal")).unwrap();
+    write_files(
+        &authority_root,
+        &[("Cargo.toml", "[workspace]\nmembers=[]\n")],
+    );
+    let outside_gates = outside.path().join("gates.jsonc");
+    fs::write(
+        &outside_gates,
+        r#"{"version":"nopal.gates/v1","gates":[{"id":"outside","stage":"pre_pr","argv":["true"]}]}"#,
+    )
+    .unwrap();
+    symlink(&outside_gates, authority_root.join(".nopal/gates.jsonc")).unwrap();
+    let authority_plan = gate_scaffold::inspect_with_checked_in_authority(&authority_root).unwrap();
+    assert!(!authority_plan.ok);
+    assert_eq!(authority_plan.authority.as_str(), "generated");
 }
 
 #[test]
