@@ -179,6 +179,7 @@ fn reject_git_code_carriers(root: &Path) -> io::Result<()> {
         "GIT_CONFIG",
         "GIT_CONFIG_COUNT",
         "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_NOSYSTEM",
         "GIT_CONFIG_SYSTEM",
         "GIT_DIFF_OPTS",
         "GIT_DIR",
@@ -195,10 +196,18 @@ fn reject_git_code_carriers(root: &Path) -> io::Result<()> {
         "RIPGREP_CONFIG_PATH",
         "SSH_ASKPASS",
     ];
-    if let Some(name) = DANGEROUS_ENV
-        .iter()
-        .find(|name| std::env::var_os(name).is_some())
-    {
+    if let Some(name) = DANGEROUS_ENV.iter().find(|name| {
+        if std::env::var_os(name).is_none() {
+            return false;
+        }
+        let debug_clean_system_config = cfg!(debug_assertions)
+            && **name == "GIT_CONFIG_NOSYSTEM"
+            && std::env::var_os("GIT_CONFIG_NOSYSTEM").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            && std::env::var_os("NOPAL_TEST_CLEAN_GIT_CONFIG").as_deref()
+                == Some(std::ffi::OsStr::new("1"));
+        !debug_clean_system_config
+    }) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!(

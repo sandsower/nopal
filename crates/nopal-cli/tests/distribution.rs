@@ -35,7 +35,9 @@ impl Command {
         let mut command = StdCommand::new(program);
         command
             .env("HOME", home)
-            .env("XDG_CONFIG_HOME", home.join(".config"));
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("NOPAL_TEST_CLEAN_GIT_CONFIG", "1");
         Self(command)
     }
 }
