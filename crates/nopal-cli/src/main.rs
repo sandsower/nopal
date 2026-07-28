@@ -3195,7 +3195,7 @@ fn copy_pi_runtime_tree_portable(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "macos"))]
 fn harden_pi_runtime_tree(path: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
