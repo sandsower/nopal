@@ -562,6 +562,30 @@ fn root_workspace_aware_templates_do_not_duplicate_member_gates() {
 }
 
 #[test]
+fn root_templates_do_not_claim_workspaces_declared_by_another_ecosystem() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            ("Cargo.toml", "[package]\nname='root'\nversion='0.1.0'\n"),
+            ("package.json", r#"{"workspaces":["packages/app"]}"#),
+            (
+                "packages/app/Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\n",
+            ),
+        ],
+    );
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    let rust_scopes = plan
+        .templates
+        .iter()
+        .filter(|template| template.id == "rust.cargo/v1")
+        .map(|template| template.scope.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(rust_scopes, vec![".", "packages/app"]);
+}
+
+#[test]
 fn workspace_declarations_cover_cargo_pnpm_go_maven_gradle_and_dotnet_forms() {
     let cases: &[(&[(&str, &str)], &str)] = &[
         (

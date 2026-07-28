@@ -220,9 +220,14 @@ pub fn inspect(root: &Path) -> io::Result<GateScaffoldPlan> {
     let workspaces = discover_workspaces(&root, &mut plan)?;
     let mut unknown_workspace = false;
     for workspace in workspaces {
-        let child = inspect_scope(&root.join(&workspace), inherited_manager.as_ref())?;
+        let child = inspect_scope(&root.join(&workspace.path), inherited_manager.as_ref())?;
         unknown_workspace |= child.readiness == Readiness::NeedsConfiguration;
-        merge_workspace_plan(&mut plan, child, &workspace);
+        merge_workspace_plan(
+            &mut plan,
+            child,
+            &workspace.path,
+            &workspace.root_covering_templates,
+        );
     }
     if plan.readiness != Readiness::Blocked {
         plan.decisions.retain(|decision| {
@@ -462,7 +467,7 @@ fn select_baseline(plan: &mut GateScaffoldPlan) {
     });
 }
 
-const ROOT_WORKSPACE_COVERING_TEMPLATES: [&str; 8] = [
+const ROOT_WORKSPACE_COVERING_TEMPLATES: [&str; 7] = [
     "rust.cargo/v1",
     "elixir.mix/v1",
     "java.maven/v1",
@@ -470,10 +475,14 @@ const ROOT_WORKSPACE_COVERING_TEMPLATES: [&str; 8] = [
     "dotnet.test/v1",
     "cpp.cmake/v1",
     "cpp.meson/v1",
-    "swift.spm/v1",
 ];
 
-fn merge_workspace_plan(plan: &mut GateScaffoldPlan, mut child: GateScaffoldPlan, scope: &str) {
+fn merge_workspace_plan(
+    plan: &mut GateScaffoldPlan,
+    mut child: GateScaffoldPlan,
+    scope: &str,
+    declared_root_coverage: &std::collections::BTreeSet<&'static str>,
+) {
     let scope_id = scope_gate_id(scope);
     let root_templates = plan
         .templates
@@ -483,7 +492,9 @@ fn merge_workspace_plan(plan: &mut GateScaffoldPlan, mut child: GateScaffoldPlan
         .collect::<std::collections::BTreeSet<_>>();
     let covered_by_root = ROOT_WORKSPACE_COVERING_TEMPLATES
         .iter()
-        .filter(|template| root_templates.contains(**template))
+        .filter(|template| {
+            root_templates.contains(**template) && declared_root_coverage.contains(**template)
+        })
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
     for decision in &mut child.decisions {
@@ -623,12 +634,27 @@ fn root_package_manager_hint(root: &Path) -> Option<PackageManagerChoice> {
         })
 }
 
-fn discover_workspaces(root: &Path, plan: &mut GateScaffoldPlan) -> io::Result<Vec<String>> {
+struct DeclaredWorkspace {
+    path: String,
+    root_covering_templates: std::collections::BTreeSet<&'static str>,
+}
+
+fn discover_workspaces(
+    root: &Path,
+    plan: &mut GateScaffoldPlan,
+) -> io::Result<Vec<DeclaredWorkspace>> {
     let mut patterns = std::collections::BTreeSet::new();
+    let mut coverage_patterns = std::collections::BTreeMap::new();
     let mut excludes = std::collections::BTreeSet::new();
-    collect_toml_workspace_patterns(root, plan, &mut patterns, &mut excludes)?;
+    collect_toml_workspace_patterns(
+        root,
+        plan,
+        &mut patterns,
+        &mut coverage_patterns,
+        &mut excludes,
+    )?;
     collect_json_workspace_patterns(root, plan, &mut patterns)?;
-    collect_line_workspace_patterns(root, plan, &mut patterns)?;
+    collect_line_workspace_patterns(root, plan, &mut patterns, &mut coverage_patterns)?;
 
     let mut excluded_workspaces = std::collections::BTreeSet::new();
     for pattern in excludes {
@@ -643,7 +669,10 @@ fn discover_workspaces(root: &Path, plan: &mut GateScaffoldPlan) -> io::Result<V
         excluded_workspaces.extend(expand_workspace_pattern(root, &pattern, plan)?);
     }
 
-    let mut workspaces = std::collections::BTreeSet::new();
+    let mut workspaces: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<&'static str>,
+    > = std::collections::BTreeMap::new();
     for pattern in patterns {
         if invalid_workspace_pattern(&pattern) {
             block_workspace(
@@ -663,17 +692,33 @@ fn discover_workspaces(root: &Path, plan: &mut GateScaffoldPlan) -> io::Result<V
         }
         for workspace in expanded {
             if !excluded_workspaces.contains(&workspace) {
-                workspaces.insert(workspace);
+                workspaces.entry(workspace).or_default().extend(
+                    coverage_patterns
+                        .get(&pattern)
+                        .into_iter()
+                        .flatten()
+                        .copied(),
+                );
             }
         }
     }
-    Ok(workspaces.into_iter().collect())
+    Ok(workspaces
+        .into_iter()
+        .map(|(path, root_covering_templates)| DeclaredWorkspace {
+            path,
+            root_covering_templates,
+        })
+        .collect())
 }
 
 fn collect_toml_workspace_patterns(
     root: &Path,
     plan: &mut GateScaffoldPlan,
     patterns: &mut std::collections::BTreeSet<String>,
+    coverage_patterns: &mut std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<&'static str>,
+    >,
     excludes: &mut std::collections::BTreeSet<String>,
 ) -> io::Result<()> {
     for path in ["Cargo.toml", "pyproject.toml"] {
@@ -688,36 +733,43 @@ fn collect_toml_workspace_patterns(
             }
         };
         if path == "Cargo.toml" {
-            insert_toml_array(&value, &["workspace", "members"], patterns);
-            insert_toml_array(&value, &["workspace", "exclude"], excludes);
+            for member in toml_array_strings(&value, &["workspace", "members"]) {
+                patterns.insert(member.clone());
+                coverage_patterns
+                    .entry(member)
+                    .or_default()
+                    .insert("rust.cargo/v1");
+            }
+            excludes.extend(toml_array_strings(&value, &["workspace", "exclude"]));
         } else {
-            insert_toml_array(&value, &["tool", "uv", "workspace", "members"], patterns);
-            insert_toml_array(&value, &["tool", "uv", "workspace", "exclude"], excludes);
+            patterns.extend(toml_array_strings(
+                &value,
+                &["tool", "uv", "workspace", "members"],
+            ));
+            excludes.extend(toml_array_strings(
+                &value,
+                &["tool", "uv", "workspace", "exclude"],
+            ));
         }
     }
     Ok(())
 }
 
-fn insert_toml_array(
-    value: &toml::Value,
-    keys: &[&str],
-    output: &mut std::collections::BTreeSet<String>,
-) {
+fn toml_array_strings(value: &toml::Value, keys: &[&str]) -> Vec<String> {
     let mut current = value;
     for key in keys {
         let Some(next) = current.get(*key) else {
-            return;
+            return Vec::new();
         };
         current = next;
     }
-    if let Some(items) = current.as_array() {
-        output.extend(
-            items
-                .iter()
-                .filter_map(toml::Value::as_str)
-                .map(ToOwned::to_owned),
-        );
-    }
+    current
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(toml::Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn collect_json_workspace_patterns(
@@ -833,6 +885,10 @@ fn collect_line_workspace_patterns(
     root: &Path,
     plan: &mut GateScaffoldPlan,
     patterns: &mut std::collections::BTreeSet<String>,
+    coverage_patterns: &mut std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<&'static str>,
+    >,
 ) -> io::Result<()> {
     if let Some(text) = read_optional_evidence(root, "pnpm-workspace.yaml", plan)? {
         let mut in_packages = false;
@@ -866,7 +922,10 @@ fn collect_line_workspace_patterns(
         }
     }
     if let Some(text) = read_optional_evidence(root, "pom.xml", plan)? {
-        patterns.extend(xml_values(&text, "module"));
+        for module in xml_values(&text, "module") {
+            patterns.insert(module.clone());
+            record_root_coverage(coverage_patterns, module, "java.maven/v1");
+        }
     }
     for settings in ["settings.gradle", "settings.gradle.kts"] {
         if let Some(text) = read_optional_evidence(root, settings, plan)? {
@@ -875,7 +934,9 @@ fn collect_line_workspace_patterns(
                 .filter(|line| line.trim_start().starts_with("include"))
             {
                 for quoted in quoted_values(line) {
-                    patterns.insert(quoted.trim_start_matches(':').replace(':', "/"));
+                    let module = quoted.trim_start_matches(':').replace(':', "/");
+                    patterns.insert(module.clone());
+                    record_root_coverage(coverage_patterns, module, "java.gradle/v1");
                 }
             }
         }
@@ -889,7 +950,9 @@ fn collect_line_workspace_patterns(
                 .any(|extension| normalized.ends_with(extension))
                 && let Some(parent) = Path::new(&normalized).parent()
             {
-                patterns.insert(parent.to_string_lossy().into_owned());
+                let project = parent.to_string_lossy().into_owned();
+                patterns.insert(project.clone());
+                record_root_coverage(coverage_patterns, project, "dotnet.test/v1");
             }
         }
     }
@@ -904,7 +967,14 @@ fn collect_line_workspace_patterns(
                     .and_then(|(_, rest)| rest.split_once(')'))
                     && let Some(value) = arguments.0.split_whitespace().next()
                 {
-                    patterns.insert(value.trim_matches(['\'', '"']).to_owned());
+                    let workspace = value.trim_matches(['\'', '"']).to_owned();
+                    patterns.insert(workspace.clone());
+                    let template = if path == "CMakeLists.txt" {
+                        "cpp.cmake/v1"
+                    } else {
+                        "cpp.meson/v1"
+                    };
+                    record_root_coverage(coverage_patterns, workspace, template);
                 }
             }
         }
@@ -914,12 +984,28 @@ fn collect_line_workspace_patterns(
             if let Some((_, value)) = line.split_once("apps_path:") {
                 let value = value.trim().trim_matches([',', '\'', '"']);
                 if !value.is_empty() {
-                    patterns.insert(format!("{value}/*"));
+                    let workspace = format!("{value}/*");
+                    patterns.insert(workspace.clone());
+                    record_root_coverage(coverage_patterns, workspace, "elixir.mix/v1");
                 }
             }
         }
     }
     Ok(())
+}
+
+fn record_root_coverage(
+    coverage_patterns: &mut std::collections::BTreeMap<
+        String,
+        std::collections::BTreeSet<&'static str>,
+    >,
+    pattern: String,
+    template: &'static str,
+) {
+    coverage_patterns
+        .entry(pattern)
+        .or_default()
+        .insert(template);
 }
 
 fn xml_values(text: &str, tag: &str) -> Vec<String> {
