@@ -65,8 +65,42 @@ pub struct LaunchPlan {
 }
 
 pub fn plan(dir: &Path, context: LaunchContext<'_>) -> io::Result<LaunchPlan> {
+    let legacy = dir.join(nopal_core::discover::LEGACY_DIR);
+    if legacy.exists() {
+        return Ok(blocked_unconfigured_plan(Diagnostic::error(
+            Code::ScaffoldLegacyDetected,
+            legacy.display().to_string(),
+            format!(
+                "legacy project state {} is preserved; Nopal will not merge or launch through it",
+                legacy.display()
+            ),
+        )));
+    }
     if !dir.join(".nopal").exists() {
         return plan_without_nopal(dir, context);
+    }
+    let required = [
+        ".nopal/nopal.jsonc",
+        ".nopal/policy.jsonc",
+        ".nopal/gates.jsonc",
+        distribution::BUNDLE_PATH,
+        distribution::LOCK_PATH,
+        ".beislid/workflow.md",
+    ];
+    let missing = required
+        .iter()
+        .filter(|path| !dir.join(path).is_file())
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Ok(blocked_unconfigured_plan(Diagnostic::error(
+            Code::ScaffoldIncomplete,
+            ".nopal",
+            format!(
+                "partial Nopal baseline is preserved; missing [{}]",
+                missing.join(", ")
+            ),
+        )));
     }
     plan_configured(dir, context)
 }
@@ -99,16 +133,11 @@ fn plan_configured(dir: &Path, context: LaunchContext<'_>) -> io::Result<LaunchP
 }
 
 fn plan_without_nopal(dir: &Path, context: LaunchContext<'_>) -> io::Result<LaunchPlan> {
-    let legacy = dir.join(".crust");
     let beislid = dir.join(".beislid");
-    if legacy.exists() || beislid.exists() {
-        let path = if legacy.exists() { legacy } else { beislid };
+    if beislid.exists() {
+        let path = beislid;
         return Ok(blocked_unconfigured_plan(Diagnostic::error(
-            if path.ends_with(".crust") {
-                Code::ScaffoldLegacyDetected
-            } else {
-                Code::ScaffoldIncomplete
-            },
+            Code::ScaffoldIncomplete,
             path.display().to_string(),
             format!(
                 "existing or legacy project state {} is preserved; Nopal will not merge an inferred baseline into it",

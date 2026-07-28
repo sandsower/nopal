@@ -17,6 +17,11 @@ globset = { workspace = true }
 regex = { workspace = true }
 getrandom = { workspace = true }
 sha2 = { workspace = true }
+base64 = { workspace = true }
+url = { workspace = true }
+same-file = { workspace = true }
+cap-std = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

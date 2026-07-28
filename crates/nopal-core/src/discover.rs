@@ -15,6 +15,8 @@ use crate::profile::Module;
 use crate::run_ledger_store::{git_stdout, resolve_like_python};
 
 pub const NOPAL_DIR: &str = ".nopal";
+/// Historical project-state marker retained only so v0.3 can preserve and reject it.
+pub const LEGACY_DIR: &str = ".crust";
 pub const MANIFEST_FILE: &str = "nopal.jsonc";
 
 /// Project-relative manifest path (used in diagnostics and display).
@@ -55,7 +57,7 @@ pub fn module_path(root: &Path, module: Module) -> PathBuf {
 ///    diagnostics (`manifest_missing`/`bundle_missing`, D10) fire for it
 ///    instead of the walk stepping past it to some other ancestor.
 /// 4. No `.nopal/` directory anywhere in that range: the toplevel is the
-///    root - the landing spot [`crate::scaffold::write_defaults`] uses on
+///    root - the landing spot [`crate::scaffold::write_baseline`] uses on
 ///    a first real launch.
 pub fn project_root(start: &Path) -> PathBuf {
     let start_abs = std::path::absolute(start).unwrap_or_else(|_| start.to_path_buf());
@@ -182,7 +184,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         init_repo(temp.path());
         let sub = temp.path().join("sub");
-        fs::create_dir_all(sub.join(".crust")).unwrap();
+        fs::create_dir_all(sub.join(LEGACY_DIR)).unwrap();
         let deeper = sub.join("deeper");
         fs::create_dir_all(&deeper).unwrap();
 

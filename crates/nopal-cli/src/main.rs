@@ -1662,19 +1662,10 @@ fn run_ask_cmd(
     }
 }
 
-/// User-level config dir for cross-repo nopal defaults:
-/// `$NOPAL_CONFIG_DIR` when set, else `$HOME/.config/nopal`; `None` when
-/// neither is available (no lookup possible - `scaffold::
-/// resolve_bundle_scaffold` treats that identically to "no template found").
-/// Read once here, at the CLI boundary, and threaded down from here on as a
-/// plain `Option<PathBuf>` - every nopal-core function that might consult it
-/// (`scaffold::write_defaults`, `launch::plan`'s unconfigured branch) takes
-/// the already-resolved directory as a parameter instead of reading the
-/// environment itself, so tests can isolate template lookup by construction
-/// (an explicit temp dir, or `None`) instead of by mutating process env -
-/// see `nopal-core::scaffold`'s module tests and this crate's
-/// `tests/coordinator.rs`, which sets `NOPAL_CONFIG_DIR` on every spawned
-/// `nopal` subprocess for exactly this reason.
+/// Resolve user-level Nopal policy and enforcement state without granting it
+/// project-package authority. The checked-in distribution contract is the
+/// only source for project resources; this directory remains relevant to the
+/// restrictive user-policy composition and enforcement subprocess context.
 fn resolve_config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var("NOPAL_CONFIG_DIR")
         .ok()
@@ -1750,6 +1741,7 @@ fn run_distribution_update(cli: &Cli, root: &Path, write: bool) -> std::io::Resu
             version: env!("CARGO_PKG_VERSION"),
             root: &builtin_root,
         },
+        &distribution_adapter::npm_program(),
         write,
     )?;
     print_report_and_exit(
@@ -1763,14 +1755,17 @@ fn run_distribution_update(cli: &Cli, root: &Path, write: bool) -> std::io::Resu
 fn run_distribution_sync(cli: &Cli, root: &Path) -> std::io::Result<ExitCode> {
     let builtin_root = resolve_builtin_adapter_root()?;
     let store_root = resolve_data_dir()?.join("packages");
-    let report = distribution_adapter::sync(nopal_core::distribution::DistributionContext {
-        project_root: root,
-        store_root: &store_root,
-        builtin: nopal_core::distribution::BuiltinDistribution {
-            version: env!("CARGO_PKG_VERSION"),
-            root: &builtin_root,
+    let report = distribution_adapter::sync(
+        nopal_core::distribution::DistributionContext {
+            project_root: root,
+            store_root: &store_root,
+            builtin: nopal_core::distribution::BuiltinDistribution {
+                version: env!("CARGO_PKG_VERSION"),
+                root: &builtin_root,
+            },
         },
-    })?;
+        &distribution_adapter::npm_program(),
+    )?;
     print_report_and_exit(
         report.ok,
         cli.json,
@@ -1782,19 +1777,13 @@ fn run_distribution_sync(cli: &Cli, root: &Path) -> std::io::Result<ExitCode> {
 /// Runs the cold `nopal.launch/v1` gates for `nopal cli`. On `--dry-run` or
 /// any gate failure, renders the plan and exits without touching Pi.
 ///
-/// A real (non-dry-run) launch against an unconfigured repo
-/// (`plan.scaffold == WouldCreate`) writes `.nopal/nopal.jsonc` and
-/// `.nopal/bundle.jsonc` first, silently and without prompting, then re-runs
-/// `plan` against
-/// the files it just wrote - that re-validation, not the write itself, is
-/// the actual gate: a half-written or unexpectedly rejected scaffold fails
-/// closed exactly like any other misconfigured repo instead of launching
-/// anyway. An invalid user-level bundle template is caught earlier
-/// still: `launch::plan` already resolves the same template/hermetic source
-/// `write_defaults` would use, so `plan.ok` is already `false` and this
-/// function returns at the first check below - `write_defaults` is never
-/// even called, let alone anything written. Only a passing plan with
-/// `dry_run` false reaches `exec_pi`.
+/// A real launch against an unconfigured Git repository writes the complete
+/// six-file project, policy, gate, distribution-lock, and Beislið baseline,
+/// then re-runs this same planner against the committed bytes. That second
+/// validation, not the write itself, is the launch gate. A partial write or
+/// unexpectedly invalid generated contract fails closed exactly like any
+/// other invalid project. Only a passing plan with `dry_run` false reaches
+/// `exec_pi`.
 ///
 /// Two stderr notices are always-on, never gated by `--verbose`
 /// unlike `launch::summary_line`: a scaffold-provenance line only on a
@@ -1961,7 +1950,7 @@ fn verify_trusted_extensions(pi_argv: &[String]) -> std::io::Result<PathBuf> {
             }
             verify_enforcement_adapter(&path)?;
             enforcement_extension = Some(path);
-        } else if normalized.ends_with("/tests/fixtures/deterministic-enforcement-provider.mjs") {
+        } else if normalized.ends_with("/deterministic-enforcement-provider.mjs") {
             verify_exact_source(
                 &path,
                 include_bytes!("../tests/fixtures/deterministic-enforcement-provider.mjs"),

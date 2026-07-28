@@ -1,14 +1,16 @@
 {
-  // Nopal's repository-local v0.3 bundle keeps executable extension code to
-  // the byte-verified enforcement adapter. Skills remain ambient prose and
-  // lifecycle resources; other extensions must wait for an enforcement-aware
-  // profile instead of bypassing the tool-call assurance boundary.
-  "version": "nopal.bundle/v1",
+  // Nopal's dogfood contract permits ambient prose skills, but executable
+  // extension authority remains confined to the byte-verified Nopal adapter.
+  "version": "nopal.bundle/v2",
   "inherit_ambient": ["skills"],
-  "extensions": [
-    { "source": "policy-gate", "path": "extensions/policy-gate/index.ts" }
-  ],
-  "themes": [
-    { "source": "nopal-dark", "path": ".nopal/theme.json" }
+  "packages": [
+    {
+      "id": "nopal",
+      "source": { "type": "builtin", "package": "nopal" },
+      "requirement": "=0.2.16",
+      "resources": [
+        { "kind": "extension", "path": "index.ts" }
+      ]
+    }
   ]
 }

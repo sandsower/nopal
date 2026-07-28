@@ -1189,44 +1189,22 @@ fn json_status_emits_versioned_envelope() {
 }
 
 #[test]
-fn bundle_valid_example_would_exec_with_four_resolved_resources() {
-    let out = nopal(&[
-        "cli",
-        "--dir",
-        &example("bundle-valid"),
-        "--json",
-        "--dry-run",
-    ]);
-    assert_eq!(out.status.code(), Some(0));
-    let doc = json(&out);
-    assert_eq!(doc["kind"], "nopal.launch/v1");
-    assert_eq!(doc["ok"], true, "{doc}");
-    assert_eq!(doc["would_exec"], true, "{doc}");
-    assert_eq!(doc["bundle"]["resources"].as_array().unwrap().len(), 4);
-    assert!(!doc["pi_argv"].as_array().unwrap().is_empty());
-}
-
-#[test]
-fn bundle_invalid_example_fails_closed_with_bundle_resource_missing() {
-    let out = nopal(&[
-        "cli",
-        "--dir",
-        &example("bundle-invalid"),
-        "--json",
-        "--dry-run",
-    ]);
-    assert_eq!(out.status.code(), Some(1));
-    let doc = json(&out);
-    assert_eq!(doc["ok"], false, "{doc}");
-    assert_eq!(doc["would_exec"], false, "{doc}");
-    assert!(
-        doc["diagnostics"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|d| d["code"] == "bundle_resource_missing"),
-        "{doc}"
-    );
+fn pre_distribution_lock_examples_are_preserved_and_rejected_before_launch() {
+    for name in ["bundle-valid", "bundle-invalid"] {
+        let out = nopal(&["cli", "--dir", &example(name), "--json", "--dry-run"]);
+        assert_eq!(out.status.code(), Some(1), "{name}: {out:?}");
+        let doc = json(&out);
+        assert_eq!(doc["ok"], false, "{name}: {doc}");
+        assert_eq!(doc["would_exec"], false, "{name}: {doc}");
+        assert!(
+            doc["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diagnostic| diagnostic["code"] == "scaffold_incomplete"),
+            "{name}: {doc}"
+        );
+    }
 }
 
 #[test]
@@ -1761,6 +1739,8 @@ fn info_json_reports_version_and_capabilities() {
             "preflights",
             "review-risk",
             "status",
+            "sync",
+            "update",
             "validate",
             "workflow",
         ]

@@ -12,8 +12,10 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use url::Url;
 
 pub use crate::bundle::{AmbientInherit, ResourceKind};
 use crate::config;
@@ -23,6 +25,7 @@ pub const BUNDLE_KIND: &str = "nopal.bundle/v2";
 pub const LOCK_KIND: &str = "nopal.lock/v1";
 pub const BUNDLE_PATH: &str = ".nopal/bundle.jsonc";
 pub const LOCK_PATH: &str = ".nopal/nopal.lock";
+const MAX_CONTROL_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct BundleDocument {
@@ -141,14 +144,61 @@ pub struct DistributionReport {
     pub diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Debug, Clone)]
+pub struct NpmResolution {
+    pub package_id: String,
+    pub resolved: String,
+    pub artifact_integrity: String,
+    pub root: PathBuf,
+}
+
+/// Return normalized package requests after the same strict validation used
+/// by lock construction. Effect adapters use this only to determine which
+/// explicit sources need resolution; it does not grant authority to prose or
+/// ambient package settings.
+pub fn package_requests(bundle_text: &str) -> Result<Vec<PackageRequest>, Vec<Diagnostic>> {
+    let (mut bundle, mut diagnostics) = parse_bundle(bundle_text, BUNDLE_PATH);
+    let Some(mut bundle) = bundle.take() else {
+        diagnostics::sort(&mut diagnostics);
+        return Err(diagnostics);
+    };
+    normalize_bundle(&mut bundle);
+    if diagnostics.iter().any(|d| d.severity == Severity::Error) {
+        diagnostics::sort(&mut diagnostics);
+        return Err(diagnostics);
+    }
+    Ok(bundle.packages)
+}
+
 /// Build a complete lock using only sources already present on the machine.
-/// It is used by first-run scaffolding and the workspace/builtin half of
-/// update. An npm request is deliberately unresolved here: only the CLI npm
-/// adapter may turn registry evidence into a locked package.
+/// It is used by first-run scaffolding and workspace-only update. An npm
+/// request is deliberately unresolved here: only the CLI npm adapter may turn
+/// registry evidence into a resolved archive and then call the resolved seam.
 pub fn build_lock_from_local_sources(
     project_root: &Path,
     bundle_text: &str,
     builtin: &BuiltinDistribution<'_>,
+) -> Result<LockDocument, Vec<Diagnostic>> {
+    build_lock(project_root, bundle_text, builtin, &[])
+}
+
+/// Build a deterministic lock from package trees already resolved and
+/// integrity-verified by an effect adapter. Core re-hashes every tree and
+/// exported resource; it never runs npm or contacts a registry itself.
+pub fn build_lock_from_resolved_sources(
+    project_root: &Path,
+    bundle_text: &str,
+    builtin: &BuiltinDistribution<'_>,
+    npm: &[NpmResolution],
+) -> Result<LockDocument, Vec<Diagnostic>> {
+    build_lock(project_root, bundle_text, builtin, npm)
+}
+
+fn build_lock(
+    project_root: &Path,
+    bundle_text: &str,
+    builtin: &BuiltinDistribution<'_>,
+    npm: &[NpmResolution],
 ) -> Result<LockDocument, Vec<Diagnostic>> {
     let (mut bundle, mut diagnostics) = parse_bundle(bundle_text, BUNDLE_PATH);
     let Some(mut bundle) = bundle.take() else {
@@ -156,10 +206,14 @@ pub fn build_lock_from_local_sources(
         return Err(diagnostics);
     };
     normalize_bundle(&mut bundle);
+    let npm = npm
+        .iter()
+        .map(|resolution| (resolution.package_id.as_str(), resolution))
+        .collect::<BTreeMap<_, _>>();
 
     let mut locked = Vec::new();
     for request in &bundle.packages {
-        let (root, resolved) = match &request.source {
+        let (root, resolved, artifact_integrity) = match &request.source {
             SourceSpec::Builtin { package } if package == "nopal" => {
                 if !requirement_accepts_exact(&request.requirement, builtin.version) {
                     diagnostics.push(package_error(
@@ -173,7 +227,7 @@ pub fn build_lock_from_local_sources(
                     ));
                     continue;
                 }
-                (builtin.root.to_path_buf(), builtin.version.to_owned())
+                (builtin.root.to_path_buf(), builtin.version.to_owned(), None)
             }
             SourceSpec::Builtin { .. } => {
                 diagnostics.push(package_error(
@@ -185,20 +239,24 @@ pub fn build_lock_from_local_sources(
                 continue;
             }
             SourceSpec::Workspace { package, root } => {
-                let relative = match safe_relative_path(root) {
+                let package_root = match resolve_workspace_root(project_root, root) {
                     Ok(path) => path,
                     Err(message) => {
                         diagnostics.push(package_error(
                             Code::DistributionPackageInvalid,
                             request,
-                            "contract",
+                            "workspace_root",
                             message,
                         ));
                         continue;
                     }
                 };
-                let package_root = project_root.join(relative);
-                let resolved = match workspace_version(&package_root, package, request) {
+                let resolved = match package_manifest_version(
+                    &package_root,
+                    package,
+                    request,
+                    "workspace_manifest",
+                ) {
                     Ok(version) => version,
                     Err(diagnostic) => {
                         diagnostics.push(diagnostic);
@@ -217,21 +275,81 @@ pub fn build_lock_from_local_sources(
                     ));
                     continue;
                 }
-                (package_root, resolved)
+                (package_root, resolved, None)
             }
             SourceSpec::Npm { .. } => {
-                diagnostics.push(package_error(
-                    Code::DistributionSourceUnsupported,
+                let Some(resolution) = npm.get(request.id.as_str()) else {
+                    diagnostics.push(package_error(
+                        Code::DistributionSourceUnsupported,
+                        request,
+                        "resolution",
+                        "npm packages require resolution evidence from `nopal update`",
+                    ));
+                    continue;
+                };
+                if !is_exact_version(&resolution.resolved)
+                    || !is_sha512_sri(&resolution.artifact_integrity)
+                {
+                    diagnostics.push(package_error(
+                        Code::DistributionPackageInvalid,
+                        request,
+                        "npm_integrity",
+                        "resolved npm evidence requires an exact version and SHA-512 SRI",
+                    ));
+                    continue;
+                }
+                if !requirement_accepts_exact(&request.requirement, &resolution.resolved) {
+                    diagnostics.push(package_error(
+                        Code::DistributionLockDrift,
+                        request,
+                        "resolution",
+                        format!(
+                            "npm resolved version {:?} does not match exact requirement {:?}",
+                            resolution.resolved, request.requirement
+                        ),
+                    ));
+                    continue;
+                }
+                let manifest_version = match package_manifest_version(
+                    &resolution.root,
+                    request.source.package(),
                     request,
-                    "resolution",
-                    "npm packages require resolution evidence from `nopal update`",
-                ));
-                continue;
+                    "resolved_manifest",
+                ) {
+                    Ok(version) => version,
+                    Err(diagnostic) => {
+                        diagnostics.push(diagnostic);
+                        continue;
+                    }
+                };
+                if manifest_version != resolution.resolved {
+                    diagnostics.push(package_error(
+                        Code::DistributionPackageInvalid,
+                        request,
+                        "resolved_manifest",
+                        format!(
+                            "resolved manifest version {manifest_version:?} does not match adapter evidence {:?}",
+                            resolution.resolved
+                        ),
+                    ));
+                    continue;
+                }
+                (
+                    resolution.root.clone(),
+                    resolution.resolved.clone(),
+                    Some(resolution.artifact_integrity.clone()),
+                )
             }
         };
 
-        match lock_local_package(request, &root, resolved) {
-            Ok(package) => locked.push(package),
+        let builtin_package = matches!(request.source, SourceSpec::Builtin { .. });
+        match lock_local_package(request, &root, resolved, builtin_package) {
+            Ok(mut package) => {
+                if let Some(integrity) = artifact_integrity {
+                    package.artifact_integrity = integrity;
+                }
+                locked.push(package);
+            }
             Err(mut package_diagnostics) => diagnostics.append(&mut package_diagnostics),
         }
     }
@@ -258,30 +376,109 @@ pub fn lock_json(lock: &LockDocument) -> serde_json::Result<String> {
 /// Resolve and verify every locked package and exported resource from local
 /// evidence only. A failed report never carries partially trusted resources.
 pub fn inspect(context: DistributionContext<'_>) -> io::Result<DistributionReport> {
-    let bundle_text = match fs::read_to_string(context.project_root.join(BUNDLE_PATH)) {
+    let bundle_text = match load_bundle_text(context.project_root)? {
         Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(error_report(Diagnostic::error(
-                Code::BundleMissing,
-                BUNDLE_PATH,
-                format!("distribution contract {BUNDLE_PATH} is missing"),
-            )));
-        }
-        Err(error) => return Err(error),
+        Err(diagnostic) => return Ok(error_report(diagnostic)),
     };
-    let lock_text = match fs::read_to_string(context.project_root.join(LOCK_PATH)) {
+    let lock_text = match load_lock_text(context.project_root)? {
         Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(error_report(Diagnostic::error(
-                Code::DistributionLockMissing,
-                LOCK_PATH,
-                format!("distribution lock {LOCK_PATH} is missing"),
-            )));
-        }
-        Err(error) => return Err(error),
+        Err(diagnostic) => return Ok(error_report(diagnostic)),
     };
 
     inspect_texts(context, &bundle_text, &lock_text)
+}
+
+pub fn load_bundle_text(root: &Path) -> io::Result<Result<String, Diagnostic>> {
+    read_control_text(
+        root,
+        BUNDLE_PATH,
+        Code::BundleMissing,
+        "distribution contract",
+    )
+}
+
+pub fn load_lock_text(root: &Path) -> io::Result<Result<String, Diagnostic>> {
+    read_control_text(
+        root,
+        LOCK_PATH,
+        Code::DistributionLockMissing,
+        "distribution lock",
+    )
+}
+
+fn read_control_text(
+    root: &Path,
+    relative: &str,
+    missing_code: Code,
+    label: &str,
+) -> io::Result<Result<String, Diagnostic>> {
+    let control_dir = root.join(".nopal");
+    let path = root.join(relative);
+    let directory_metadata = match fs::symlink_metadata(&control_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Err(Diagnostic::error(
+                missing_code,
+                relative,
+                format!("{label} {relative} is missing"),
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    if !directory_metadata.is_dir() || directory_metadata.file_type().is_symlink() {
+        return Ok(Err(Diagnostic::error(
+            Code::DistributionPackageInvalid,
+            relative,
+            ".nopal control directory must be a real directory, not a link or special file",
+        )));
+    }
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(Err(Diagnostic::error(
+                missing_code,
+                relative,
+                format!("{label} {relative} is missing"),
+            )));
+        }
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(Err(Diagnostic::error(
+            Code::DistributionPackageInvalid,
+            relative,
+            format!("{label} {relative} must be a real regular file"),
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() != 1 {
+            return Ok(Err(Diagnostic::error(
+                Code::DistributionPackageInvalid,
+                relative,
+                format!("{label} {relative} must not have multiple hard links"),
+            )));
+        }
+    }
+    if metadata.len() > MAX_CONTROL_FILE_BYTES {
+        return Ok(Err(Diagnostic::error(
+            Code::DistributionPackageInvalid,
+            relative,
+            format!("{label} {relative} exceeds the {MAX_CONTROL_FILE_BYTES}-byte limit"),
+        )));
+    }
+    let bytes = fs::read(&path)?;
+    String::from_utf8(bytes).map_or_else(
+        |_| {
+            Ok(Err(Diagnostic::error(
+                Code::DistributionPackageInvalid,
+                relative,
+                format!("{label} {relative} is not UTF-8"),
+            )))
+        },
+        |text| Ok(Ok(text)),
+    )
 }
 
 /// Inspect already-loaded contract and lock text through the identical path
@@ -302,6 +499,7 @@ pub fn inspect_texts(
         return Ok(report_with_diagnostics(diagnostics));
     };
 
+    validate_lock(&lock, &mut diagnostics);
     if lock.version != LOCK_KIND {
         diagnostics.push(Diagnostic::error(
             Code::VersionUnsupported,
@@ -362,11 +560,23 @@ pub fn inspect_texts(
             continue;
         };
         if package.source != request.source {
-            diagnostics.push(package_error(
+            diagnostics.push(locked_package_error(
                 Code::DistributionLockDrift,
-                request,
+                package,
                 "contract_lock",
                 "locked source does not match the checked-in package source",
+            ));
+            continue;
+        }
+        if !requirement_accepts_exact(&request.requirement, &package.resolved) {
+            diagnostics.push(locked_package_error(
+                Code::DistributionLockDrift,
+                package,
+                "contract_lock",
+                format!(
+                    "locked version {:?} does not match exact requirement {:?}",
+                    package.resolved, request.requirement
+                ),
             ));
             continue;
         }
@@ -377,7 +587,40 @@ pub fn inspect_texts(
                 continue;
             }
         };
-        let tree_integrity = match hash_tree(&root) {
+        if matches!(
+            request.source,
+            SourceSpec::Workspace { .. } | SourceSpec::Npm { .. }
+        ) {
+            let manifest_version = match package_manifest_version(
+                &root,
+                request.source.package(),
+                request,
+                "installed_manifest",
+            ) {
+                Ok(version) => version,
+                Err(diagnostic) => {
+                    diagnostics.push(diagnostic);
+                    continue;
+                }
+            };
+            if manifest_version != package.resolved {
+                diagnostics.push(package_error(
+                    Code::DistributionIntegrityMismatch,
+                    request,
+                    "installed_manifest",
+                    format!(
+                        "installed manifest version {manifest_version:?} does not match locked version {:?}",
+                        package.resolved
+                    ),
+                ));
+                continue;
+            }
+        }
+        let tree_integrity = match if matches!(request.source, SourceSpec::Builtin { .. }) {
+            hash_builtin_package(&root, request)
+        } else {
+            hash_tree(&root)
+        } {
             Ok(integrity) => integrity,
             Err(error) => {
                 diagnostics.push(package_error(
@@ -419,9 +662,9 @@ pub fn inspect_texts(
         if request_resources.keys().collect::<Vec<_>>()
             != locked_resources.keys().collect::<Vec<_>>()
         {
-            diagnostics.push(package_error(
+            diagnostics.push(locked_package_error(
                 Code::DistributionLockDrift,
-                request,
+                package,
                 "contract_lock",
                 "locked resource exports do not match the checked-in package contract",
             ));
@@ -520,22 +763,35 @@ fn installed_root(
             }
             Ok(context.builtin.root.to_path_buf())
         }
-        SourceSpec::Workspace { root, .. } => safe_relative_path(root)
-            .map(|relative| context.project_root.join(relative))
+        SourceSpec::Workspace { root, .. } => resolve_workspace_root(context.project_root, root)
             .map_err(|message| {
                 package_error(
                     Code::DistributionPackageInvalid,
                     request,
-                    "contract",
+                    "workspace_root",
                     message,
                 )
             }),
-        SourceSpec::Npm { package: name, .. } => Ok(npm_store_path(
-            context.store_root,
-            name,
-            &package.resolved,
-            &package.artifact_integrity,
-        )),
+        SourceSpec::Npm { package: name, .. } => {
+            let identity = digest_bytes(
+                format!(
+                    "{name}\0{}\0{}",
+                    package.resolved, package.artifact_integrity
+                )
+                .as_bytes(),
+            );
+            let relative = Path::new("npm").join(identity.trim_start_matches("sha256:"));
+            resolve_confined_directory(context.store_root, &relative, "npm store").map_err(
+                |message| {
+                    package_error(
+                        Code::DistributionPackageInvalid,
+                        request,
+                        "installed_store",
+                        message,
+                    )
+                },
+            )
+        }
         _ => Err(package_error(
             Code::DistributionSourceUnsupported,
             request,
@@ -556,9 +812,14 @@ fn lock_local_package(
     request: &PackageRequest,
     root: &Path,
     resolved: String,
+    builtin: bool,
 ) -> Result<LockedPackage, Vec<Diagnostic>> {
     let mut diagnostics = Vec::new();
-    let installed_tree_integrity = match hash_tree(root) {
+    let installed_tree_integrity = match if builtin {
+        hash_builtin_package(root, request)
+    } else {
+        hash_tree(root)
+    } {
         Ok(integrity) => integrity,
         Err(error) => {
             diagnostics.push(package_error(
@@ -667,10 +928,120 @@ fn parse_lock(text: &str, path: &str, diagnostics: &mut Vec<Diagnostic>) -> Opti
     }
 }
 
+fn validate_lock(lock: &LockDocument, diagnostics: &mut Vec<Diagnostic>) {
+    let mut ids = BTreeSet::new();
+    for package in &lock.packages {
+        if !is_portable_id(&package.id) || package.id.is_empty() {
+            diagnostics.push(locked_package_error(
+                Code::DistributionLockParseError,
+                package,
+                "contract_lock",
+                "locked package id is not portable",
+            ));
+        }
+        if !ids.insert(package.id.as_str()) {
+            diagnostics.push(locked_package_error(
+                Code::DuplicateId,
+                package,
+                "contract_lock",
+                "duplicate locked package id",
+            ));
+        }
+        if !is_exact_version(&package.resolved) {
+            diagnostics.push(locked_package_error(
+                Code::DistributionLockParseError,
+                package,
+                "contract_lock",
+                "locked package has no valid exact semantic version",
+            ));
+        }
+        if !is_sha256_integrity(&package.installed_tree_integrity) {
+            diagnostics.push(locked_package_error(
+                Code::DistributionLockParseError,
+                package,
+                "installed_integrity",
+                "locked package has invalid installed tree integrity",
+            ));
+        }
+        match &package.source {
+            SourceSpec::Npm { .. } if !is_sha512_sri(&package.artifact_integrity) => {
+                diagnostics.push(locked_package_error(
+                    Code::DistributionLockParseError,
+                    package,
+                    "npm_integrity",
+                    "locked npm package requires valid SHA-512 artifact SRI",
+                ));
+            }
+            SourceSpec::Npm { .. } => {}
+            _ if package.artifact_integrity != package.installed_tree_integrity => {
+                diagnostics.push(locked_package_error(
+                    Code::DistributionLockDrift,
+                    package,
+                    "installed_integrity",
+                    "locked local artifact and installed-tree integrity differ",
+                ));
+            }
+            _ => {}
+        }
+        let mut resources = BTreeSet::new();
+        for resource in &package.resources {
+            if !resources.insert((resource.kind, resource.path.as_str())) {
+                diagnostics.push(locked_package_error(
+                    Code::DuplicateId,
+                    package,
+                    "resource_export",
+                    format!(
+                        "lock repeats {:?} resource {:?}",
+                        resource.kind, resource.path
+                    ),
+                ));
+            }
+            if safe_relative_path(&resource.path).is_err()
+                || !is_sha256_integrity(&resource.tree_integrity)
+            {
+                diagnostics.push(locked_package_error(
+                    Code::DistributionLockParseError,
+                    package,
+                    "resource_integrity",
+                    format!("lock has invalid resource evidence for {:?}", resource.path),
+                ));
+            }
+        }
+    }
+}
+
+fn is_sha256_integrity(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn is_sha512_sri(value: &str) -> bool {
+    let Some(encoded) = value.strip_prefix("sha512-") else {
+        return false;
+    };
+    !encoded.is_empty()
+        && !encoded.chars().any(char::is_whitespace)
+        && base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .is_ok_and(|digest| digest.len() == 64)
+}
+
+fn is_safe_registry(value: &str) -> bool {
+    Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
 fn validate_bundle(bundle: &BundleDocument, path: &str, diagnostics: &mut Vec<Diagnostic>) {
     let mut ids = BTreeSet::new();
     for request in &bundle.packages {
-        if request.id.trim().is_empty() || !is_portable_id(&request.id) {
+        if request.id.trim().is_empty() || request.id.len() > 128 || !is_portable_id(&request.id) {
             diagnostics.push(Diagnostic::error(
                 Code::DistributionPackageInvalid,
                 path,
@@ -687,20 +1058,20 @@ fn validate_bundle(bundle: &BundleDocument, path: &str, diagnostics: &mut Vec<Di
                 format!("duplicate distribution package id {:?}", request.id),
             ));
         }
-        if request.source.package().trim().is_empty() {
+        if !is_package_identity(request.source.package()) {
             diagnostics.push(package_error(
                 Code::DistributionPackageInvalid,
                 request,
                 "contract",
-                "package source identity must not be empty",
+                "package source identity must be a bounded lowercase npm-style name",
             ));
         }
-        if request.requirement.trim().is_empty() {
+        if exact_requirement(&request.requirement).is_none() {
             diagnostics.push(package_error(
                 Code::DistributionPackageInvalid,
                 request,
                 "contract",
-                "requirement must not be empty",
+                "v0.3 package requirements must be exact semantic versions, optionally prefixed by '='",
             ));
         }
         match &request.source {
@@ -714,12 +1085,7 @@ fn validate_bundle(bundle: &BundleDocument, path: &str, diagnostics: &mut Vec<Di
                     ));
                 }
             }
-            SourceSpec::Npm { registry, .. }
-                if !registry.starts_with("https://")
-                    || registry.contains('@')
-                    || registry.contains('?')
-                    || registry.contains('#') =>
-            {
+            SourceSpec::Npm { registry, .. } if !is_safe_registry(registry) => {
                 diagnostics.push(package_error(
                     Code::DistributionPackageInvalid,
                     request,
@@ -825,14 +1191,85 @@ fn contract_digest(bundle: &BundleDocument) -> String {
     digest_bytes(&serde_json::to_vec(bundle).unwrap_or_default())
 }
 
-fn requirement_accepts_exact(requirement: &str, version: &str) -> bool {
-    requirement.trim() == version || requirement.trim() == format!("={version}")
+fn exact_requirement(requirement: &str) -> Option<&str> {
+    let value = requirement.trim();
+    let version = value.strip_prefix('=').unwrap_or(value);
+    (value == requirement
+        && value.len() <= 256
+        && !value.chars().any(char::is_control)
+        && is_exact_version(version))
+    .then_some(version)
 }
 
-fn workspace_version(
+fn requirement_accepts_exact(requirement: &str, version: &str) -> bool {
+    exact_requirement(requirement) == Some(version)
+}
+
+fn resolve_workspace_root(project_root: &Path, value: &str) -> Result<PathBuf, String> {
+    let relative = safe_relative_path(value)?;
+    resolve_confined_directory(project_root, &relative, "workspace root")
+}
+
+fn resolve_confined_directory(
+    boundary_root: &Path,
+    relative: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let boundary = boundary_root.canonicalize().map_err(|error| {
+        format!(
+            "cannot canonicalize {label} boundary {}: {error}",
+            boundary_root.display()
+        )
+    })?;
+    let mut current = boundary.clone();
+    for component in relative.components() {
+        if component == Component::CurDir {
+            continue;
+        }
+        let Component::Normal(part) = component else {
+            return Err(format!(
+                "{label} path {} is not portable",
+                relative.display()
+            ));
+        };
+        current.push(part);
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            format!(
+                "{label} component {} is unavailable: {error}",
+                current.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "{label} component {} is a symbolic link",
+                current.display()
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(format!(
+                "{label} component {} is not a directory",
+                current.display()
+            ));
+        }
+    }
+    let resolved = current
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize {label} {}: {error}", current.display()))?;
+    if !resolved.starts_with(&boundary) {
+        return Err(format!(
+            "{label} {} escapes boundary {}",
+            resolved.display(),
+            boundary.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+fn package_manifest_version(
     root: &Path,
     expected_name: &str,
     request: &PackageRequest,
+    boundary: &str,
 ) -> Result<String, Diagnostic> {
     #[derive(Deserialize)]
     struct Manifest {
@@ -841,11 +1278,27 @@ fn workspace_version(
     }
 
     let path = root.join("package.json");
-    let text = fs::read_to_string(&path).map_err(|error| {
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
         package_error(
             Code::DistributionPackageMissing,
             request,
-            "workspace_manifest",
+            boundary,
+            format!("cannot inspect {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 1024 * 1024 {
+        return Err(package_error(
+            Code::DistributionPackageInvalid,
+            request,
+            boundary,
+            "package.json must be a regular file no larger than 1 MiB",
+        ));
+    }
+    let text = fs::read_to_string(&path).map_err(|error| {
+        package_error(
+            Code::DistributionPackageInvalid,
+            request,
+            boundary,
             format!("cannot read {}: {error}", path.display()),
         )
     })?;
@@ -853,7 +1306,7 @@ fn workspace_version(
         package_error(
             Code::DistributionPackageInvalid,
             request,
-            "workspace_manifest",
+            boundary,
             format!("invalid {}: {error}", path.display()),
         )
     })?;
@@ -861,19 +1314,19 @@ fn workspace_version(
         return Err(package_error(
             Code::DistributionPackageInvalid,
             request,
-            "workspace_manifest",
+            boundary,
             format!(
                 "manifest package name {:?} does not match source identity {expected_name:?}",
                 manifest.name
             ),
         ));
     }
-    if manifest.version.trim().is_empty() {
+    if !is_exact_version(&manifest.version) {
         return Err(package_error(
             Code::DistributionPackageInvalid,
             request,
-            "workspace_manifest",
-            "manifest version must not be empty",
+            boundary,
+            "manifest version must be an exact semantic version",
         ));
     }
     Ok(manifest.version)
@@ -883,11 +1336,21 @@ fn safe_relative_path(value: &str) -> Result<PathBuf, String> {
     if value.trim().is_empty() {
         return Err("package-relative path must not be empty".to_owned());
     }
+    if value != "."
+        && (value.contains(['\\', ':', '\0'])
+            || value
+                .split('/')
+                .any(|segment| segment.is_empty() || matches!(segment, "." | "..")))
+    {
+        return Err(format!(
+            "package-relative path {value:?} is not one canonical portable spelling"
+        ));
+    }
     let path = Path::new(value);
     if path.is_absolute()
         || path
             .components()
-            .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
+            .any(|component| !matches!(component, Component::Normal(_)) && value != ".")
     {
         return Err(format!(
             "package-relative path {value:?} must not be absolute or contain traversal"
@@ -900,6 +1363,111 @@ fn is_portable_id(value: &str) -> bool {
     value
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn is_exact_version(value: &str) -> bool {
+    let (without_build, build) = value
+        .split_once('+')
+        .map_or((value, None), |(version, build)| (version, Some(build)));
+    if build.is_some_and(|identifiers| !valid_version_identifiers(identifiers, false)) {
+        return false;
+    }
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(core, prerelease)| {
+            (core, Some(prerelease))
+        });
+    if prerelease.is_some_and(|identifiers| !valid_version_identifiers(identifiers, true)) {
+        return false;
+    }
+    let parts = core.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part == &"0" || !part.starts_with('0'))
+        })
+}
+
+fn valid_version_identifiers(value: &str, reject_numeric_leading_zero: bool) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|identifier| {
+            !identifier.is_empty()
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && (!reject_numeric_leading_zero
+                    || !identifier.bytes().all(|byte| byte.is_ascii_digit())
+                    || identifier == "0"
+                    || !identifier.starts_with('0'))
+        })
+}
+
+fn is_package_identity(value: &str) -> bool {
+    if value.is_empty() || value.len() > 214 {
+        return false;
+    }
+    let segment_ok = |segment: &str| {
+        !segment.is_empty()
+            && segment.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'-' | b'_' | b'.')
+            })
+            && segment
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+    };
+    if let Some(scoped) = value.strip_prefix('@') {
+        let Some((scope, name)) = scoped.split_once('/') else {
+            return false;
+        };
+        !name.contains('/') && segment_ok(scope) && segment_ok(name)
+    } else {
+        !value.contains(['/', '@']) && segment_ok(value)
+    }
+}
+
+fn hash_builtin_package(root: &Path, request: &PackageRequest) -> io::Result<String> {
+    if request
+        .resources
+        .iter()
+        .any(|resource| resource.path == ".")
+    {
+        return hash_tree(root);
+    }
+    let mut selected = request
+        .resources
+        .iter()
+        .map(|resource| resource.path.clone())
+        .collect::<BTreeSet<_>>();
+    for resource in &request.resources {
+        let path = Path::new(&resource.path);
+        if resource.kind == ResourceKind::Extension
+            && path.file_name().is_some_and(|name| name == "index.ts")
+        {
+            let parent = path.parent().unwrap_or_else(|| Path::new(""));
+            for support in ["classifier.ts", "nopal-cli.ts"] {
+                selected.insert(parent.join(support).to_string_lossy().into_owned());
+            }
+        }
+    }
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(format!(
+            "builtin package root is not a real directory: {}",
+            root.display()
+        )));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"dir\0.\0");
+    for relative in selected {
+        let relative_path = safe_relative_path(&relative)
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidData, message))?;
+        hash_entry(&root.join(&relative_path), &relative_path, &mut hasher)?;
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 pub fn hash_tree(root: &Path) -> io::Result<String> {
@@ -923,7 +1491,7 @@ fn hash_entry(path: &Path, relative: &Path, hasher: &mut Sha256) -> io::Result<(
             path.display()
         )));
     }
-    let relative_text = relative.to_string_lossy().replace('\\', "/");
+    let relative_text = portable_tree_path(relative)?;
     if metadata.is_file() {
         hasher.update(b"file\0");
         hasher.update(relative_text.as_bytes());
@@ -948,8 +1516,62 @@ fn hash_entry(path: &Path, relative: &Path, hasher: &mut Sha256) -> io::Result<(
     Ok(())
 }
 
+fn portable_tree_path(relative: &Path) -> io::Result<String> {
+    if relative == Path::new(".") {
+        return Ok(".".to_owned());
+    }
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        if component == Component::CurDir {
+            continue;
+        }
+        let Component::Normal(part) = component else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("package tree path {} is not relative", relative.display()),
+            ));
+        };
+        let text = part.to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("package tree path {} is not UTF-8", relative.display()),
+            )
+        })?;
+        if text.is_empty() || text.contains(['\\', ':', '\0']) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "package tree path {} is not portable across supported platforms",
+                    relative.display()
+                ),
+            ));
+        }
+        parts.push(text);
+    }
+    Ok(parts.join("/"))
+}
+
 fn digest_bytes(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn locked_package_error(
+    code: Code,
+    package: &LockedPackage,
+    boundary: &str,
+    detail: impl AsRef<str>,
+) -> Diagnostic {
+    Diagnostic::error(
+        code,
+        LOCK_PATH,
+        format!(
+            "package {:?} from {} source {:?} failed at control boundary {boundary}: {}",
+            package.id,
+            package.source.kind(),
+            package.source.package(),
+            detail.as_ref()
+        ),
+    )
 }
 
 fn package_error(
