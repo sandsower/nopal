@@ -384,11 +384,27 @@ fn parse_scaffold_provenance(
                 format!("duplicate generated gate id {id:?} in scaffold provenance"),
             ));
         }
+        if !id.starts_with("detected.") {
+            diagnostics.push(Diagnostic::error(
+                Code::FieldInvalid,
+                path,
+                format!("generated gate id {id:?} must use the reserved detected.* namespace"),
+            ));
+        }
         if !declared_gate_ids.contains(id.as_str()) {
             diagnostics.push(Diagnostic::error(
                 Code::GateRefUnknown,
                 path,
                 format!("scaffold provenance references missing generated gate {id:?}"),
+            ));
+        }
+    }
+    for id in &declared_gate_ids {
+        if id.starts_with("detected.") && !generated_ids.contains(*id) {
+            diagnostics.push(Diagnostic::error(
+                Code::FieldInvalid,
+                path,
+                format!("generated gate {id:?} is missing from scaffold.generated_gate_ids"),
             ));
         }
     }

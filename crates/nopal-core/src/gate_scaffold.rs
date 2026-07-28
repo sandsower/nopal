@@ -291,6 +291,18 @@ pub fn inspect(root: &Path) -> io::Result<GateScaffoldPlan> {
     Ok(plan)
 }
 
+/// Doctor has no changed-file evidence, so only repository-wide selected
+/// gates can prove that generated readiness is safely superseded.
+fn unscoped_explicit_pre_pr_gate_ids(config: &crate::gates::GatesConfig) -> Vec<String> {
+    let generated = config.generated_gate_ids();
+    crate::selection::select(config, crate::gates::GateStage::PrePr, &[])
+        .selected
+        .into_iter()
+        .filter(|gate| !generated.contains(gate.id.as_str()))
+        .map(|gate| gate.id)
+        .collect()
+}
+
 /// Inspect detection together with existing explicit gate authority. This is
 /// used by doctor only; it never rewrites the checked-in document.
 pub fn inspect_with_checked_in_authority(root: &Path) -> io::Result<GateScaffoldPlan> {
@@ -305,28 +317,7 @@ pub fn inspect_with_checked_in_authority(root: &Path) -> io::Result<GateScaffold
             let (config, diagnostics) = crate::gates::parse_gates(&text, ".nopal/gates.jsonc");
             authority_diagnostics.extend(diagnostics);
             if let Some(config) = config {
-                let generated = config
-                    .scaffold
-                    .as_ref()
-                    .map(|provenance| {
-                        provenance
-                            .generated_gate_ids
-                            .iter()
-                            .map(String::as_str)
-                            .collect::<std::collections::BTreeSet<_>>()
-                    })
-                    .unwrap_or_default();
-                nopal_explicit.extend(
-                    config
-                        .gates
-                        .iter()
-                        .filter(|gate| {
-                            gate.stage == crate::gates::GateStage::PrePr
-                                && (config.scaffold.is_none()
-                                    || !generated.contains(gate.id.as_str()))
-                        })
-                        .map(|gate| gate.id.clone()),
-                );
+                nopal_explicit.extend(unscoped_explicit_pre_pr_gate_ids(&config));
                 if config.scaffold.is_some() && nopal_explicit.is_empty() {
                     generated_checked_text = Some(text.clone());
                 }
@@ -345,19 +336,10 @@ pub fn inspect_with_checked_in_authority(root: &Path) -> io::Result<GateScaffold
             let compiled = crate::beislid_import::compile_text(&text, ".beislid/workflow.md");
             authority_diagnostics.extend(compiled.diagnostics);
             if let Some(value) = compiled.modules.get("gates") {
-                beislid_explicit.extend(
-                    value
-                        .get("gates")
-                        .and_then(serde_json::Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter(|entry| {
-                            entry.get("stage").and_then(serde_json::Value::as_str) == Some("pre_pr")
-                        })
-                        .filter_map(|entry| entry.get("id").or_else(|| entry.get("name")))
-                        .filter_map(serde_json::Value::as_str)
-                        .map(ToOwned::to_owned),
-                );
+                let (config, diagnostics) =
+                    crate::gates::validate_document(value, ".beislid/workflow.md#beislid:gates");
+                authority_diagnostics.extend(diagnostics);
+                beislid_explicit.extend(unscoped_explicit_pre_pr_gate_ids(&config));
             }
         }
         Ok(None) => {}
@@ -702,84 +684,100 @@ struct DeclaredWorkspace {
     root_covering_templates: std::collections::BTreeSet<&'static str>,
 }
 
+#[derive(Deserialize)]
+struct PnpmWorkspaceDocument {
+    #[serde(default)]
+    packages: Vec<String>,
+}
+
+/// Workspace exclusions are authority-local.
+/// Keeping each root manifest in its own set prevents one ecosystem's
+/// negation from erasing a workspace independently declared by another.
+#[derive(Default)]
+struct WorkspaceDeclarationSet {
+    patterns: std::collections::BTreeSet<String>,
+    coverage_patterns: std::collections::BTreeMap<String, std::collections::BTreeSet<&'static str>>,
+    excludes: std::collections::BTreeSet<String>,
+}
+
 fn discover_workspaces(
     root: &Path,
     plan: &mut GateScaffoldPlan,
 ) -> io::Result<Vec<DeclaredWorkspace>> {
-    let mut patterns = std::collections::BTreeSet::new();
-    let mut coverage_patterns = std::collections::BTreeMap::new();
-    let mut excludes = std::collections::BTreeSet::new();
-    collect_toml_workspace_patterns(
-        root,
-        plan,
-        &mut patterns,
-        &mut coverage_patterns,
-        &mut excludes,
-    )?;
-    collect_json_workspace_patterns(root, plan, &mut patterns)?;
-    collect_line_workspace_patterns(root, plan, &mut patterns, &mut coverage_patterns)?;
+    let mut declarations = Vec::new();
+    collect_toml_workspace_patterns(root, plan, &mut declarations)?;
+    collect_json_workspace_patterns(root, plan, &mut declarations)?;
+    collect_line_workspace_patterns(root, plan, &mut declarations)?;
 
     let mut budget = ExpansionBudget::default();
-    let mut excluded_workspaces = std::collections::BTreeSet::new();
-    for raw_pattern in excludes {
-        let Some(pattern) = normalize_workspace_pattern(&raw_pattern) else {
-            block_workspace(
-                plan,
-                &raw_pattern,
-                "workspace exclusion is empty after normalization",
-            );
-            continue;
-        };
-        if invalid_workspace_pattern(&pattern) {
-            block_workspace(
-                plan,
-                &raw_pattern,
-                "workspace exclusions must be relative and cannot contain parent traversal",
-            );
-            continue;
-        }
-        excluded_workspaces.extend(expand_workspace_pattern(root, &pattern, plan, &mut budget)?);
-    }
-
     let mut workspaces: std::collections::BTreeMap<
         String,
         std::collections::BTreeSet<&'static str>,
     > = std::collections::BTreeMap::new();
-    for raw_pattern in patterns {
-        let coverage = coverage_patterns
-            .get(&raw_pattern)
-            .cloned()
-            .unwrap_or_default();
-        let Some(pattern) = normalize_workspace_pattern(&raw_pattern) else {
-            block_workspace(
+    for declaration in declarations {
+        let mut excluded_workspaces = std::collections::BTreeSet::new();
+        for raw_pattern in declaration.excludes {
+            let Some(pattern) = normalize_workspace_pattern(&raw_pattern) else {
+                block_workspace(
+                    plan,
+                    &raw_pattern,
+                    "workspace exclusion is empty after normalization",
+                );
+                continue;
+            };
+            if invalid_workspace_pattern(&pattern) {
+                block_workspace(
+                    plan,
+                    &raw_pattern,
+                    "workspace exclusions must be relative and cannot contain parent traversal",
+                );
+                continue;
+            }
+            excluded_workspaces.extend(expand_workspace_pattern(
+                root,
+                &pattern,
                 plan,
-                &raw_pattern,
-                "workspace declaration is empty after normalization",
-            );
-            continue;
-        };
-        if invalid_workspace_pattern(&pattern) {
-            block_workspace(
-                plan,
-                &raw_pattern,
-                "workspace declarations must be relative and cannot contain parent traversal",
-            );
-            continue;
+                &mut budget,
+            )?);
         }
-        let expanded = expand_workspace_pattern(root, &pattern, plan, &mut budget)?;
-        if expanded.is_empty() && !pattern.contains(['*', '?', '[']) {
-            block_workspace(
-                plan,
-                &raw_pattern,
-                "declared workspace does not resolve to a confined directory",
-            );
-        }
-        for workspace in expanded {
-            if !excluded_workspaces.contains(&workspace) {
-                workspaces
-                    .entry(workspace)
-                    .or_default()
-                    .extend(coverage.iter().copied());
+
+        for raw_pattern in declaration.patterns {
+            let coverage = declaration
+                .coverage_patterns
+                .get(&raw_pattern)
+                .cloned()
+                .unwrap_or_default();
+            let Some(pattern) = normalize_workspace_pattern(&raw_pattern) else {
+                block_workspace(
+                    plan,
+                    &raw_pattern,
+                    "workspace declaration is empty after normalization",
+                );
+                continue;
+            };
+            if invalid_workspace_pattern(&pattern) {
+                block_workspace(
+                    plan,
+                    &raw_pattern,
+                    "workspace declarations must be relative and cannot contain parent traversal",
+                );
+                continue;
+            }
+            let expanded = expand_workspace_pattern(root, &pattern, plan, &mut budget)?;
+            if expanded.is_empty() && !pattern.contains(['*', '?', '[']) {
+                block_workspace(
+                    plan,
+                    &raw_pattern,
+                    "declared workspace does not resolve to a confined directory",
+                );
+            }
+            for workspace in expanded {
+                if !excluded_workspaces.contains(&workspace) {
+                    workspaces
+                        .entry(workspace)
+                        .or_default()
+                        .extend(coverage.iter().copied());
+                }
             }
         }
     }
@@ -795,12 +793,7 @@ fn discover_workspaces(
 fn collect_toml_workspace_patterns(
     root: &Path,
     plan: &mut GateScaffoldPlan,
-    patterns: &mut std::collections::BTreeSet<String>,
-    coverage_patterns: &mut std::collections::BTreeMap<
-        String,
-        std::collections::BTreeSet<&'static str>,
-    >,
-    excludes: &mut std::collections::BTreeSet<String>,
+    declarations: &mut Vec<WorkspaceDeclarationSet>,
 ) -> io::Result<()> {
     for path in ["Cargo.toml", "pyproject.toml"] {
         let Some(text) = read_optional_evidence(root, path, plan)? else {
@@ -813,25 +806,30 @@ fn collect_toml_workspace_patterns(
                 continue;
             }
         };
+        let mut declaration = WorkspaceDeclarationSet::default();
         if path == "Cargo.toml" {
             for member in toml_array_strings(&value, &["workspace", "members"]) {
-                patterns.insert(member.clone());
-                coverage_patterns
+                declaration.patterns.insert(member.clone());
+                declaration
+                    .coverage_patterns
                     .entry(member)
                     .or_default()
                     .insert("rust.cargo/v1");
             }
-            excludes.extend(toml_array_strings(&value, &["workspace", "exclude"]));
+            declaration
+                .excludes
+                .extend(toml_array_strings(&value, &["workspace", "exclude"]));
         } else {
-            patterns.extend(toml_array_strings(
+            declaration.patterns.extend(toml_array_strings(
                 &value,
                 &["tool", "uv", "workspace", "members"],
             ));
-            excludes.extend(toml_array_strings(
+            declaration.excludes.extend(toml_array_strings(
                 &value,
                 &["tool", "uv", "workspace", "exclude"],
             ));
         }
+        declarations.push(declaration);
     }
     Ok(())
 }
@@ -856,8 +854,9 @@ fn toml_array_strings(value: &toml::Value, keys: &[&str]) -> Vec<String> {
 fn collect_json_workspace_patterns(
     root: &Path,
     plan: &mut GateScaffoldPlan,
-    patterns: &mut std::collections::BTreeSet<String>,
+    declarations: &mut Vec<WorkspaceDeclarationSet>,
 ) -> io::Result<()> {
+    let mut declaration = WorkspaceDeclarationSet::default();
     if let Some(text) = read_optional_evidence(root, "package.json", plan)? {
         let package: serde_json::Value = match serde_json::from_str(&text) {
             Ok(value) => value,
@@ -876,7 +875,7 @@ fn collect_json_workspace_patterns(
                 .or_else(|| value.get("packages").and_then(serde_json::Value::as_array))
         });
         if let Some(workspaces) = workspaces {
-            patterns.extend(
+            declaration.patterns.extend(
                 workspaces
                     .iter()
                     .filter_map(serde_json::Value::as_str)
@@ -950,7 +949,7 @@ fn collect_json_workspace_patterns(
             .and_then(|value| value.get("include"))
             .and_then(serde_json::Value::as_array)
         {
-            patterns.extend(
+            declaration.patterns.extend(
                 items
                     .iter()
                     .filter_map(serde_json::Value::as_str)
@@ -959,37 +958,47 @@ fn collect_json_workspace_patterns(
             );
         }
     }
+    declarations.push(declaration);
     Ok(())
 }
 
 fn collect_line_workspace_patterns(
     root: &Path,
     plan: &mut GateScaffoldPlan,
-    patterns: &mut std::collections::BTreeSet<String>,
-    coverage_patterns: &mut std::collections::BTreeMap<
-        String,
-        std::collections::BTreeSet<&'static str>,
-    >,
+    declarations: &mut Vec<WorkspaceDeclarationSet>,
 ) -> io::Result<()> {
+    let mut pnpm_declaration = WorkspaceDeclarationSet::default();
     if let Some(text) = read_optional_evidence(root, "pnpm-workspace.yaml", plan)? {
-        let mut in_packages = false;
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed == "packages:" {
-                in_packages = true;
-                continue;
+        let document: PnpmWorkspaceDocument = match serde_yaml_ng::from_str(&text) {
+            Ok(document) => document,
+            Err(error) => {
+                block_invalid_evidence(
+                    plan,
+                    "pnpm-workspace.yaml",
+                    format!("invalid pnpm workspace YAML: {error}"),
+                );
+                PnpmWorkspaceDocument {
+                    packages: Vec::new(),
+                }
             }
-            if in_packages && !line.starts_with(char::is_whitespace) {
-                break;
-            }
-            if in_packages && let Some(pattern) = trimmed.strip_prefix('-') {
-                patterns.insert(pattern.trim().trim_matches(['\'', '"']).to_owned());
+        };
+        for pattern in document.packages {
+            if let Some(excluded) = pattern.strip_prefix('!') {
+                pnpm_declaration.excludes.insert(excluded.to_owned());
+            } else {
+                pnpm_declaration.patterns.insert(pattern);
             }
         }
     }
+    declarations.push(pnpm_declaration);
+
+    let mut declaration = WorkspaceDeclarationSet::default();
+    let patterns = &mut declaration.patterns;
+    let coverage_patterns = &mut declaration.coverage_patterns;
     if let Some(text) = read_optional_evidence(root, "go.work", plan)? {
+        let syntax = strip_go_comments(&text);
         let mut in_block = false;
-        for line in text.lines() {
+        for line in syntax.lines() {
             let trimmed = line.trim();
             if trimmed == "use (" {
                 in_block = true;
@@ -1003,7 +1012,8 @@ fn collect_line_workspace_patterns(
         }
     }
     if let Some(text) = read_optional_evidence(root, "pom.xml", plan)? {
-        for module in xml_values(&text, "module") {
+        let syntax = strip_xml_comments(&text);
+        for module in xml_values(&syntax, "module") {
             patterns.insert(module.clone());
             record_root_coverage(coverage_patterns, module, "java.maven/v1");
         }
@@ -1044,13 +1054,10 @@ fn collect_line_workspace_patterns(
         ("meson.build", "subdir"),
     ] {
         if let Some(text) = read_optional_evidence(root, path, plan)? {
-            for line in text.lines().filter(|line| line.contains(marker)) {
-                if let Some(arguments) = line
-                    .split_once('(')
-                    .and_then(|(_, rest)| rest.split_once(')'))
-                    && let Some(value) = arguments.0.split_whitespace().next()
-                {
-                    let workspace = value.trim_matches(['\'', '"']).to_owned();
+            let syntax = strip_build_comments(&text, path == "CMakeLists.txt");
+            for line in syntax.lines() {
+                if let Some(value) = declared_call_first_argument(line, marker) {
+                    let workspace = value.to_owned();
                     patterns.insert(workspace.clone());
                     let template = if path == "CMakeLists.txt" {
                         "cpp.cmake/v1"
@@ -1074,6 +1081,7 @@ fn collect_line_workspace_patterns(
             }
         }
     }
+    declarations.push(declaration);
     Ok(())
 }
 
@@ -1089,6 +1097,97 @@ fn record_root_coverage(
         .entry(pattern)
         .or_default()
         .insert(template);
+}
+
+/// Workspace evidence comes only from Go syntax, never from line or block
+/// comments that may contain examples or disabled declarations.
+/// Masking non-newline comment text with spaces prevents comment removal from
+/// splicing surrounding fragments into a new token.
+fn strip_go_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut block_comment = false;
+    while index < bytes.len() {
+        let Some(character) = text[index..].chars().next() else {
+            break;
+        };
+        let width = character.len_utf8();
+        if block_comment {
+            if bytes.get(index..index + 2) == Some(b"*/") {
+                block_comment = false;
+                output.push(' ');
+                index += 2;
+            } else {
+                output.push(if character == '\n' { '\n' } else { ' ' });
+                index += width;
+            }
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            output.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' && active_quote != '`' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            index += width;
+            continue;
+        }
+        if bytes.get(index..index + 2) == Some(b"//") {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                output.push(' ');
+                index += 1;
+            }
+            continue;
+        }
+        if bytes.get(index..index + 2) == Some(b"/*") {
+            block_comment = true;
+            output.push(' ');
+            index += 2;
+            continue;
+        }
+        if matches!(character, '\'' | '"' | '`') {
+            quote = Some(character);
+        }
+        output.push(character);
+        index += width;
+    }
+    output
+}
+
+/// XML comments are documentation, not Maven module authority.
+/// Space masking preserves token boundaries so comments cannot synthesize tag
+/// names when they appear between XML name fragments.
+fn strip_xml_comments(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("<!--") {
+        output.push_str(&rest[..start]);
+        let comment = &rest[start + 4..];
+        if let Some(end) = comment.find("-->") {
+            output.extend(
+                rest[start..start + 4 + end + 3]
+                    .chars()
+                    .map(|character| if character == '\n' { '\n' } else { ' ' }),
+            );
+            rest = &comment[end + 3..];
+        } else {
+            output.extend(
+                rest[start..]
+                    .chars()
+                    .map(|character| if character == '\n' { '\n' } else { ' ' }),
+            );
+            rest = "";
+            break;
+        }
+    }
+    output.push_str(rest);
+    output
 }
 
 fn xml_values(text: &str, tag: &str) -> Vec<String> {
@@ -1123,6 +1222,162 @@ fn quoted_values(text: &str) -> Vec<String> {
         }
     }
     values
+}
+
+fn strip_build_comments(text: &str, cmake_bracket_comments: bool) -> String {
+    let bytes = text.as_bytes();
+    let mut output = String::with_capacity(text.len());
+    let mut index = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let Some(character) = text[index..].chars().next() else {
+            break;
+        };
+        let width = character.len_utf8();
+        if let Some(active_quote) = quote {
+            output.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' && active_quote == '"' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            index += width;
+            continue;
+        }
+        if !cmake_bracket_comments && let Some(delimiter) = meson_multiline_delimiter(bytes, index)
+        {
+            index += 3;
+            while index < bytes.len() {
+                if meson_multiline_delimiter(bytes, index) == Some(delimiter) {
+                    index += 3;
+                    break;
+                }
+                let Some(string_character) = text[index..].chars().next() else {
+                    break;
+                };
+                if string_character == '\n' {
+                    output.push('\n');
+                }
+                index += string_character.len_utf8();
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            output.push(character);
+            index += width;
+            continue;
+        }
+        if cmake_bracket_comments
+            && let Some((content_start, equals)) = cmake_bracket_open(bytes, index)
+        {
+            index = content_start;
+            while index < bytes.len() {
+                if cmake_bracket_close(bytes, index, equals) {
+                    index += equals + 2;
+                    break;
+                }
+                let Some(string_character) = text[index..].chars().next() else {
+                    break;
+                };
+                if string_character == '\n' {
+                    output.push('\n');
+                }
+                index += string_character.len_utf8();
+            }
+            continue;
+        }
+        if character != '#' {
+            output.push(character);
+            index += width;
+            continue;
+        }
+        if cmake_bracket_comments
+            && let Some((content_start, equals)) = cmake_bracket_comment_open(bytes, index)
+        {
+            index = content_start;
+            while index < bytes.len() {
+                if cmake_bracket_comment_close(bytes, index, equals) {
+                    index += equals + 2;
+                    break;
+                }
+                let Some(comment_character) = text[index..].chars().next() else {
+                    break;
+                };
+                if comment_character == '\n' {
+                    output.push('\n');
+                }
+                index += comment_character.len_utf8();
+            }
+        } else {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+        }
+    }
+    output
+}
+
+fn meson_multiline_delimiter(bytes: &[u8], index: usize) -> Option<u8> {
+    let delimiter = *bytes.get(index)?;
+    (matches!(delimiter, b'\'' | b'"')
+        && bytes.get(index + 1) == Some(&delimiter)
+        && bytes.get(index + 2) == Some(&delimiter))
+    .then_some(delimiter)
+}
+
+fn cmake_bracket_comment_open(bytes: &[u8], index: usize) -> Option<(usize, usize)> {
+    (bytes.get(index) == Some(&b'#'))
+        .then(|| cmake_bracket_open(bytes, index + 1))
+        .flatten()
+}
+
+fn cmake_bracket_open(bytes: &[u8], index: usize) -> Option<(usize, usize)> {
+    if bytes.get(index) != Some(&b'[') {
+        return None;
+    }
+    let mut cursor = index + 1;
+    while bytes.get(cursor) == Some(&b'=') {
+        cursor += 1;
+    }
+    (bytes.get(cursor) == Some(&b'[')).then_some((cursor + 1, cursor - index - 1))
+}
+
+fn cmake_bracket_comment_close(bytes: &[u8], index: usize, equals: usize) -> bool {
+    cmake_bracket_close(bytes, index, equals)
+}
+
+fn cmake_bracket_close(bytes: &[u8], index: usize, equals: usize) -> bool {
+    if bytes.get(index) != Some(&b']') {
+        return false;
+    }
+    let equals_end = index + 1 + equals;
+    bytes
+        .get(index + 1..equals_end)
+        .is_some_and(|delimiter| delimiter.iter().all(|byte| *byte == b'='))
+        && bytes.get(equals_end) == Some(&b']')
+}
+
+fn declared_call_first_argument<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    let trimmed = line.trim_start();
+    let command = trimmed.get(..marker.len())?;
+    if !command.eq_ignore_ascii_case(marker) {
+        return None;
+    }
+    let arguments = trimmed
+        .get(marker.len()..)?
+        .trim_start()
+        .strip_prefix('(')?
+        .split_once(')')?
+        .0;
+    let value = arguments
+        .split_whitespace()
+        .next()?
+        .trim_matches(['\'', '"']);
+    (!value.is_empty()).then_some(value)
 }
 
 fn normalize_workspace_pattern(pattern: &str) -> Option<String> {
@@ -1738,8 +1993,9 @@ fn collect_composer_scripts(
     };
     let tasks = value
         .get("scripts")
-        .and_then(serde_json::Value::as_object)
-        .map(|scripts| ordered_validation_tasks(scripts.keys().map(String::as_str)))
+        .and_then(|scripts| scripts.get("test"))
+        .filter(|script| composer_test_runs_phpunit(script))
+        .map(|_| vec!["test".to_owned()])
         .unwrap_or_default();
     if !tasks.is_empty() {
         sources.push(ExplicitTaskSource {
@@ -2103,19 +2359,73 @@ fn detect_php(root: &Path, plan: &mut GateScaffoldPlan, suppressed: bool) -> io:
     let Some(composer) = read_optional_evidence(root, "composer.json", plan)? else {
         return Ok(());
     };
-    let phpunit_config =
-        has_evidence(root, "phpunit.xml", plan)? || has_evidence(root, "phpunit.xml.dist", plan)?;
-    if composer.contains("phpunit") || phpunit_config {
+    let value: serde_json::Value = match serde_json::from_str(&composer) {
+        Ok(value) => value,
+        Err(error) => {
+            block_invalid_evidence(
+                plan,
+                "composer.json",
+                format!("invalid composer.json: {error}"),
+            );
+            return Ok(());
+        }
+    };
+    let configured_dependency = ["require", "require-dev"].iter().any(|section| {
+        value
+            .get(section)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|dependencies| dependencies.contains_key("phpunit/phpunit"))
+    });
+    let configured_script = value
+        .get("scripts")
+        .and_then(|scripts| scripts.get("test"))
+        .is_some_and(composer_test_runs_phpunit);
+    let phpunit_config_path = if has_evidence(root, "phpunit.xml", plan)? {
+        Some("phpunit.xml")
+    } else if has_evidence(root, "phpunit.xml.dist", plan)? {
+        Some("phpunit.xml.dist")
+    } else {
+        None
+    };
+    if configured_script || configured_dependency || phpunit_config_path.is_some() {
+        let mut evidence = vec!["composer.json".to_owned()];
+        evidence.extend(phpunit_config_path.map(ToOwned::to_owned));
+        let run = if configured_script {
+            gate("phpunit", &["composer", "test"])
+        } else {
+            gate("phpunit", &["vendor/bin/phpunit"])
+        };
         choose_template(
             plan,
             suppressed,
             "php.composer/v1",
             "php",
-            vec!["composer.json".to_owned()],
-            vec![gate("phpunit", &["vendor/bin/phpunit"])],
+            evidence,
+            vec![run],
         );
     }
     Ok(())
+}
+
+fn composer_test_runs_phpunit(value: &serde_json::Value) -> bool {
+    let commands = match value {
+        serde_json::Value::String(command) => vec![command.as_str()],
+        serde_json::Value::Array(commands) => commands
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect(),
+        _ => Vec::new(),
+    };
+    commands.into_iter().any(|command| {
+        command
+            .split_whitespace()
+            .next()
+            .map(|token| token.trim_matches(['\'', '"']))
+            .is_some_and(|executable| {
+                !executable.starts_with('@')
+                    && (executable == "phpunit" || executable.ends_with("/phpunit"))
+            })
+    })
 }
 
 fn detect_cpp(root: &Path, plan: &mut GateScaffoldPlan, suppressed: bool) -> io::Result<()> {

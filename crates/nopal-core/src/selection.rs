@@ -109,12 +109,21 @@ pub fn select(config: &GatesConfig, stage: GateStage, changed_files: &[String]) 
     // Gate id -> first Via that pulled it in, in selection order.
     let mut pulled: Vec<(String, Via)> = Vec::new();
     let mut selectors = Vec::new();
+    let generated_gate_ids = config.generated_gate_ids();
 
     if config.selectors.is_empty() {
         for gate in &config.gates {
             pulled.push((gate.id.clone(), Via::Default));
         }
     } else {
+        // Generated baselines are repository-wide defaults. Explicit selectors
+        // scope explicit authority; they do not silently scope generated proof
+        // that was scaffolded before those selectors existed.
+        for gate in &config.gates {
+            if generated_gate_ids.contains(gate.id.as_str()) {
+                pulled.push((gate.id.clone(), Via::Default));
+            }
+        }
         for selector in &config.selectors {
             let matched_files = matching_files(&files, &selector.paths, &selector.exclude);
             let matched = !matched_files.is_empty();
@@ -144,12 +153,22 @@ pub fn select(config: &GatesConfig, stage: GateStage, changed_files: &[String]) 
         }
     }
 
-    let suppressed_generated =
-        if config.has_explicit_gates_for_stage(&stage) && config.scaffold.is_some() {
-            config.generated_gate_ids()
-        } else {
-            std::collections::BTreeSet::new()
-        };
+    // Explicit authority replaces generated defaults only when selected
+    // same-stage proof covers the whole change set. One matching selector
+    // cannot erase generated proof for files outside that selector's scope.
+    let selected_explicit_authority = explicit_authority_covers_selection(
+        config,
+        &stage,
+        &files,
+        &selectors,
+        &pulled,
+        &generated_gate_ids,
+    );
+    let suppressed_generated = if config.scaffold.is_some() && selected_explicit_authority {
+        generated_gate_ids
+    } else {
+        std::collections::BTreeSet::new()
+    };
     let mut selected = Vec::new();
     let mut skipped = Vec::new();
 
@@ -214,6 +233,44 @@ pub fn select(config: &GatesConfig, stage: GateStage, changed_files: &[String]) 
 
 fn find_gate<'a>(config: &'a GatesConfig, id: &str) -> Option<&'a Gate> {
     config.gates.iter().find(|gate| gate.id == id)
+}
+
+fn explicit_authority_covers_selection(
+    config: &GatesConfig,
+    stage: &GateStage,
+    files: &[String],
+    selector_matches: &[SelectorMatch],
+    pulled: &[(String, Via)],
+    generated_gate_ids: &std::collections::BTreeSet<&str>,
+) -> bool {
+    if config.selectors.is_empty() {
+        return pulled.iter().any(|(id, _)| {
+            find_gate(config, id).is_some_and(|gate| {
+                &gate.stage == stage && !generated_gate_ids.contains(gate.id.as_str())
+            })
+        });
+    }
+    if files.is_empty() {
+        return false;
+    }
+    let mut covered_files = std::collections::BTreeSet::new();
+    for (selector, matched) in config.selectors.iter().zip(selector_matches) {
+        let selects_explicit_gate = selector.gate_sets.iter().any(|set_name| {
+            config.gate_sets.get(set_name).is_some_and(|set| {
+                set.gates.iter().any(|id| {
+                    find_gate(config, id).is_some_and(|gate| {
+                        &gate.stage == stage && !generated_gate_ids.contains(gate.id.as_str())
+                    })
+                })
+            })
+        });
+        if selects_explicit_gate {
+            covered_files.extend(matched.matched_files.iter().map(String::as_str));
+        }
+    }
+    files
+        .iter()
+        .all(|file| covered_files.contains(file.as_str()))
 }
 
 /// Changed files matching any `paths` glob and no `exclude` glob, in the

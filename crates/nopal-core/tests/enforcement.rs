@@ -86,7 +86,7 @@ fn explicit_nopal_or_beislid_gates_supersede_generated_templates() {
 fn symlinked_authority_files_and_directories_fail_closed_without_following_targets() {
     use std::os::unix::fs::symlink;
 
-    for authority in ["gates", "workflow", "directory"] {
+    for authority in ["gates", "gates-internal", "workflow", "directory"] {
         let temp = tempfile::tempdir().unwrap();
         project(temp.path());
         let outside = temp.path().join(format!("outside-{authority}"));
@@ -97,6 +97,13 @@ fn symlinked_authority_files_and_directories_fail_closed_without_following_targe
             );
             fs::remove_file(temp.path().join(".nopal/gates.jsonc")).unwrap();
             symlink(&outside, temp.path().join(".nopal/gates.jsonc")).unwrap();
+        } else if authority == "gates-internal" {
+            write(
+                &temp.path().join(".nopal/real-gates.jsonc"),
+                r#"{"version":"nopal.gates/v1","gates":[{"id":"inside","stage":"pre_pr","argv":["true"]}]}"#,
+            );
+            fs::remove_file(temp.path().join(".nopal/gates.jsonc")).unwrap();
+            symlink("real-gates.jsonc", temp.path().join(".nopal/gates.jsonc")).unwrap();
         } else if authority == "workflow" {
             write(
                 &outside,
@@ -131,6 +138,56 @@ fn symlinked_authority_files_and_directories_fail_closed_without_following_targe
             diagnostic.code == nopal_core::diagnostics::Code::ModuleParseError
         }));
     }
+}
+
+#[test]
+fn selector_scoped_explicit_gate_cannot_suppress_all_generated_push_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    project(temp.path());
+    write(&temp.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n");
+    let generated = nopal_core::gate_scaffold::inspect(temp.path()).unwrap();
+    let mut gates: serde_json::Value =
+        serde_json::from_str(&generated.gates_json().unwrap()).unwrap();
+    gates["gates"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "explicit-rust",
+            "stage": "pre_pr",
+            "argv": ["cargo", "test"]
+        }));
+    gates["gate_sets"] = serde_json::json!({
+        "rust": {"gates": ["explicit-rust"]}
+    });
+    gates["selectors"] = serde_json::json!([{
+        "name": "rust",
+        "paths": ["**/*.rs"],
+        "gate_sets": ["rust"]
+    }]);
+    write(
+        &temp.path().join(".nopal/gates.jsonc"),
+        &serde_json::to_string_pretty(&gates).unwrap(),
+    );
+
+    let report = enforcement::plan(EnforcementRequest {
+        root: temp.path(),
+        config_dir: None,
+        mode: Mode::SupervisedAuto,
+        action: "git.push",
+        classes: &[ActionClass::GitRemote],
+        run_dir: None,
+        receipt_key: None,
+    })
+    .unwrap();
+
+    assert!(report.ok, "{:?}", report.diagnostics);
+    assert!(!report.required_gates.is_empty());
+    assert!(
+        report
+            .required_gates
+            .iter()
+            .all(|gate| gate.id.starts_with("detected."))
+    );
 }
 
 #[test]

@@ -108,6 +108,17 @@ fn generated_v2_document_is_accepted_and_malformed_provenance_fails_closed() {
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic.code == nopal_core::diagnostics::Code::ScaffoldTemplateInvalid
     }));
+
+    let mut incomplete: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    incomplete["scaffold"]["generated_gate_ids"] = serde_json::json!([]);
+    let (_, diagnostics) = nopal_core::gates::parse_gates(
+        &serde_json::to_string(&incomplete).unwrap(),
+        ".nopal/gates.jsonc",
+    );
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == nopal_core::diagnostics::Code::FieldInvalid
+            && diagnostic.message.contains("generated gate")
+    }));
 }
 
 #[test]
@@ -145,6 +156,63 @@ fn explicit_gate_selection_suppresses_generated_template_gates() {
             .iter()
             .any(|gate| { gate.reason.as_str() == "superseded_by_explicit_authority" })
     );
+}
+
+#[test]
+fn partially_matched_explicit_selectors_do_not_suppress_uncovered_generated_proof() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(temp.path(), &[("Cargo.toml", "[workspace]\nmembers=[]\n")]);
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&plan.gates_json().unwrap()).unwrap();
+    value["gates"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "explicit-rust",
+            "stage": "pre_pr",
+            "argv": ["cargo", "test"]
+        }));
+    value["gate_sets"] = serde_json::json!({
+        "rust": {"gates": ["explicit-rust"]}
+    });
+    value["selectors"] = serde_json::json!([{
+        "name": "rust",
+        "paths": ["**/*.rs"],
+        "gate_sets": ["rust"]
+    }]);
+    let (config, diagnostics) = nopal_core::gates::parse_gates(
+        &serde_json::to_string(&value).unwrap(),
+        ".nopal/gates.jsonc",
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let config = config.unwrap();
+
+    let fully_covered = nopal_core::selection::select(
+        &config,
+        nopal_core::gates::GateStage::PrePr,
+        &["src/lib.rs".to_owned()],
+    );
+    assert_eq!(
+        fully_covered
+            .selected
+            .iter()
+            .map(|gate| gate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["explicit-rust"]
+    );
+
+    let partially_covered = nopal_core::selection::select(
+        &config,
+        nopal_core::gates::GateStage::PrePr,
+        &["README.md".to_owned(), "src/lib.rs".to_owned()],
+    );
+    let selected = partially_covered
+        .selected
+        .iter()
+        .map(|gate| gate.id.as_str())
+        .collect::<Vec<_>>();
+    assert!(selected.contains(&"explicit-rust"));
+    assert!(selected.contains(&"detected.root.baseline.diff-check"));
 }
 
 #[test]
@@ -944,6 +1012,28 @@ fn checked_in_nopal_and_typed_beislid_gates_supersede_generated_defaults() {
 }
 
 #[test]
+fn doctor_does_not_treat_selector_scoped_gates_as_repository_wide_readiness() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[(
+            ".nopal/gates.jsonc",
+            r#"{
+  "version": "nopal.gates/v1",
+  "gates": [{"id":"explicit-rust","stage":"pre_pr","argv":["cargo","test"]}],
+  "gate_sets": {"rust":{"gates":["explicit-rust"]}},
+  "selectors": [{"name":"rust","paths":["**/*.rs"],"gate_sets":["rust"]}]
+}"#,
+        )],
+    );
+
+    let plan = gate_scaffold::inspect_with_checked_in_authority(temp.path()).unwrap();
+
+    assert_eq!(plan.readiness, Readiness::NeedsConfiguration);
+    assert_eq!(plan.authority.as_str(), "generated");
+}
+
+#[test]
 fn doctor_reports_drift_between_checked_in_generation_and_current_evidence() {
     let temp = tempfile::tempdir().unwrap();
     write_files(temp.path(), &[("Cargo.toml", "[workspace]\nmembers=[]\n")]);
@@ -995,5 +1085,223 @@ fn repeated_detection_is_byte_deterministic() {
     assert_eq!(
         serde_json::to_vec(&first).unwrap(),
         serde_json::to_vec(&second).unwrap()
+    );
+}
+
+#[test]
+fn composer_description_text_does_not_prove_phpunit() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[(
+            "composer.json",
+            r#"{"name":"demo/demo","description":"Documentation mentions phpunit but does not configure it","scripts":{"test":"echo phpunit is not configured"}}"#,
+        )],
+    );
+
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+
+    assert_eq!(plan.readiness, Readiness::NeedsConfiguration);
+    assert!(!plan.selected_template_ids().contains(&"php.composer/v1"));
+}
+
+#[test]
+fn composer_script_alias_does_not_prove_the_aliased_command_runs_phpunit() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[(
+            "composer.json",
+            r#"{"name":"demo/demo","scripts":{"test":"@fake/phpunit","fake/phpunit":"echo no tests"}}"#,
+        )],
+    );
+
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+
+    assert_eq!(plan.readiness, Readiness::NeedsConfiguration);
+    assert!(!plan.selected_template_ids().contains(&"php.composer/v1"));
+}
+
+#[test]
+fn go_and_maven_comments_do_not_declare_workspaces() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            (
+                "go.work",
+                "go 1.22\nus/* disabled */e ./split-comment-go\nuse (\n  // ./commented-go\n  /* ./also-commented-go */\n  ./live-go\n)\n",
+            ),
+            (
+                "pom.xml",
+                "<project><modules><!-- <module>commented-maven</module> --><mod<!-- disabled -->ule>split-comment-maven</module><module>live-maven</module></modules></project>",
+            ),
+            (
+                "split-comment-go/go.mod",
+                "module example.test/split-comment-go\n",
+            ),
+            (
+                "split-comment-maven/go.mod",
+                "module example.test/split-comment-maven\n",
+            ),
+            ("live-go/go.mod", "module example.test/live-go\n"),
+            ("live-maven/go.mod", "module example.test/live-maven\n"),
+        ],
+    );
+
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    let scopes = plan
+        .templates
+        .iter()
+        .map(|template| template.scope.as_str())
+        .collect::<Vec<_>>();
+    assert!(scopes.contains(&"live-go"));
+    assert!(scopes.contains(&"live-maven"));
+    assert!(!scopes.contains(&"commented-go"));
+    assert!(!scopes.contains(&"also-commented-go"));
+    assert!(!scopes.contains(&"commented-maven"));
+    assert!(!scopes.contains(&"split-comment-go"));
+    assert!(!scopes.contains(&"split-comment-maven"));
+}
+
+#[test]
+fn commented_cpp_subdirectory_calls_do_not_declare_workspaces() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            (
+                "CMakeLists.txt",
+                "enable_testing()\n# add_subdirectory(line-comment)\n#[[\nadd_subdirectory(archive)\n]]\n",
+            ),
+            ("line-comment/go.mod", "module example.test/line-comment\n"),
+            ("archive/go.mod", "module example.test/archive\n"),
+        ],
+    );
+
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert!(
+        !plan
+            .templates
+            .iter()
+            .any(|template| { matches!(template.scope.as_str(), "archive" | "line-comment") })
+    );
+}
+
+#[test]
+fn cmake_bracket_strings_are_ignored_and_commands_are_case_insensitive() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            (
+                "CMakeLists.txt",
+                "enable_testing()\nset(DOCUMENTATION [=[\nadd_subdirectory(archive)\n]=])\nADD_SUBDIRECTORY(live)\n",
+            ),
+            ("archive/go.mod", "module example.test/archive\n"),
+            ("live/go.mod", "module example.test/live\n"),
+        ],
+    );
+
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert!(
+        !plan
+            .templates
+            .iter()
+            .any(|template| template.scope == "archive")
+    );
+    assert!(
+        plan.templates
+            .iter()
+            .any(|template| template.scope == "live")
+    );
+}
+
+#[test]
+fn multiline_meson_strings_do_not_declare_workspaces() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            (
+                "meson.build",
+                "project('demo', 'c')\nmessage = '''\nsubdir('archive')\n'''\n",
+            ),
+            ("archive/go.mod", "module example.test/archive\n"),
+        ],
+    );
+
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert!(
+        !plan
+            .templates
+            .iter()
+            .any(|template| template.scope == "archive")
+    );
+}
+
+#[test]
+fn pnpm_negations_do_not_exclude_workspaces_declared_by_cargo() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            ("Cargo.toml", "[workspace]\nmembers = ['packages/*']\n"),
+            (
+                "pnpm-workspace.yaml",
+                "packages:\n  - 'packages/*'\n  - '!packages/backend'\n",
+            ),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            ("packages/backend/go.mod", "module example.test/backend\n"),
+        ],
+    );
+
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert!(
+        plan.templates
+            .iter()
+            .any(|template| template.scope == "packages/backend")
+    );
+}
+
+#[test]
+fn pnpm_negated_workspace_patterns_exclude_matching_members() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            (
+                "pnpm-workspace.yaml",
+                "packages:\n  - 'packages/*'\n  - '!packages/legacy' # intentionally excluded\n",
+            ),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            ("packages/app/go.mod", "module example.test/app\n"),
+            ("packages/legacy/go.mod", "module example.test/legacy\n"),
+        ],
+    );
+
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert!(
+        plan.templates
+            .iter()
+            .any(|template| template.scope == "packages/app")
+    );
+    assert!(
+        !plan
+            .templates
+            .iter()
+            .any(|template| template.scope == "packages/legacy")
     );
 }

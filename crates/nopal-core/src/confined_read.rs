@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{self, Read as _};
 use std::path::{Component, Path};
 
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
 
 pub fn read_utf8(root: &Path, relative: &Path, max_bytes: usize) -> io::Result<Option<String>> {
@@ -27,12 +28,7 @@ pub fn regular_file_exists(root: &Path, relative: &Path) -> io::Result<bool> {
         Err(error) => return Err(error),
     };
     let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
+    options.read(true).follow(FollowSymlinks::No);
     match parent.open_with(name, &options) {
         Ok(file) => Ok(file.metadata()?.is_file()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -47,12 +43,7 @@ pub fn read_bytes(root: &Path, relative: &Path, max_bytes: usize) -> io::Result<
         Err(error) => return Err(error),
     };
     let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use cap_std::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
+    options.read(true).follow(FollowSymlinks::No);
     let mut file = match parent.open_with(name, &options) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -101,11 +92,11 @@ fn open_parent<'a>(root: &Path, relative: &'a Path) -> io::Result<(Dir, &'a std:
             ));
         }
         let mut options = OpenOptions::new();
-        options.read(true);
+        options.read(true).follow(FollowSymlinks::No);
         #[cfg(unix)]
         {
             use cap_std::fs::OpenOptionsExt as _;
-            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+            options.custom_flags(libc::O_DIRECTORY);
         }
         let opened = directory.open_with(name, &options)?;
         if !opened.metadata()?.is_dir() {

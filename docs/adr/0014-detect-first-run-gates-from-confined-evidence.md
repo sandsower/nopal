@@ -26,6 +26,7 @@ The immutable plan contains readiness, selected templates, generated gates, evid
 Scaffold, launch, and `nopal doctor` consume that same plan.
 
 Generated baselines use `nopal.gates/v2` with `nopal.gate-scaffold/v1` provenance.
+Every generated gate uses the reserved `detected.*` namespace and must appear in the provenance's complete generated-gate list.
 Version 1 gate documents remain accepted as explicit checked-in authority.
 Older Nopal binaries reject version 2 instead of launching while ignoring readiness.
 
@@ -37,9 +38,20 @@ Precedence within an evidence scope is:
 4. proven ecosystem defaults;
 5. the baseline Git diff check.
 
+Same-stage explicit gates suppress generated defaults only when selected explicit proof covers the complete change set.
+An unmatched or partially matched selector cannot remove generated proof for uncovered files.
+Unknown-project readiness requires executable repository-wide proof, so selector-scoped authority cannot unblock launch before changed-file evidence exists.
+Repository-wide typed Beislið gates satisfy the same readiness rule whether the checked-in Nopal gate document is explicit version 1 or generated version 2.
+
 Independent ecosystems and declared workspaces compose deterministically.
 Conflicting package managers, build systems, or repository task runners stop generation and name all conflicting evidence.
-Fixed exclusions prevent declared globs from turning fixtures, examples, vendors, generated output, caches, or dependency trees into accidental project authority.
+Fixed exclusions and manifest-declared negated patterns prevent globs from turning fixtures, examples, vendors, generated output, caches, or dependency trees into accidental project authority.
+Manifest exclusions apply only to workspace declarations from that same manifest, so one ecosystem cannot erase a workspace independently declared by another.
+Pnpm workspace YAML is parsed structurally so quoted negations and inline comments retain their declared meaning.
+Line-oriented build declarations must be syntactic calls outside comments, CMake bracket arguments, and multiline strings rather than arbitrary text matches.
+Go and Maven workspace declarations inside their language comment forms are ignored.
+CMake command names are matched case-insensitively as required by the language.
+Composer script aliases are not proof of PHPUnit because the alias target can be an arbitrary passing command.
 Symlinked or traversing workspace declarations fail closed.
 
 An unknown repository still receives the complete six-file baseline.
@@ -48,6 +60,7 @@ A blocked or ambiguous plan is never published.
 
 A generated version 2 document is compared with current detection evidence before every launch.
 Evidence drift blocks launch unless explicit checked-in gates supersede generated defaults.
+Authority reads open every component with no-follow semantics, and enforcement hashes the exact confined bytes it parsed rather than rereading ambient paths.
 
 ## Alternatives considered
 

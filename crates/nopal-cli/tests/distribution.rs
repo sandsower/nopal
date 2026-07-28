@@ -125,6 +125,100 @@ fn unknown_first_run_writes_complete_baseline_but_does_not_start_pi() {
 }
 
 #[test]
+fn repository_wide_typed_beislid_gate_unblocks_explicit_v1_nopal_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    let adapter = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("extensions/policy-gate");
+    nopal_core::scaffold::write_baseline(
+        &repo,
+        nopal_core::distribution::BuiltinDistribution {
+            version: env!("CARGO_PKG_VERSION"),
+            root: &adapter,
+        },
+    )
+    .unwrap();
+    fs::write(
+        repo.join(".nopal/gates.jsonc"),
+        r#"{"version":"nopal.gates/v1","gates":[]}"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join(".beislid/workflow.md"),
+        "```beislid:gates\n- name: test\n  command: 'cargo test'\n```\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", repo.to_str().unwrap(), "--json", "--dry-run"])
+        .env("NOPAL_DATA_DIR", temp.path().join("data"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["ready"], true);
+}
+
+#[test]
+fn selector_scoped_gate_does_not_unblock_unknown_generated_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    let adapter = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("extensions/policy-gate");
+    nopal_core::scaffold::write_baseline(
+        &repo,
+        nopal_core::distribution::BuiltinDistribution {
+            version: env!("CARGO_PKG_VERSION"),
+            root: &adapter,
+        },
+    )
+    .unwrap();
+    let gates_path = repo.join(".nopal/gates.jsonc");
+    let mut gates: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&gates_path).unwrap()).unwrap();
+    gates["gates"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "explicit-rust",
+            "stage": "pre_pr",
+            "argv": ["cargo", "test"]
+        }));
+    gates["gate_sets"] = serde_json::json!({
+        "rust": { "gates": ["explicit-rust"] }
+    });
+    gates["selectors"] = serde_json::json!([{
+        "name": "rust",
+        "paths": ["**/*.rs"],
+        "gate_sets": ["rust"]
+    }]);
+    fs::write(&gates_path, serde_json::to_string_pretty(&gates).unwrap()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", repo.to_str().unwrap(), "--json", "--dry-run"])
+        .env("NOPAL_DATA_DIR", temp.path().join("data"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        document["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| { diagnostic["code"] == "gate_configuration_required" })
+    );
+}
+
+#[test]
 fn preflight_only_configuration_does_not_unblock_unknown_generated_gates() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");

@@ -165,29 +165,17 @@ fn checked_in_gates_ready(dir: &Path) -> io::Result<(bool, Vec<Diagnostic>)> {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "workflow is missing"))?;
     let compiled = nopal_core::beislid_import::compile_text(&workflow_text, ".beislid/workflow.md");
     let beislid_explicit = compiled.modules.get("gates").is_some_and(|value| {
-        value
-            .get("gates")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|items| {
-                items.iter().any(|gate| {
-                    gate.get("stage").and_then(serde_json::Value::as_str) == Some("pre_pr")
-                })
-            })
+        let (gates, gate_diagnostics) =
+            nopal_core::gates::validate_document(value, ".beislid/workflow.md#beislid:gates");
+        diagnostics.extend(gate_diagnostics);
+        has_unscoped_explicit_pre_pr(&gates)
     });
     diagnostics.extend(compiled.diagnostics);
 
     let ready = match &config.scaffold {
-        None => config.has_explicit_gates_for_stage(&nopal_core::gates::GateStage::PrePr),
+        None => has_unscoped_explicit_pre_pr(&config) || beislid_explicit,
         Some(provenance) => {
-            let generated = provenance
-                .generated_gate_ids
-                .iter()
-                .map(String::as_str)
-                .collect::<std::collections::BTreeSet<_>>();
-            let nopal_explicit = config.gates.iter().any(|gate| {
-                gate.stage == nopal_core::gates::GateStage::PrePr
-                    && !generated.contains(gate.id.as_str())
-            });
+            let nopal_explicit = has_unscoped_explicit_pre_pr(&config);
             if nopal_explicit || beislid_explicit {
                 true
             } else {
@@ -211,6 +199,17 @@ fn checked_in_gates_ready(dir: &Path) -> io::Result<(bool, Vec<Diagnostic>)> {
         .iter()
         .all(|diagnostic| diagnostic.severity != Severity::Error);
     Ok((ready && diagnostics_ok, diagnostics))
+}
+
+/// Launch has no changed-file set to prove selector coverage.
+/// Only explicit proof selected without file evidence can replace generated
+/// readiness for the whole repository.
+fn has_unscoped_explicit_pre_pr(config: &nopal_core::gates::GatesConfig) -> bool {
+    let generated = config.generated_gate_ids();
+    nopal_core::selection::select(config, nopal_core::gates::GateStage::PrePr, &[])
+        .selected
+        .iter()
+        .any(|gate| !generated.contains(gate.id.as_str()))
 }
 
 fn plan_without_nopal(dir: &Path, context: LaunchContext<'_>) -> io::Result<LaunchPlan> {
