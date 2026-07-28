@@ -1712,31 +1712,55 @@ fn resolve_builtin_adapter_root() -> std::io::Result<PathBuf> {
         candidates.push(root.clone());
         candidates.push(root.join("extensions/policy-gate"));
     }
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(parent) = executable.parent()
-    {
-        candidates.push(parent.join("extensions/policy-gate"));
+    if let Ok(executable) = std::env::current_exe() {
+        candidates.extend(packaged_adapter_candidates(&executable));
     }
     candidates.push(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
             .join("extensions/policy-gate"),
     );
+    resolve_builtin_adapter_root_from(candidates)
+}
+
+/// Keep executable-relative layouts explicit so app packaging can test the
+/// lookup contract without depending on a source checkout. Linux places the
+/// adapter beside the executables, while a macOS app keeps non-binary
+/// resources under `Contents/Resources`.
+fn packaged_adapter_candidates(executable: &Path) -> Vec<PathBuf> {
+    let Some(parent) = executable.parent() else {
+        return Vec::new();
+    };
+    let mut candidates = vec![parent.join("extensions/policy-gate")];
+    if let Some(contents) = parent.parent() {
+        candidates.push(contents.join("Resources/extensions/policy-gate"));
+    }
+    candidates
+}
+
+fn resolve_builtin_adapter_root_from(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> std::io::Result<PathBuf> {
     for candidate in candidates {
-        if candidate.join("index.ts").is_file() {
+        if ["index.ts", "classifier.ts", "nopal-cli.ts"]
+            .iter()
+            .all(|name| candidate.join(name).is_file())
+        {
             return candidate.canonicalize();
         }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "cannot locate the built-in Nopal enforcement adapter package",
+        "cannot locate the complete built-in Nopal enforcement adapter package",
     ))
 }
 
 fn run_distribution_update(cli: &Cli, root: &Path, write: bool) -> std::io::Result<ExitCode> {
     let builtin_root = resolve_builtin_adapter_root()?;
+    let store_root = resolve_data_dir()?.join("packages");
     let report = distribution_adapter::update(
         root,
+        &store_root,
         nopal_core::distribution::BuiltinDistribution {
             version: env!("CARGO_PKG_VERSION"),
             root: &builtin_root,
@@ -2119,7 +2143,54 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::parse_tmux_plot_identity;
+    use std::fs;
+
+    use super::{
+        packaged_adapter_candidates, parse_tmux_plot_identity, resolve_builtin_adapter_root_from,
+        verify_enforcement_adapter,
+    };
+
+    #[test]
+    fn source_free_apps_resolve_the_exact_packaged_adapter() {
+        let temp = tempfile::tempdir().unwrap();
+        for (executable, adapter) in [
+            (
+                temp.path().join("Nopal-linux/nopal"),
+                temp.path().join("Nopal-linux/extensions/policy-gate"),
+            ),
+            (
+                temp.path().join("Nopal.app/Contents/MacOS/nopal"),
+                temp.path()
+                    .join("Nopal.app/Contents/Resources/extensions/policy-gate"),
+            ),
+        ] {
+            fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            fs::create_dir_all(&adapter).unwrap();
+            fs::write(&executable, b"standalone nopal binary\n").unwrap();
+            for (name, bytes) in [
+                (
+                    "index.ts",
+                    include_bytes!("../../../extensions/policy-gate/index.ts").as_slice(),
+                ),
+                (
+                    "classifier.ts",
+                    include_bytes!("../../../extensions/policy-gate/classifier.ts").as_slice(),
+                ),
+                (
+                    "nopal-cli.ts",
+                    include_bytes!("../../../extensions/policy-gate/nopal-cli.ts").as_slice(),
+                ),
+            ] {
+                fs::write(adapter.join(name), bytes).unwrap();
+            }
+
+            let resolved =
+                resolve_builtin_adapter_root_from(packaged_adapter_candidates(&executable))
+                    .unwrap();
+            assert_eq!(resolved, adapter.canonicalize().unwrap());
+            verify_enforcement_adapter(&resolved.join("index.ts")).unwrap();
+        }
+    }
 
     #[test]
     fn tmux_identity_prefers_the_explicit_plot_tag_and_verifies_the_pane() {

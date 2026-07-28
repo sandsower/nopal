@@ -38,6 +38,32 @@ fn builtin_bundle() -> &'static str {
 "#
 }
 
+fn duplicate_builtin_bundle() -> &'static str {
+    r#"{
+  "version": "nopal.bundle/v2",
+  "inherit_ambient": [],
+  "packages": [
+    {
+      "id": "nopal-a",
+      "source": { "type": "builtin", "package": "nopal" },
+      "requirement": "=0.3.0",
+      "resources": [
+        { "kind": "extension", "path": "extensions/policy-gate/index.ts" }
+      ]
+    },
+    {
+      "id": "nopal-b",
+      "source": { "type": "builtin", "package": "nopal" },
+      "requirement": "=0.3.0",
+      "resources": [
+        { "kind": "extension", "path": "extensions/policy-gate/index.ts" }
+      ]
+    }
+  ]
+}
+"#
+}
+
 #[test]
 fn builtin_lock_and_inspection_resolve_the_exact_verified_resource() {
     let temp = tempfile::tempdir().unwrap();
@@ -75,6 +101,109 @@ fn builtin_lock_and_inspection_resolve_the_exact_verified_resource() {
         distribution_root.join("extensions/policy-gate/index.ts")
     );
     assert_eq!(report.packages[0].resolved, "0.3.0");
+}
+
+#[test]
+fn canonical_resource_paths_are_unique_across_package_ids() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let distribution_root = temp.path().join("distribution");
+    fs::create_dir_all(project.join(".nopal")).unwrap();
+    write_adapter(&distribution_root);
+    let builtin = BuiltinDistribution {
+        version: "0.3.0",
+        root: &distribution_root,
+    };
+
+    let diagnostics =
+        distribution::build_lock_from_local_sources(&project, duplicate_builtin_bundle(), &builtin)
+            .unwrap_err();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == nopal_core::diagnostics::Code::DistributionPackageInvalid
+            && diagnostic.message.contains("canonical resource")
+            && diagnostic.message.contains("nopal-a")
+            && diagnostic.message.contains("nopal-b")
+            && diagnostic.message.contains("resource_export")
+    }));
+
+    let single =
+        distribution::build_lock_from_local_sources(&project, builtin_bundle(), &builtin).unwrap();
+    let mut first = single.packages[0].clone();
+    first.id = "nopal-a".to_owned();
+    let mut second = first.clone();
+    second.id = "nopal-b".to_owned();
+    let preexisting_lock = distribution::LockDocument {
+        version: distribution::LOCK_KIND.to_owned(),
+        contract_digest: format!("sha256:{}", "0".repeat(64)),
+        packages: vec![first, second],
+    };
+    let report = distribution::inspect_texts(
+        DistributionContext {
+            project_root: &project,
+            store_root: &temp.path().join("store"),
+            builtin,
+        },
+        duplicate_builtin_bundle(),
+        &distribution::lock_json(&preexisting_lock).unwrap(),
+    )
+    .unwrap();
+    assert!(!report.ok);
+    assert!(report.resources.is_empty());
+    assert!(report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == nopal_core::diagnostics::Code::DistributionPackageInvalid
+            && diagnostic.message.contains("canonical resource")
+            && diagnostic.message.contains("nopal-a")
+            && diagnostic.message.contains("nopal-b")
+    }));
+}
+
+#[test]
+fn workspace_packages_cannot_alias_one_canonical_resource() {
+    let temp = tempfile::tempdir().unwrap();
+    let project = temp.path().join("project");
+    let package = project.join("packages/shared");
+    let distribution_root = temp.path().join("distribution");
+    fs::create_dir_all(&package).unwrap();
+    write_adapter(&distribution_root);
+    fs::write(
+        package.join("package.json"),
+        r#"{ "name": "shared", "version": "1.2.3" }"#,
+    )
+    .unwrap();
+    fs::write(package.join("skill.md"), "shared skill\n").unwrap();
+    let bundle = r#"{
+  "version": "nopal.bundle/v2",
+  "packages": [
+    {
+      "id": "shared-a",
+      "source": { "type": "workspace", "package": "shared", "root": "packages/shared" },
+      "requirement": "=1.2.3",
+      "resources": [{ "kind": "skill", "path": "skill.md" }]
+    },
+    {
+      "id": "shared-b",
+      "source": { "type": "workspace", "package": "shared", "root": "packages/shared" },
+      "requirement": "=1.2.3",
+      "resources": [{ "kind": "skill", "path": "skill.md" }]
+    }
+  ]
+}"#;
+
+    let diagnostics = distribution::build_lock_from_local_sources(
+        &project,
+        bundle,
+        &BuiltinDistribution {
+            version: "0.3.0",
+            root: &distribution_root,
+        },
+    )
+    .unwrap_err();
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == nopal_core::diagnostics::Code::DistributionPackageInvalid
+            && diagnostic.message.contains("canonical resource")
+            && diagnostic.message.contains("shared-a")
+            && diagnostic.message.contains("shared-b")
+    }));
 }
 
 #[test]

@@ -30,6 +30,18 @@ const MAX_NPM_STDOUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_NPM_STDERR_BYTES: usize = 64 * 1024;
 const NPM_TIMEOUT: Duration = Duration::from_secs(120);
 
+fn acquire_mutation_lock(store_root: &Path) -> io::Result<File> {
+    fs::create_dir_all(store_root)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(store_root.join(".distribution.lock"))?;
+    fs2::FileExt::lock_exclusive(&lock)?;
+    Ok(lock)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LockedPackageSummary {
     pub id: String,
@@ -63,10 +75,12 @@ pub struct SyncReport {
 
 pub fn update(
     project_root: &Path,
+    store_root: &Path,
     builtin: BuiltinDistribution<'_>,
     npm_program: &OsStr,
     write: bool,
 ) -> io::Result<UpdateReport> {
+    let _mutation_lock = acquire_mutation_lock(store_root)?;
     let bundle_text = match distribution::load_bundle_text(project_root)? {
         Ok(text) => text,
         Err(diagnostic) => return Ok(update_failure(vec![diagnostic])),
@@ -107,10 +121,70 @@ pub fn update(
         Ok(lock) => lock,
         Err(diagnostics) => return Ok(update_failure(diagnostics)),
     };
+    let current_bundle_text = match distribution::load_bundle_text(project_root)? {
+        Ok(text) => text,
+        Err(diagnostic) => return Ok(update_failure(vec![diagnostic])),
+    };
+    if current_bundle_text != bundle_text {
+        return Ok(update_failure(vec![Diagnostic::error(
+            Code::DistributionLockDrift,
+            distribution::BUNDLE_PATH,
+            "distribution contract changed during update at control boundary update_transaction; no lock was written",
+        )]));
+    }
+    let current_proposal = match distribution::build_lock_from_resolved_sources(
+        project_root,
+        &current_bundle_text,
+        &builtin,
+        &npm_resolutions,
+    ) {
+        Ok(proposal) => proposal,
+        Err(diagnostics) => return Ok(update_failure(diagnostics)),
+    };
+    if current_proposal != lock {
+        return Ok(update_failure(vec![Diagnostic::error(
+            Code::DistributionLockDrift,
+            distribution::LOCK_PATH,
+            "distribution evidence changed during update at control boundary update_transaction; no lock was written",
+        )]));
+    }
+
     let packages = lock_summaries(&lock);
     if write {
         let text = distribution::lock_json(&lock).map_err(io::Error::other)?;
         write_text_durable(&project_root.join(distribution::LOCK_PATH), &text)?;
+        let written_text = match distribution::load_lock_text(project_root)? {
+            Ok(text) => text,
+            Err(diagnostic) => return Ok(update_published_failure(&lock, vec![diagnostic])),
+        };
+        let written_lock = match distribution::parse_lock_text(&written_text) {
+            Ok(written_lock) => written_lock,
+            Err(diagnostics) => return Ok(update_published_failure(&lock, diagnostics)),
+        };
+        if written_lock != lock {
+            return Ok(update_published_failure(
+                &lock,
+                vec![Diagnostic::error(
+                    Code::DistributionLockDrift,
+                    distribution::LOCK_PATH,
+                    "written distribution lock differs from the verified proposal at control boundary update_transaction",
+                )],
+            ));
+        }
+        let post_write_bundle = match distribution::load_bundle_text(project_root)? {
+            Ok(text) => text,
+            Err(diagnostic) => return Ok(update_published_failure(&lock, vec![diagnostic])),
+        };
+        if post_write_bundle != bundle_text {
+            return Ok(update_published_failure(
+                &lock,
+                vec![Diagnostic::error(
+                    Code::DistributionLockDrift,
+                    distribution::BUNDLE_PATH,
+                    "distribution contract changed while the lock was published at control boundary update_transaction; update did not report stale authority as current",
+                )],
+            ));
+        }
     }
     drop(temporary);
     Ok(UpdateReport {
@@ -125,15 +199,16 @@ pub fn update(
 }
 
 pub fn sync(context: DistributionContext<'_>, npm_program: &OsStr) -> io::Result<SyncReport> {
-    fs::create_dir_all(context.store_root)?;
-    let sync_lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(context.store_root.join(".sync.lock"))?;
-    fs2::FileExt::lock_exclusive(&sync_lock)?;
-    let initial = distribution::inspect(context)?;
+    let _mutation_lock = acquire_mutation_lock(context.store_root)?;
+    let bundle_text = match distribution::load_bundle_text(context.project_root)? {
+        Ok(text) => text,
+        Err(diagnostic) => return Ok(sync_failure(vec![diagnostic])),
+    };
+    let lock_text = match distribution::load_lock_text(context.project_root)? {
+        Ok(text) => text,
+        Err(diagnostic) => return Ok(sync_failure(vec![diagnostic])),
+    };
+    let initial = distribution::inspect_texts(context, &bundle_text, &lock_text)?;
     if initial.ok {
         return Ok(sync_report(initial, false));
     }
@@ -152,27 +227,13 @@ pub fn sync(context: DistributionContext<'_>, npm_program: &OsStr) -> io::Result
         return Ok(sync_report(initial, false));
     }
 
-    let bundle_text = match distribution::load_bundle_text(context.project_root)? {
-        Ok(text) => text,
-        Err(diagnostic) => return Ok(sync_failure(vec![diagnostic])),
-    };
     let requests = match distribution::package_requests(&bundle_text) {
         Ok(requests) => requests,
         Err(diagnostics) => return Ok(sync_failure(diagnostics)),
     };
-    let lock_text = match distribution::load_lock_text(context.project_root)? {
-        Ok(text) => text,
-        Err(diagnostic) => return Ok(sync_failure(vec![diagnostic])),
-    };
-    let lock: LockDocument = match serde_json::from_str(&lock_text) {
+    let lock = match distribution::parse_lock_text(&lock_text) {
         Ok(lock) => lock,
-        Err(error) => {
-            return Ok(sync_failure(vec![Diagnostic::error(
-                Code::DistributionLockParseError,
-                distribution::LOCK_PATH,
-                format!("invalid distribution lock: {error}"),
-            )]));
-        }
+        Err(diagnostics) => return Ok(sync_failure(diagnostics)),
     };
 
     let mut changed = false;
@@ -832,6 +893,19 @@ fn update_failure(mut diagnostics: Vec<Diagnostic>) -> UpdateReport {
         packages: Vec::new(),
         diagnostics,
         proposal: None,
+    }
+}
+
+fn update_published_failure(lock: &LockDocument, mut diagnostics: Vec<Diagnostic>) -> UpdateReport {
+    nopal_core::diagnostics::sort(&mut diagnostics);
+    UpdateReport {
+        kind: "nopal.update/v1",
+        ok: false,
+        wrote: true,
+        lock_path: distribution::LOCK_PATH.to_owned(),
+        packages: lock_summaries(lock),
+        diagnostics,
+        proposal: Some(lock.clone()),
     }
 }
 

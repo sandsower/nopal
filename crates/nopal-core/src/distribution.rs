@@ -212,6 +212,7 @@ fn build_lock(
         .collect::<BTreeMap<_, _>>();
 
     let mut locked = Vec::new();
+    let mut resource_owners = BTreeMap::new();
     for request in &bundle.packages {
         let (root, resolved, artifact_integrity) = match &request.source {
             SourceSpec::Builtin { package } if package == "nopal" => {
@@ -348,6 +349,29 @@ fn build_lock(
                 if let Some(integrity) = artifact_integrity {
                     package.artifact_integrity = integrity;
                 }
+                for resource in &package.resources {
+                    match canonical_resource_path(&root, &resource.path) {
+                        Ok(path) => {
+                            record_resource_owner(
+                                &mut resource_owners,
+                                path,
+                                request,
+                                resource.kind,
+                                &resource.path,
+                                &mut diagnostics,
+                            );
+                        }
+                        Err(error) => diagnostics.push(package_error(
+                            Code::DistributionPackageInvalid,
+                            request,
+                            "resource_export",
+                            format!(
+                                "cannot resolve canonical resource path {:?}: {error}",
+                                resource.path
+                            ),
+                        )),
+                    }
+                }
                 locked.push(package);
             }
             Err(mut package_diagnostics) => diagnostics.append(&mut package_diagnostics),
@@ -371,6 +395,37 @@ pub fn lock_json(lock: &LockDocument) -> serde_json::Result<String> {
         text.push('\n');
         text
     })
+}
+
+/// Parse and structurally validate lock text through the same JSONC path used by launch.
+/// Effect adapters reuse this seam so comments and diagnostics cannot drift by command.
+pub fn parse_lock_text(lock_text: &str) -> Result<LockDocument, Vec<Diagnostic>> {
+    let mut diagnostics = Vec::new();
+    let lock = parse_lock(lock_text, LOCK_PATH, &mut diagnostics);
+    if let Some(lock) = &lock {
+        validate_lock(lock, &mut diagnostics);
+        if lock.version != LOCK_KIND {
+            diagnostics.push(Diagnostic::error(
+                Code::VersionUnsupported,
+                LOCK_PATH,
+                format!(
+                    "unsupported distribution lock version {:?}; expected {LOCK_KIND:?}",
+                    lock.version
+                ),
+            ));
+        }
+    }
+    diagnostics::sort(&mut diagnostics);
+    if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error)
+    {
+        Err(diagnostics)
+    } else if let Some(lock) = lock {
+        Ok(lock)
+    } else {
+        Err(diagnostics)
+    }
 }
 
 /// Resolve and verify every locked package and exported resource from local
@@ -490,7 +545,13 @@ pub fn inspect_texts(
     lock_text: &str,
 ) -> io::Result<DistributionReport> {
     let (mut bundle, mut diagnostics) = parse_bundle(bundle_text, BUNDLE_PATH);
-    let lock = parse_lock(lock_text, LOCK_PATH, &mut diagnostics);
+    let lock = match parse_lock_text(lock_text) {
+        Ok(lock) => Some(lock),
+        Err(mut lock_diagnostics) => {
+            diagnostics.append(&mut lock_diagnostics);
+            None
+        }
+    };
     let Some(mut bundle) = bundle.take() else {
         return Ok(report_with_diagnostics(diagnostics));
     };
@@ -499,17 +560,6 @@ pub fn inspect_texts(
         return Ok(report_with_diagnostics(diagnostics));
     };
 
-    validate_lock(&lock, &mut diagnostics);
-    if lock.version != LOCK_KIND {
-        diagnostics.push(Diagnostic::error(
-            Code::VersionUnsupported,
-            LOCK_PATH,
-            format!(
-                "unsupported distribution lock version {:?}; expected {LOCK_KIND:?}",
-                lock.version
-            ),
-        ));
-    }
     let actual_contract_digest = contract_digest(&bundle);
     if lock.contract_digest != actual_contract_digest {
         diagnostics.push(Diagnostic::error(
@@ -555,6 +605,7 @@ pub fn inspect_texts(
 
     let mut resolved_packages = Vec::new();
     let mut resolved_resources = Vec::new();
+    let mut resource_owners = BTreeMap::new();
     for request in &bundle.packages {
         let Some(package) = locked.get(request.id.as_str()).copied() else {
             continue;
@@ -688,13 +739,35 @@ pub fn inspect_texts(
             let resolved_path = root.join(relative);
             match hash_tree(&resolved_path) {
                 Ok(integrity) if integrity == resource.tree_integrity => {
-                    package_resources.push(ResolvedResource {
-                        package_id: package.id.clone(),
-                        kind: resource.kind,
-                        package_path: resource.path.clone(),
-                        resolved_path,
-                        integrity,
-                    });
+                    match canonical_resource_path(&root, &resource.path) {
+                        Ok(canonical) => {
+                            if record_resource_owner(
+                                &mut resource_owners,
+                                canonical,
+                                request,
+                                resource.kind,
+                                &resource.path,
+                                &mut diagnostics,
+                            ) {
+                                package_resources.push(ResolvedResource {
+                                    package_id: package.id.clone(),
+                                    kind: resource.kind,
+                                    package_path: resource.path.clone(),
+                                    resolved_path,
+                                    integrity,
+                                });
+                            }
+                        }
+                        Err(error) => diagnostics.push(package_error(
+                            Code::DistributionPackageInvalid,
+                            request,
+                            "resource_export",
+                            format!(
+                                "cannot resolve canonical resource path {:?}: {error}",
+                                resource.path
+                            ),
+                        )),
+                    }
                 }
                 Ok(integrity) => diagnostics.push(package_error(
                     Code::DistributionIntegrityMismatch,
@@ -741,6 +814,41 @@ pub fn inspect_texts(
         resources: resolved_resources,
         diagnostics,
     })
+}
+
+fn canonical_resource_path(root: &Path, package_path: &str) -> io::Result<PathBuf> {
+    let relative = safe_relative_path(package_path).map_err(io::Error::other)?;
+    fs::canonicalize(root.join(relative))
+}
+
+fn record_resource_owner(
+    owners: &mut BTreeMap<PathBuf, (String, ResourceKind, String)>,
+    canonical: PathBuf,
+    request: &PackageRequest,
+    kind: ResourceKind,
+    package_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> bool {
+    if let Some((owner_id, owner_kind, owner_path)) = owners.get(&canonical) {
+        diagnostics.push(package_error(
+            Code::DistributionPackageInvalid,
+            request,
+            "resource_export",
+            format!(
+                "canonical resource {} ({} {package_path:?}) is already exported by package {owner_id:?} as {} {owner_path:?}",
+                canonical.display(),
+                kind.as_str(),
+                owner_kind.as_str()
+            ),
+        ));
+        false
+    } else {
+        owners.insert(
+            canonical,
+            (request.id.clone(), kind, package_path.to_owned()),
+        );
+        true
+    }
 }
 
 fn installed_root(

@@ -31,9 +31,13 @@ macos:
 	stage="Nopal.app.tmp"; \
 	rm -rf "$$stage"; \
 	trap 'rm -rf "$$stage"' EXIT HUP INT TERM; \
-	install -d "$$stage/Contents/MacOS"; \
+	install -d "$$stage/Contents/MacOS" "$$stage/Contents/Resources/extensions/policy-gate"; \
 	install -m 0755 "$(RELEASE_DIR)/nopal-field-native" "$$stage/Contents/MacOS/nopal-field-native"; \
 	install -m 0755 "$(RELEASE_DIR)/nopal" "$$stage/Contents/MacOS/nopal"; \
+	for adapter_file in index.ts classifier.ts nopal-cli.ts; do \
+		install -m 0644 "extensions/policy-gate/$$adapter_file" \
+			"$$stage/Contents/Resources/extensions/policy-gate/$$adapter_file"; \
+	done; \
 	printf '%s\n' \
 		'<?xml version="1.0" encoding="UTF-8"?>' \
 		'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -76,9 +80,13 @@ linux:
 	stage="Nopal-linux.tmp"; \
 	rm -rf "$$stage"; \
 	trap 'rm -rf "$$stage"' EXIT HUP INT TERM; \
-	install -d "$$stage"; \
+	install -d "$$stage/extensions/policy-gate"; \
 	install -m 0755 "$(RELEASE_DIR)/nopal-field-native" "$$stage/nopal-field-native"; \
 	install -m 0755 "$(RELEASE_DIR)/nopal" "$$stage/nopal"; \
+	for adapter_file in index.ts classifier.ts nopal-cli.ts; do \
+		install -m 0644 "extensions/policy-gate/$$adapter_file" \
+			"$$stage/extensions/policy-gate/$$adapter_file"; \
+	done; \
 	rm -rf Nopal-linux; \
 	mv "$$stage" Nopal-linux; \
 	trap - EXIT HUP INT TERM; \

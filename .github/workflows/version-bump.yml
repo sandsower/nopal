@@ -92,11 +92,32 @@ jobs:
           . scripts/release-version.sh
           git fetch --force origin main
           git switch --force-create "$RELEASE_BRANCH" origin/main
-          current=$(release_workspace_version Cargo.toml)
-          next=$(release_next_patch_version "$current")
-          sed -i "s/^version = \"$current\"\$/version = \"$next\"/" Cargo.toml
+          next=$(release_bump_project_versions Cargo.toml .nopal/bundle.jsonc)
           cargo update --workspace --offline || cargo update --workspace
-          git add Cargo.toml Cargo.lock
+          verification_dir=$(mktemp -d)
+          trap 'rm -rf "$verification_dir"' EXIT HUP INT TERM
+          cargo run --locked -p nopal-cli -- --dir . update --write
+          cp .nopal/nopal.lock "$verification_dir/nopal.lock"
+          cargo run --locked -p nopal-cli -- --dir . update --write
+          cmp -s .nopal/nopal.lock "$verification_dir/nopal.lock" || {
+            echo "distribution lock regeneration is not deterministic" >&2
+            exit 1
+          }
+          cargo run --locked -p nopal-cli -- --dir . --dry-run --json \
+            > "$verification_dir/launch.json"
+          jq -e --arg version "$next" '
+            .kind == "nopal.launch/v1" and
+            .ok == true and
+            .bundle.ok == true and
+            (.diagnostics | length) == 0 and
+            (.bundle.packages | any(
+              .id == "nopal" and
+              .source_kind == "builtin" and
+              .resolved == $version
+            ))
+          ' "$verification_dir/launch.json" >/dev/null
+          cargo run --locked -p nopal-cli -- validate
+          git add Cargo.toml Cargo.lock .nopal/bundle.jsonc .nopal/nopal.lock
           git commit -m "chore(release): v$next"
 
           remote_sha=$(git ls-remote --heads origin "refs/heads/$RELEASE_BRANCH" | cut -f1)

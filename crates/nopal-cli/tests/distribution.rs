@@ -461,8 +461,16 @@ fn npm_update_and_sync_verify_sri_extract_safely_and_repair_the_exact_store() {
     assert_eq!(fs::read_dir(&escaped_store).unwrap().count(), 0);
     fs::remove_file(store_root.join("npm")).unwrap();
 
+    let lock_path = repo.join(".nopal/nopal.lock");
+    let commented_lock = fs::read_to_string(&lock_path).unwrap().replacen(
+        '{',
+        "{\n  // Exact lock comments are accepted consistently by launch and sync.",
+        1,
+    );
+    fs::write(&lock_path, &commented_lock).unwrap();
     let sync = command(&["sync"]);
     assert_eq!(sync.status.code(), Some(0), "{sync:?}");
+    assert_eq!(fs::read_to_string(&lock_path).unwrap(), commented_lock);
     let sync_doc: serde_json::Value = serde_json::from_slice(&sync.stdout).unwrap();
     assert_eq!(sync_doc["changed"], true);
     let store = nopal_core::distribution::npm_store_path(
@@ -500,6 +508,88 @@ fn npm_update_and_sync_verify_sri_extract_safely_and_repair_the_exact_store() {
         serde_json::from_slice::<serde_json::Value>(&fs::read(manifest).unwrap()).unwrap()["version"],
         "1.2.3"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn update_refuses_to_write_a_lock_for_bundle_bytes_changed_during_resolution() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let data = temp.path().join("data");
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(repo.join(".nopal")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    git(&repo, &["init", "-q"]);
+    let bundle_path = repo.join(".nopal/bundle.jsonc");
+    let bundle = r#"{
+  "version": "nopal.bundle/v2",
+  "packages": [{
+    "id": "guidance",
+    "source": { "type": "npm", "package": "@test/guidance", "registry": "https://registry.example.test" },
+    "requirement": "=1.2.3",
+    "resources": [{ "kind": "skill", "path": "skills/review" }]
+  }]
+}"#;
+    fs::write(&bundle_path, bundle).unwrap();
+    let archive = temp.path().join("guidance.tgz");
+    write_npm_archive(&archive, false);
+    let integrity = sha512_sri(&archive);
+    let npm = bin.join("npm");
+    write_fake_npm(&npm);
+    let ready = temp.path().join("npm-ready");
+    let resume = temp.path().join("npm-resume");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let child = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args([
+            "--dir",
+            repo.to_str().unwrap(),
+            "--json",
+            "update",
+            "--write",
+        ])
+        .env("PATH", path)
+        .env("NOPAL_DATA_DIR", &data)
+        .env("FAKE_NPM_ARCHIVE", &archive)
+        .env("FAKE_NPM_INTEGRITY", &integrity)
+        .env("FAKE_NPM_READY", &ready)
+        .env("FAKE_NPM_RESUME", &resume)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    for _ in 0..500 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "fake npm never reached the resolution seam");
+    fs::write(
+        &bundle_path,
+        format!("{bundle}\n// concurrent checked-in contract edit\n"),
+    )
+    .unwrap();
+    fs::write(&resume, "resume\n").unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        document["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["code"] == "distribution_lock_drift"
+                && diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("update_transaction")))
+    );
+    assert!(!repo.join(".nopal/nopal.lock").exists());
 }
 
 #[test]
@@ -605,6 +695,10 @@ done
 if [ "${FAKE_NPM_OVERSIZED:-}" = '1' ]; then
   dd if=/dev/zero bs=1048576 count=3 2>/dev/null | tr '\000' x
   exit 0
+fi
+if [ -n "${FAKE_NPM_READY:-}" ]; then
+  : > "$FAKE_NPM_READY"
+  while [ ! -e "$FAKE_NPM_RESUME" ]; do sleep 0.01; done
 fi
 cp "$FAKE_NPM_ARCHIVE" "$destination/package.tgz"
 if [ -n "${FAKE_NPM_CALLS:-}" ]; then printf 'pack\n' >> "$FAKE_NPM_CALLS"; fi
