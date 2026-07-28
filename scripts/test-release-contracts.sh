@@ -19,6 +19,41 @@ tag="v$version"
   || fail "patch version did not increment across a digit boundary"
 [ "$(release_next_patch_version 4.19.99)" = "4.19.100" ] \
   || fail "patch version did not preserve major and minor components"
+
+bump_fixture="$tmp/version-bump-fixture"
+mkdir -p "$bump_fixture/.nopal"
+printf '%s\n' \
+  '[workspace]' \
+  '' \
+  '[workspace.package]' \
+  'version = "4.19.99"' \
+  > "$bump_fixture/Cargo.toml"
+printf '%s\n' \
+  '{' \
+  '  "version": "nopal.bundle/v2",' \
+  '  "packages": [{' \
+  '    "id": "nopal",' \
+  '    "source": { "type": "builtin", "package": "nopal" },' \
+  '    "requirement": "=4.19.99",' \
+  '    "resources": [{ "kind": "extension", "path": "index.ts" }]' \
+  '  }]' \
+  '}' \
+  > "$bump_fixture/.nopal/bundle.jsonc"
+real_manifest_before=$(sha256sum "$repo_root/Cargo.toml" | cut -d ' ' -f1)
+real_bundle_before=$(sha256sum "$repo_root/.nopal/bundle.jsonc" | cut -d ' ' -f1)
+fixture_next=$(release_bump_project_versions \
+  "$bump_fixture/Cargo.toml" "$bump_fixture/.nopal/bundle.jsonc")
+[ "$fixture_next" = 4.19.100 ] \
+  || fail "fixture bump returned unexpected version $fixture_next"
+grep -Fqx 'version = "4.19.100"' "$bump_fixture/Cargo.toml" \
+  || fail "fixture workspace version was not bumped"
+grep -Fq '"requirement": "=4.19.100"' "$bump_fixture/.nopal/bundle.jsonc" \
+  || fail "fixture builtin requirement was not bumped exactly"
+[ "$(sha256sum "$repo_root/Cargo.toml" | cut -d ' ' -f1)" = "$real_manifest_before" ] \
+  || fail "fixture bump mutated the real workspace version"
+[ "$(sha256sum "$repo_root/.nopal/bundle.jsonc" | cut -d ' ' -f1)" = "$real_bundle_before" ] \
+  || fail "fixture bump mutated the real distribution contract"
+
 if release_next_patch_version 1.2 >"$tmp/invalid-version.stdout" \
   2>"$tmp/invalid-version.stderr"; then
   fail "invalid workspace version unexpectedly produced a patch version"
@@ -55,6 +90,20 @@ grep -Fq 'base_sha=$GITHUB_SHA' "$version_workflow" \
 grep -Fq 'git switch --force-create "$RELEASE_BRANCH" origin/main' \
   "$version_workflow" \
   || fail "the next version branch is not refreshed from current main"
+grep -Fq 'release_bump_project_versions Cargo.toml .nopal/bundle.jsonc' \
+  "$version_workflow" \
+  || fail "automated bumps do not update the workspace and builtin requirement together"
+grep -Fq 'update --write' "$version_workflow" \
+  || fail "automated bumps do not regenerate the exact distribution lock"
+grep -Fq 'cmp -s .nopal/nopal.lock' "$version_workflow" \
+  || fail "automated bumps do not verify deterministic lock regeneration"
+grep -Fq '.resolved == $version' "$version_workflow" \
+  || fail "automated bumps do not verify the resolved builtin version"
+grep -Fq -- '--dry-run --json' "$version_workflow" \
+  || fail "automated bumps do not validate the cold launch plan"
+grep -Fq 'git add Cargo.toml Cargo.lock .nopal/bundle.jsonc .nopal/nopal.lock' \
+  "$version_workflow" \
+  || fail "automated bumps do not stage the complete version and distribution contract"
 grep -Fq 'gh workflow run ci.yml --ref "$RELEASE_BRANCH"' "$version_workflow" \
   || fail "automated version pull requests do not dispatch CI explicitly"
 grep -Fq 'gh auth setup-git' "$version_workflow" \
@@ -94,6 +143,56 @@ printf 'fake nopal binary\n' > "$fake_binary"
 printf '#!/bin/sh\nprintf "fake rondo runtime\\n"\n' > "$fake_rondo"
 printf '<html><body>fake dependency licenses</body></html>\n' > "$fake_third_party_licenses"
 chmod 0755 "$fake_rondo"
+
+app_fixture="$tmp/app-source"
+app_target="$tmp/app-target"
+app_tools="$tmp/app-tools"
+mkdir -p "$app_fixture/extensions/policy-gate" "$app_target/release" "$app_tools"
+cp "$repo_root/Makefile" "$repo_root/Cargo.toml" "$app_fixture/"
+for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+  cp "$repo_root/extensions/policy-gate/$adapter_file" \
+    "$app_fixture/extensions/policy-gate/$adapter_file"
+done
+cp "$fake_binary" "$app_target/release/nopal"
+printf 'fake native app binary\n' > "$app_target/release/nopal-field-native"
+chmod 0755 "$app_target/release/nopal" "$app_target/release/nopal-field-native"
+printf '#!/bin/sh\nexit 0\n' > "$app_tools/cargo"
+printf '#!/bin/sh\nexit 0\n' > "$app_tools/plutil"
+chmod 0755 "$app_tools/cargo" "$app_tools/plutil"
+
+PATH="$app_tools:$PATH" make -s -C "$app_fixture" macos \
+  HOST_OS=Darwin CARGO_TARGET_DIR="$app_target" \
+  >"$tmp/macos-package.stdout"
+macos_adapter="$app_fixture/Nopal.app/Contents/Resources/extensions/policy-gate"
+[ -d "$macos_adapter" ] \
+  || fail "macOS app does not contain the source-free built-in adapter layout"
+find "$macos_adapter" -type f -exec basename {} \; | LC_ALL=C sort \
+  > "$tmp/macos-adapter-files"
+printf '%s\n' classifier.ts index.ts nopal-cli.ts \
+  > "$tmp/expected-adapter-files"
+cmp "$tmp/expected-adapter-files" "$tmp/macos-adapter-files" \
+  || fail "macOS app does not contain exactly the three built-in adapter files"
+for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+  cmp "$repo_root/extensions/policy-gate/$adapter_file" \
+    "$macos_adapter/$adapter_file" \
+    || fail "macOS app adapter $adapter_file bytes changed"
+done
+
+PATH="$app_tools:$PATH" make -s -C "$app_fixture" linux \
+  HOST_OS=Linux CARGO_TARGET_DIR="$app_target" \
+  >"$tmp/linux-package.stdout"
+linux_adapter="$app_fixture/Nopal-linux/extensions/policy-gate"
+[ -d "$linux_adapter" ] \
+  || fail "Linux app does not contain the source-free built-in adapter layout"
+find "$linux_adapter" -type f -exec basename {} \; | LC_ALL=C sort \
+  > "$tmp/linux-adapter-files"
+cmp "$tmp/expected-adapter-files" "$tmp/linux-adapter-files" \
+  || fail "Linux app does not contain exactly the three built-in adapter files"
+for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+  cmp "$repo_root/extensions/policy-gate/$adapter_file" \
+    "$linux_adapter/$adapter_file" \
+    || fail "Linux app adapter $adapter_file bytes changed"
+done
 
 rondo_commit=$(sed -n 's/.*"source_commit": "\([0-9a-f]*\)".*/\1/p' "$repo_root/rondo-runtime.json")
 [ "${#rondo_commit}" -eq 40 ] || fail "Rondo provenance source commit is not a full SHA"

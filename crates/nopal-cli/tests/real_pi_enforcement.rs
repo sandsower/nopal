@@ -52,15 +52,21 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
     let nopal = PathBuf::from(env!("CARGO_BIN_EXE_nopal"));
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let enforcement_source = source_root.join("extensions/policy-gate");
-    let provider = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let provider_source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/deterministic-enforcement-provider.mjs")
         .canonicalize()
         .unwrap();
+    let pi_package = pi
+        .canonicalize()
+        .unwrap()
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .to_path_buf();
+    let pi_ai = pi_package.join("node_modules/@earendil-works/pi-ai");
     assert!(
-        source_root
-            .join("node_modules/@earendil-works/pi-ai")
-            .is_dir(),
-        "run npm ci first"
+        pi_ai.is_dir(),
+        "installed Pi must include its pi-ai dependency"
     );
 
     let temp = tempfile::tempdir().unwrap();
@@ -77,7 +83,17 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
     for file in ["index.ts", "classifier.ts", "nopal-cli.ts"] {
         fs::copy(enforcement_source.join(file), adapter.join(file)).unwrap();
     }
+    fs::copy(
+        &provider_source,
+        adapter.join("deterministic-enforcement-provider.mjs"),
+    )
+    .unwrap();
     let enforcement = adapter.join("index.ts").canonicalize().unwrap();
+    let dependency_parent = temp
+        .path()
+        .join("distribution/node_modules/@earendil-works");
+    fs::create_dir_all(&dependency_parent).unwrap();
+    std::os::unix::fs::symlink(&pi_ai, dependency_parent.join("pi-ai")).unwrap();
     let substituted_cli_marker = temp.path().join("substituted-cli-ran");
     write(
         &bin.join("nopal"),
@@ -134,13 +150,39 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
     );
     std::os::unix::fs::symlink(".nopal/policy.jsonc", repo.join("policy-link")).unwrap();
     std::os::unix::fs::symlink(".nopal", repo.join("authority-dir-link")).unwrap();
+    let bundle = format!(
+        r#"{{
+          "version": "nopal.bundle/v2",
+          "inherit_ambient": [],
+          "packages": [{{
+            "id": "nopal",
+            "source": {{ "type": "builtin", "package": "nopal" }},
+            "requirement": "={}",
+            "resources": [
+              {{ "kind": "extension", "path": "index.ts" }},
+              {{ "kind": "extension", "path": "deterministic-enforcement-provider.mjs" }}
+            ]
+          }}]
+        }}"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    write(&repo.join(".nopal/bundle.jsonc"), &bundle);
+    let lock = nopal_core::distribution::build_lock_from_local_sources(
+        &repo,
+        &bundle,
+        &nopal_core::distribution::BuiltinDistribution {
+            version: env!("CARGO_PKG_VERSION"),
+            root: &adapter,
+        },
+    )
+    .unwrap();
     write(
-        &repo.join(".nopal/bundle.jsonc"),
-        &format!(
-            "{{ \"version\": \"nopal.bundle/v1\", \"extensions\": [{{ \"source\": \"enforcement\", \"path\": {:?} }}, {{ \"source\": \"proof-provider\", \"path\": {:?} }}] }}",
-            enforcement.display().to_string(),
-            provider.display().to_string()
-        ),
+        &repo.join(".nopal/nopal.lock"),
+        &nopal_core::distribution::lock_json(&lock).unwrap(),
+    );
+    write(
+        &repo.join(".beislid/workflow.md"),
+        "<!-- beislid-workflow: v1 -->\n\n# Enforcement proof\n",
     );
     let gate_count = temp.path().join("gate-count");
     let path = format!(
@@ -170,6 +212,7 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
             "enforcement walking skeleton proof",
         ])
         .env("NOPAL_PI_BIN", &pi)
+        .env("NOPAL_DISTRIBUTION_ROOT", temp.path().join("distribution"))
         .env("BEISLID_STATE_DIR", &state)
         .env("NOPAL_CONFIG_DIR", temp.path().join("config"))
         .env("PI_CODING_AGENT_DIR", &agent)

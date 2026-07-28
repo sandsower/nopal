@@ -33,6 +33,7 @@ use nopal_core::scaffold;
 use nopal_core::{gates::GateStage, policy};
 
 mod coordinator;
+mod distribution_adapter;
 mod herdr_bridge;
 mod info;
 mod launch;
@@ -78,6 +79,14 @@ enum Cmd {
     /// Deprecated internal spelling for the canonical bare launch
     #[command(hide = true)]
     Cli(CliLaunchArgs),
+    /// Materialize and verify the exact checked-in distribution lock
+    Sync,
+    /// Resolve the distribution contract into an exact lock proposal
+    Update {
+        /// Atomically replace .nopal/nopal.lock with the proposal
+        #[arg(long)]
+        write: bool,
+    },
     /// Validate the nopal.project/v1 manifest and profile-required modules
     Validate,
     /// Inspect nopal.gates/v1 preflights
@@ -786,6 +795,8 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
         Some(Cmd::Cli(args)) => {
             dispatch_launch(cli, &root, args.dry_run, args.with_ambient, args.verbose)
         }
+        Some(Cmd::Sync) => run_distribution_sync(cli, &root),
+        Some(Cmd::Update { write }) => run_distribution_update(cli, &root, *write),
         Some(Cmd::Validate) => {
             let report = nopal_core::status::validation_report(&root)?;
             print_report_and_exit(
@@ -1651,53 +1662,152 @@ fn run_ask_cmd(
     }
 }
 
-/// User-level config dir for cross-repo nopal defaults:
-/// `$NOPAL_CONFIG_DIR` when set, else `$HOME/.config/nopal`; `None` when
-/// neither is available (no lookup possible - `scaffold::
-/// resolve_bundle_scaffold` treats that identically to "no template found").
-/// Read once here, at the CLI boundary, and threaded down from here on as a
-/// plain `Option<PathBuf>` - every nopal-core function that might consult it
-/// (`scaffold::write_defaults`, `launch::plan`'s unconfigured branch) takes
-/// the already-resolved directory as a parameter instead of reading the
-/// environment itself, so tests can isolate template lookup by construction
-/// (an explicit temp dir, or `None`) instead of by mutating process env -
-/// see `nopal-core::scaffold`'s module tests and this crate's
-/// `tests/coordinator.rs`, which sets `NOPAL_CONFIG_DIR` on every spawned
-/// `nopal` subprocess for exactly this reason.
+/// Resolve user-level Nopal policy and enforcement state without granting it
+/// project-package authority. The checked-in distribution contract is the
+/// only source for project resources; this directory remains relevant to the
+/// restrictive user-policy composition and enforcement subprocess context.
 fn resolve_config_dir() -> Option<PathBuf> {
-    // Empty env values are treated as unset (XDG convention). Without the
-    // filter, `NOPAL_CONFIG_DIR=` would make the template path the bare
-    // relative `bundle-default.jsonc`, resolved against the process cwd -
-    // letting a repo-local file of that name in whatever directory nopal
-    // runs from silently become the user's standing template.
     if let Some(dir) = std::env::var("NOPAL_CONFIG_DIR")
         .ok()
-        .filter(|v| !v.is_empty())
+        .filter(|value| !value.is_empty())
     {
         return Some(PathBuf::from(dir));
     }
     std::env::var("HOME")
         .ok()
-        .filter(|v| !v.is_empty())
+        .filter(|value| !value.is_empty())
         .map(|home| Path::new(&home).join(".config").join("nopal"))
+}
+
+fn resolve_data_dir() -> std::io::Result<PathBuf> {
+    if let Some(dir) = std::env::var("NOPAL_DATA_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(dir));
+    }
+    if let Some(dir) = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Path::new(&dir).join("nopal"));
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(|home| Path::new(&home).join(".local/share/nopal"))
+        .ok_or_else(|| {
+            std::io::Error::other("cannot resolve Nopal data directory; set NOPAL_DATA_DIR or HOME")
+        })
+}
+
+/// Resolve the built-in adapter package from an explicit distribution root,
+/// the packaged executable layout, or the source checkout used for local
+/// builds. Every candidate is still byte-verified before Pi launch, so this
+/// locator cannot turn an environment path into executable authority.
+fn resolve_builtin_adapter_root() -> std::io::Result<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(root) = std::env::var_os("NOPAL_DISTRIBUTION_ROOT") {
+        let root = PathBuf::from(root);
+        candidates.push(root.clone());
+        candidates.push(root.join("extensions/policy-gate"));
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        candidates.extend(packaged_adapter_candidates(&executable));
+    }
+    candidates.push(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("extensions/policy-gate"),
+    );
+    resolve_builtin_adapter_root_from(candidates)
+}
+
+/// Keep executable-relative layouts explicit so app packaging can test the
+/// lookup contract without depending on a source checkout. Linux places the
+/// adapter beside the executables, while a macOS app keeps non-binary
+/// resources under `Contents/Resources`.
+fn packaged_adapter_candidates(executable: &Path) -> Vec<PathBuf> {
+    let Some(parent) = executable.parent() else {
+        return Vec::new();
+    };
+    let mut candidates = vec![parent.join("extensions/policy-gate")];
+    if let Some(contents) = parent.parent() {
+        candidates.push(contents.join("Resources/extensions/policy-gate"));
+    }
+    candidates
+}
+
+fn resolve_builtin_adapter_root_from(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> std::io::Result<PathBuf> {
+    for candidate in candidates {
+        if ["index.ts", "classifier.ts", "nopal-cli.ts"]
+            .iter()
+            .all(|name| candidate.join(name).is_file())
+        {
+            return candidate.canonicalize();
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "cannot locate the complete built-in Nopal enforcement adapter package",
+    ))
+}
+
+fn run_distribution_update(cli: &Cli, root: &Path, write: bool) -> std::io::Result<ExitCode> {
+    let builtin_root = resolve_builtin_adapter_root()?;
+    let store_root = resolve_data_dir()?.join("packages");
+    let report = distribution_adapter::update(
+        root,
+        &store_root,
+        nopal_core::distribution::BuiltinDistribution {
+            version: env!("CARGO_PKG_VERSION"),
+            root: &builtin_root,
+        },
+        &distribution_adapter::npm_program(),
+        write,
+    )?;
+    print_report_and_exit(
+        report.ok,
+        cli.json,
+        || serde_json::to_string_pretty(&report),
+        || distribution_adapter::human_update(&report),
+    )
+}
+
+fn run_distribution_sync(cli: &Cli, root: &Path) -> std::io::Result<ExitCode> {
+    let builtin_root = resolve_builtin_adapter_root()?;
+    let store_root = resolve_data_dir()?.join("packages");
+    let report = distribution_adapter::sync(
+        nopal_core::distribution::DistributionContext {
+            project_root: root,
+            store_root: &store_root,
+            builtin: nopal_core::distribution::BuiltinDistribution {
+                version: env!("CARGO_PKG_VERSION"),
+                root: &builtin_root,
+            },
+        },
+        &distribution_adapter::npm_program(),
+    )?;
+    print_report_and_exit(
+        report.ok,
+        cli.json,
+        || serde_json::to_string_pretty(&report),
+        || distribution_adapter::human_sync(&report),
+    )
 }
 
 /// Runs the cold `nopal.launch/v1` gates for `nopal cli`. On `--dry-run` or
 /// any gate failure, renders the plan and exits without touching Pi.
 ///
-/// A real (non-dry-run) launch against an unconfigured repo
-/// (`plan.scaffold == WouldCreate`) writes `.nopal/nopal.jsonc` and
-/// `.nopal/bundle.jsonc` first, silently and without prompting, then re-runs
-/// `plan` against
-/// the files it just wrote - that re-validation, not the write itself, is
-/// the actual gate: a half-written or unexpectedly rejected scaffold fails
-/// closed exactly like any other misconfigured repo instead of launching
-/// anyway. An invalid user-level bundle template is caught earlier
-/// still: `launch::plan` already resolves the same template/hermetic source
-/// `write_defaults` would use, so `plan.ok` is already `false` and this
-/// function returns at the first check below - `write_defaults` is never
-/// even called, let alone anything written. Only a passing plan with
-/// `dry_run` false reaches `exec_pi`.
+/// A real launch against an unconfigured Git repository writes the complete
+/// six-file project, policy, gate, distribution-lock, and Beislið baseline,
+/// then re-runs this same planner against the committed bytes. That second
+/// validation, not the write itself, is the launch gate. A partial write or
+/// unexpectedly invalid generated contract fails closed exactly like any
+/// other invalid project. Only a passing plan with `dry_run` false reaches
+/// `exec_pi`.
 ///
 /// Two stderr notices are always-on, never gated by `--verbose`
 /// unlike `launch::summary_line`: a scaffold-provenance line only on a
@@ -1711,8 +1821,22 @@ fn dispatch_launch(
     with_ambient: bool,
     verbose: bool,
 ) -> std::io::Result<ExitCode> {
-    let config_dir = resolve_config_dir();
-    let plan = launch::plan(root, with_ambient, config_dir.as_deref())?;
+    if with_ambient {
+        return Err(std::io::Error::other(
+            "ambient Pi resources may only be enabled by the checked-in distribution contract; --with-ambient is not an authority source",
+        ));
+    }
+    let store_root = resolve_data_dir()?.join("packages");
+    let builtin_root = resolve_builtin_adapter_root()?;
+    let builtin = nopal_core::distribution::BuiltinDistribution {
+        version: env!("CARGO_PKG_VERSION"),
+        root: &builtin_root,
+    };
+    let context = launch::LaunchContext {
+        store_root: &store_root,
+        builtin,
+    };
+    let plan = launch::plan(root, context)?;
     if dry_run || !plan.ok {
         return print_report_and_exit(
             plan.ok,
@@ -1722,17 +1846,14 @@ fn dispatch_launch(
         );
     }
 
-    let mut created_source = None;
+    let mut created_paths = None;
     let plan = if plan.scaffold == launch::Scaffold::WouldCreate {
-        let scaffolded = scaffold::write_defaults(root, config_dir.as_deref())?;
-        let rescaffolded = launch::plan(root, with_ambient, config_dir.as_deref())?;
-        if !rescaffolded.ok {
-            // Even a failing re-plan must record that this launch just wrote
-            // two files into the repo: mark the report and print the
-            // created-notice, or the one path that scaffolded and then
-            // failed would be the one path with no visible record of it.
-            eprintln!("{}", scaffold_notice(&scaffolded.source));
-            let marked = launch::mark_scaffolded(rescaffolded, &scaffolded.source);
+        let baseline = scaffold::build_baseline(root, builtin)?;
+        let scaffolded = scaffold::write_baseline(root, builtin)?;
+        let rescaffolded = launch::plan(root, context)?;
+        let marked = launch::mark_scaffolded(rescaffolded, &baseline);
+        eprintln!("{}", scaffold_notice(&scaffolded));
+        if !marked.ok {
             return print_report_and_exit(
                 false,
                 cli.json,
@@ -1740,26 +1861,28 @@ fn dispatch_launch(
                 || launch::launch_toon(&marked),
             );
         }
-        let marked = launch::mark_scaffolded(rescaffolded, &scaffolded.source);
-        created_source = Some(scaffolded.source);
+        created_paths = Some(scaffolded.rel_paths);
         marked
     } else {
         plan
     };
 
-    if let Some(source) = &created_source {
-        eprintln!("{}", scaffold_notice(source));
-    }
     if plan.ambient_kinds.contains(&"extensions") {
         return Err(std::io::Error::other(
             "enforcement initialization failed: ambient Pi extensions are not part of the trusted executable bundle",
         ));
     }
     if cli.pi_args.iter().any(|argument| {
-        argument == "-e" || argument == "--extension" || argument.starts_with("--extension=")
+        matches!(
+            argument.as_str(),
+            "-e" | "--extension" | "--skill" | "--prompt-template" | "--theme"
+        ) || argument.starts_with("--extension=")
+            || argument.starts_with("--skill=")
+            || argument.starts_with("--prompt-template=")
+            || argument.starts_with("--theme=")
     }) {
         return Err(std::io::Error::other(
-            "enforcement initialization failed: Pi extensions must be declared in the byte-verified Nopal bundle",
+            "enforcement initialization failed: Pi resources must come from the checked-in Nopal distribution contract",
         ));
     }
     let enforcement_extension = verify_trusted_extensions(&plan.pi_argv)?;
@@ -1808,17 +1931,16 @@ fn dispatch_launch(
         ))
     })?;
 
+    if let Some(paths) = created_paths {
+        eprintln!(
+            "nopal: check in generated project baseline: {}",
+            paths.join(", ")
+        );
+    }
     eprintln!("{}", launch::resource_surface_line(&plan));
     if verbose {
         eprintln!("{}", launch::summary_line(&plan));
     }
-    // exec_pi's cwd is the ORIGINAL invocation dir (`cli.dir`, as given),
-    // not the discovered `root`: config/gates/bundle
-    // resolve at the discovered project root, but pi itself starts where
-    // the user stands. Bundle resource paths in `plan.pi_argv` are already
-    // absolutized (`bundle::bundle_report` absolutizes `root` before
-    // resolving them), so this split is safe - nothing in pi's argv depends
-    // on `cli.dir`.
     enforcement::initialize_receipt_capability(&run.run_dir)?;
     let mut pi_argv = plan.pi_argv;
     pi_argv.extend(cli.pi_args.iter().cloned());
@@ -1852,7 +1974,7 @@ fn verify_trusted_extensions(pi_argv: &[String]) -> std::io::Result<PathBuf> {
             }
             verify_enforcement_adapter(&path)?;
             enforcement_extension = Some(path);
-        } else if normalized.ends_with("/tests/fixtures/deterministic-enforcement-provider.mjs") {
+        } else if normalized.ends_with("/deterministic-enforcement-provider.mjs") {
             verify_exact_source(
                 &path,
                 include_bytes!("../tests/fixtures/deterministic-enforcement-provider.mjs"),
@@ -1923,12 +2045,11 @@ fn warn_for_interactive_rondo(root: &Path) {
 
 /// The always-on created-notice, shared by the success path and the
 /// scaffolded-then-failed re-plan path so a write is never silent.
-fn scaffold_notice(source: &scaffold::ScaffoldSource) -> String {
+fn scaffold_notice(scaffolded: &scaffold::Scaffolded) -> String {
     format!(
-        "nopal: created {} + {} ({})",
-        discover::manifest_rel_path(),
-        nopal_core::bundle::bundle_rel_path(),
-        source.describe()
+        "nopal: created complete project baseline [{}] ({})",
+        scaffolded.rel_paths.join(", "),
+        scaffolded.source.describe()
     )
 }
 
@@ -1956,6 +2077,7 @@ fn exec_pi(
         // Pi's own update-check network call and banner are noise nopal
         // already owns readiness reporting for; skip it every launch.
         .env("PI_SKIP_VERSION_CHECK", "1")
+        .env("PI_OFFLINE", "1")
         .env("NOPAL_ENFORCEMENT_RUN_ID", enforcement.run_id)
         .env("NOPAL_ENFORCEMENT_ROOT", enforcement.root)
         .env("NOPAL_ENFORCEMENT_STATE_DIR", enforcement.state_dir)
@@ -2021,7 +2143,54 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::parse_tmux_plot_identity;
+    use std::fs;
+
+    use super::{
+        packaged_adapter_candidates, parse_tmux_plot_identity, resolve_builtin_adapter_root_from,
+        verify_enforcement_adapter,
+    };
+
+    #[test]
+    fn source_free_apps_resolve_the_exact_packaged_adapter() {
+        let temp = tempfile::tempdir().unwrap();
+        for (executable, adapter) in [
+            (
+                temp.path().join("Nopal-linux/nopal"),
+                temp.path().join("Nopal-linux/extensions/policy-gate"),
+            ),
+            (
+                temp.path().join("Nopal.app/Contents/MacOS/nopal"),
+                temp.path()
+                    .join("Nopal.app/Contents/Resources/extensions/policy-gate"),
+            ),
+        ] {
+            fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            fs::create_dir_all(&adapter).unwrap();
+            fs::write(&executable, b"standalone nopal binary\n").unwrap();
+            for (name, bytes) in [
+                (
+                    "index.ts",
+                    include_bytes!("../../../extensions/policy-gate/index.ts").as_slice(),
+                ),
+                (
+                    "classifier.ts",
+                    include_bytes!("../../../extensions/policy-gate/classifier.ts").as_slice(),
+                ),
+                (
+                    "nopal-cli.ts",
+                    include_bytes!("../../../extensions/policy-gate/nopal-cli.ts").as_slice(),
+                ),
+            ] {
+                fs::write(adapter.join(name), bytes).unwrap();
+            }
+
+            let resolved =
+                resolve_builtin_adapter_root_from(packaged_adapter_candidates(&executable))
+                    .unwrap();
+            assert_eq!(resolved, adapter.canonicalize().unwrap());
+            verify_enforcement_adapter(&resolved.join("index.ts")).unwrap();
+        }
+    }
 
     #[test]
     fn tmux_identity_prefers_the_explicit_plot_tag_and_verifies_the_pane() {

@@ -9,7 +9,7 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config;
 use crate::diagnostics::{self, Code, Diagnostic, Severity};
@@ -19,7 +19,7 @@ pub const BUNDLE_KIND: &str = "nopal.bundle/v1";
 const NOPAL_DIR: &str = ".nopal";
 const BUNDLE_FILE: &str = "bundle.jsonc";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
     Extension,
