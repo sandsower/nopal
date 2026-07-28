@@ -9,13 +9,13 @@
         "package": "nopal"
       },
       "resolved": "0.2.19",
-      "artifact_integrity": "sha256:f0fb6e11ea2b8b528670e4a621dd620447048d36894e610874959e2a13adb8c4",
-      "installed_tree_integrity": "sha256:f0fb6e11ea2b8b528670e4a621dd620447048d36894e610874959e2a13adb8c4",
+      "artifact_integrity": "sha256:781ac0d911445a7ff0d8214a5c439731eae0f1a1ddf13f9a158d69cc07fc7337",
+      "installed_tree_integrity": "sha256:781ac0d911445a7ff0d8214a5c439731eae0f1a1ddf13f9a158d69cc07fc7337",
       "resources": [
         {
           "kind": "extension",
           "path": "index.ts",
-          "tree_integrity": "sha256:26c07f372ca4e63753e11f92411acf78f2a11dec414cb3d8c6cf2c51526ed5d7"
+          "tree_integrity": "sha256:3651c644393a5709188db4cd257fd9d7fc8d342c3a2efba095d4bf66f430702b"
         }
       ]
     }

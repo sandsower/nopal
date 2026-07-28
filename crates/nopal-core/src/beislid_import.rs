@@ -359,6 +359,7 @@ fn recognized_block_key(key: &str) -> bool {
             | "gates"
             | "gate_sets"
             | "action_policy"
+            | "agent_isolation"
             | "lifecycle_actions"
             | "plot_establishment"
             | "visual_surfaces"
@@ -520,6 +521,13 @@ fn build_modules(
                 has_policy = true;
                 let modes = policy_block(block, path, diagnostics);
                 policy_doc.insert("modes".to_owned(), Value::Object(modes));
+            }
+            "agent_isolation" => {
+                has_workflow = true;
+                workflow_doc.insert(
+                    "agent_isolation".to_owned(),
+                    nested_yaml_block(block, path, diagnostics),
+                );
             }
             "lifecycle_actions" => {
                 has_workflow = true;
@@ -704,6 +712,38 @@ fn flat_map_block(block: &Block, path: &str, diagnostics: &mut Vec<Diagnostic>) 
         }
     }
     Value::Object(obj)
+}
+
+fn nested_yaml_block(block: &Block, path: &str, diagnostics: &mut Vec<Diagnostic>) -> Value {
+    match serde_yaml_ng::from_str::<Value>(&block.body) {
+        Ok(Value::Object(value)) => Value::Object(value),
+        Ok(_) => {
+            diagnostics.push(
+                Diagnostic::error(
+                    Code::BeislidImportParseError,
+                    path,
+                    format!("block {:?}: expected a mapping", block.key),
+                )
+                .with_position(block.line + 1, 1),
+            );
+            Value::Object(Map::new())
+        }
+        Err(error) => {
+            let location = error.location();
+            diagnostics.push(
+                Diagnostic::error(
+                    Code::BeislidImportParseError,
+                    path,
+                    format!("block {:?}: invalid nested YAML: {error}", block.key),
+                )
+                .with_position(
+                    block.line + location.as_ref().map_or(1, |location| location.line()),
+                    location.as_ref().map_or(1, |location| location.column()),
+                ),
+            );
+            Value::Object(Map::new())
+        }
+    }
 }
 
 fn yaml_like_block(block: &Block, path: &str, diagnostics: &mut Vec<Diagnostic>) -> Value {

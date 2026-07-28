@@ -597,6 +597,7 @@ mod tests {
         fs::create_dir_all(root).unwrap();
         fs::write(root.join("index.ts"), "export default 1;\n").unwrap();
         fs::write(root.join("classifier.ts"), "export const classify = 1;\n").unwrap();
+        fs::write(root.join("guard.ts"), "export const guard = 1;\n").unwrap();
         fs::write(root.join("nopal-cli.ts"), "export const cli = 1;\n").unwrap();
     }
 

@@ -26,6 +26,8 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
 fs2 = { workspace = true }
+libc = { workspace = true }
+jsonc-parser = { workspace = true }
 
 [dev-dependencies]
 nopal-native-lifecycle = { workspace = true }

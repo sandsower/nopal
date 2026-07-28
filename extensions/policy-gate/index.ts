@@ -1,28 +1,26 @@
-import { realpathSync } from "node:fs";
-import path from "node:path";
+import { closeSync, readSync, writeFileSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { EnforcementAuthority } from "./classifier.js";
 import {
-	classifyBashCommandSet,
-	commandReferencesEnforcementAuthority,
-	isProtectedEnforcementPath,
-	redactToolContent,
-	shouldBlockProtectedCredentialPath,
-	type EnforcementAuthority,
-} from "./classifier.js";
-import {
-	planEnforcement,
-	reauthorizationIsCurrent,
-	recordEnforcementGate,
-	resolvePolicyMode,
-	type EnforcementGate,
-} from "./nopal-cli.js";
+	activeToolCatalogIsExpected,
+	createGuardStats,
+	installPiActionGuard,
+	type GuardStats,
+} from "./guard.js";
+import { resolvePolicyMode } from "./nopal-cli.js";
 
 type EnforcementBootstrap = {
 	authority: EnforcementAuthority;
+	mode: string;
 };
 
-const BOOTSTRAP_PROPERTY = "__nopalEnforcementBootstrapV1";
+const BOOTSTRAP_PROPERTY = "__nopalEnforcementBootstrapV2";
 
+/**
+ * Consume launch authority exactly once and retain it in a non-writable slot.
+ * Agent tools and gate subprocesses inherit neither the bootstrap variable
+ * names nor the launch-scoped mode after extension initialization.
+ */
 function loadBootstrap(): EnforcementBootstrap | undefined {
 	const host = globalThis as unknown as Record<string, unknown>;
 	const retained = host[BOOTSTRAP_PROPERTY];
@@ -34,16 +32,53 @@ function loadBootstrap(): EnforcementBootstrap | undefined {
 	const configDir = process.env.NOPAL_ENFORCEMENT_CONFIG_DIR;
 	const adapterDir = process.env.NOPAL_ENFORCEMENT_ADAPTER_DIR;
 	const nopalBin = process.env.NOPAL_ENFORCEMENT_CLI;
+	const capabilityFdText = process.env.NOPAL_ENFORCEMENT_CAPABILITY_FD;
+	const gateExecutorBin = process.env.NOPAL_GATE_EXECUTOR_BIN;
+	const gateHome = process.env.NOPAL_GATE_HOME;
+	const gateExecutorDigest = process.env.NOPAL_GATE_EXECUTOR_DIGEST;
+	const capabilityFd = Number(capabilityFdText);
+	let adapterCapability: string | undefined;
+	if (Number.isSafeInteger(capabilityFd) && capabilityFd >= 3 && capabilityFd <= 1024) {
+		const bytes = Buffer.alloc(64);
+		try {
+			if (readSync(capabilityFd, bytes, 0, bytes.length, 0) === bytes.length) {
+				const value = bytes.toString("utf8");
+				if (/^[0-9a-f]{64}$/i.test(value)) adapterCapability = value;
+			}
+		} finally {
+			closeSync(capabilityFd);
+		}
+	}
+	const mode = resolvePolicyMode(process.env);
 	delete process.env.NOPAL_ENFORCEMENT_RUN_ID;
 	delete process.env.NOPAL_ENFORCEMENT_ROOT;
 	delete process.env.NOPAL_ENFORCEMENT_STATE_DIR;
 	delete process.env.NOPAL_ENFORCEMENT_CONFIG_DIR;
 	delete process.env.NOPAL_ENFORCEMENT_ADAPTER_DIR;
 	delete process.env.NOPAL_ENFORCEMENT_CLI;
-	if (!runId || !projectRoot || !stateDir || !adapterDir || !nopalBin) return undefined;
+	delete process.env.NOPAL_ENFORCEMENT_CAPABILITY_FD;
+	delete process.env.NOPAL_GATE_EXECUTOR_BIN;
+	delete process.env.NOPAL_GATE_HOME;
+	delete process.env.NOPAL_GATE_EXECUTOR_DIGEST;
+	delete process.env.NOPAL_POLICY_MODE;
+	if (!runId || !projectRoot || !stateDir || !adapterDir || !nopalBin || !adapterCapability
+		|| !gateExecutorBin || !gateHome || !gateExecutorDigest
+		|| !Number.isSafeInteger(capabilityFd)) return undefined;
 
 	const bootstrap: EnforcementBootstrap = {
-		authority: { runId, projectRoot, stateDir, adapterDir, nopalBin, ...(configDir ? { configDir } : {}) },
+		authority: {
+			runId,
+			projectRoot,
+			stateDir,
+			adapterDir,
+			nopalBin,
+			adapterCapability,
+			gateExecutorBin,
+			gateHome,
+			gateExecutorDigest,
+			...(configDir ? { configDir } : {}),
+		},
+		mode,
 	};
 	Object.defineProperty(host, BOOTSTRAP_PROPERTY, {
 		value: bootstrap,
@@ -54,57 +89,38 @@ function loadBootstrap(): EnforcementBootstrap | undefined {
 	return bootstrap;
 }
 
-type GateStats = {
-	total: number;
-	allowed: number;
-	denied: number;
-	asked: number;
-	approved: number;
-	blocked: number;
-	failClosed: number;
-};
-
-function createStats(): GateStats {
-	return { total: 0, allowed: 0, denied: 0, asked: 0, approved: 0, blocked: 0, failClosed: 0 };
-}
-
 function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info"): void {
 	if (ctx.hasUI) ctx.ui.notify(message, level);
 }
 
-/** pi's own read-only tools; distinct from bash shell commands that happen to be read-only. */
-function isSkippedReadOnlyTool(toolName: string): boolean {
-	return toolName === "read" || toolName === "grep" || toolName === "find" || toolName === "ls";
-}
-
-function buildStatusLines(mode: string, stats: GateStats): string[] {
+function buildStatusLines(mode: string, stats: GuardStats): string[] {
 	return [
 		"Nopal enforcement: ON for the entire session",
-		`Mode (NOPAL_POLICY_MODE): ${mode}`,
-		"Protected floors: credential-path blocking, secret redaction, and internal enforcement API blocking",
+		`Pinned policy mode: ${mode}`,
+		"Protected surface: every active Pi tool call, exact targets, workflow gates, placement, credential paths, and enforcement authority",
 		`Decisions this session: ${stats.total} (allowed ${stats.allowed}, denied ${stats.denied}, asked ${stats.asked}, approved ${stats.approved}, blocked ${stats.blocked}, fail-closed ${stats.failClosed})`,
 	];
 }
 
-function gateWorkingDirectory(root: string, configured: string | undefined): string | undefined {
-	const resolvedRoot = path.resolve(root);
-	const resolved = path.resolve(resolvedRoot, configured ?? ".");
-	return resolved === resolvedRoot || resolved.startsWith(`${resolvedRoot}${path.sep}`) ? resolved : undefined;
-}
-
-async function executeGate(pi: ExtensionAPI, gate: EnforcementGate, root: string) {
-	const cwd = gateWorkingDirectory(root, gate.cwd);
-	if (!cwd) return { stdout: "", stderr: "gate cwd escapes repository root", code: 2 };
-	if ("command" in gate.run) return pi.exec("bash", ["-lc", gate.run.command], { cwd });
-	const [command, ...args] = gate.run.argv;
-	if (!command) return { stdout: "", stderr: "gate argv is empty", code: 2 };
-	return pi.exec(command, args, { cwd });
-}
-
 export default function policyGate(pi: ExtensionAPI) {
-	const stats = createStats();
+	let guardInstalled = false;
+	const probe = process.env.NOPAL_ENFORCEMENT_PROBE === "1";
+	pi.on("session_start", () => {
+		const catalogExpected = activeToolCatalogIsExpected(pi.getActiveTools());
+		if (!catalogExpected) process.exit(72);
+		if (!probe) return;
+		const path = process.env.NOPAL_ENFORCEMENT_PROBE_ACK;
+		const token = process.env.NOPAL_ENFORCEMENT_PROBE_TOKEN;
+		delete process.env.NOPAL_ENFORCEMENT_PROBE;
+		delete process.env.NOPAL_ENFORCEMENT_PROBE_ACK;
+		delete process.env.NOPAL_ENFORCEMENT_PROBE_TOKEN;
+		if (!path || !token || !guardInstalled) process.exit(72);
+		writeFileSync(path, token, { encoding: "utf8", mode: 0o600, flag: "wx" });
+		process.exit(0);
+	});
+	const stats = createGuardStats();
 	const bootstrap = loadBootstrap();
-	const authority = bootstrap?.authority;
+	const mode = bootstrap?.mode ?? "uninitialized";
 
 	pi.registerCommand("policy-gate", {
 		description: "Show the always-on Nopal enforcement status",
@@ -114,147 +130,10 @@ export default function policyGate(pi: ExtensionAPI) {
 				notify(ctx, "Usage: /policy-gate [status]", "warning");
 				return;
 			}
-			notify(ctx, buildStatusLines(resolvePolicyMode(process.env), stats).join("\n"), "info");
+			notify(ctx, buildStatusLines(mode, stats).join("\n"), bootstrap ? "info" : "error");
 		},
 	});
 
-	pi.on("tool_call", async (event, ctx) => {
-		const inputPath = String((event.input as { path?: unknown }).path ?? "");
-		if (inputPath && authority) {
-			let protectedPath = isProtectedEnforcementPath(inputPath, ctx.cwd, authority);
-			try {
-				protectedPath ||= isProtectedEnforcementPath(realpathSync(path.resolve(ctx.cwd, inputPath)), ctx.cwd, authority);
-			} catch {
-				// A not-yet-created path still receives lexical protection above.
-			}
-			if (protectedPath) {
-				stats.blocked += 1;
-				return { block: true, reason: "Nopal enforcement authority is not accessible to agent tools" };
-			}
-		}
-
-		if (event.toolName === "write" || event.toolName === "edit") {
-			if (shouldBlockProtectedCredentialPath(event.toolName, inputPath)) {
-				return { block: true, reason: `Protected credential path: ${inputPath}` };
-			}
-			return undefined;
-		}
-
-		if (isSkippedReadOnlyTool(event.toolName)) return undefined;
-		if (event.toolName !== "bash") return undefined;
-
-		const command = String((event.input as { command?: unknown }).command ?? "");
-		if (!command.trim()) return undefined;
-		if (!authority) {
-			stats.failClosed += 1;
-			stats.blocked += 1;
-			return { block: true, reason: "Nopal enforcement was not initialized for this Pi session" };
-		}
-		if (commandReferencesEnforcementAuthority(command, ctx.cwd, authority)) {
-			stats.blocked += 1;
-			return { block: true, reason: "The enforcement contract and evidence store are reserved for the trusted Pi adapter" };
-		}
-
-		const commandClassifications = classifyBashCommandSet(command);
-		if (!commandClassifications.complete) {
-			stats.failClosed += 1;
-			stats.blocked += 1;
-			return { block: true, reason: commandClassifications.reason ?? "The shell command could not be classified completely" };
-		}
-		if (commandClassifications.classifications.some((classification) => classification.action === "nopal.enforcement_internal")) {
-			stats.blocked += 1;
-			return { block: true, reason: "The enforcement machine API is reserved for the trusted Pi adapter" };
-		}
-
-		const mode = resolvePolicyMode(process.env);
-		const planned = [] as Array<{
-			params: { mode: string; action: string; class: string; runId: string; nopalBin: string; cwd: string };
-			result: Awaited<ReturnType<typeof planEnforcement>>;
-			approved: boolean;
-		}>;
-		for (const classification of commandClassifications.classifications) {
-			const params = {
-				mode,
-				action: classification.action,
-				class: classification.class,
-				runId: authority.runId,
-				nopalBin: authority.nopalBin,
-				cwd: ctx.cwd,
-			};
-			const result = await planEnforcement((cmd, cmdArgs, options) => pi.exec(cmd, cmdArgs, options), params);
-			stats.total += 1;
-			if (result.failClosed) {
-				stats.failClosed += 1;
-				stats.blocked += 1;
-				return { block: true, reason: result.explanation };
-			}
-			if (result.decision === "deny") {
-				stats.denied += 1;
-				return { block: true, reason: result.explanation };
-			}
-			let approved = false;
-			if (result.decision === "ask") {
-				stats.asked += 1;
-				if (!ctx.hasUI) {
-					stats.blocked += 1;
-					return { block: true, reason: `${result.explanation} (no UI available for confirmation)` };
-				}
-				const choice = await ctx.ui.select(`Policy gate: ${result.explanation}\n\n${command}\n\nAllow this command?`, ["No, block it", "Yes, run it"]);
-				if (choice !== "Yes, run it") {
-					stats.blocked += 1;
-					return { block: true, reason: "Blocked by user" };
-				}
-				approved = true;
-				stats.approved += 1;
-			}
-			planned.push({ params, result, approved });
-		}
-
-		for (const action of planned) {
-			const initialContract = action.result.contractDigest;
-			const initialWorkspace = action.result.workspaceFingerprint;
-			for (const gate of action.result.requiredGates) {
-				const gateResult = await executeGate(pi, gate, action.result.root);
-				const recorded = await recordEnforcementGate(
-					(cmd, cmdArgs, options) => pi.exec(cmd, cmdArgs, options),
-					{
-						...action.params,
-						gateId: gate.id,
-						exitCode: gateResult.code,
-						contractDigest: initialContract,
-						workspaceFingerprint: initialWorkspace,
-						gateDefinitionDigest: gate.definitionDigest,
-					},
-				);
-				if (!recorded) {
-					stats.failClosed += 1;
-					stats.blocked += 1;
-					return { block: true, reason: `Could not durably record gate ${gate.id}; enforcement context changed or evidence authentication failed` };
-				}
-				if (gateResult.code !== 0) {
-					stats.blocked += 1;
-					return { block: true, reason: `Required gate ${gate.id} failed: ${gateResult.stderr}` };
-				}
-			}
-
-			if (action.result.requiredGates.length > 0) {
-				const reauthorized = await planEnforcement(
-					(cmd, cmdArgs, options) => pi.exec(cmd, cmdArgs, options),
-					action.params,
-				);
-				if (!reauthorizationIsCurrent(action.result, reauthorized, action.approved)) {
-					stats.failClosed += 1;
-					stats.blocked += 1;
-					return { block: true, reason: "Gate receipts or the approved authorization context were not current after execution; blocking fail closed" };
-				}
-			}
-		}
-		stats.allowed += 1;
-		return undefined;
-	});
-
-	pi.on("tool_result", async (event) => {
-		if (event.toolName !== "bash" && event.toolName !== "read") return undefined;
-		return { content: redactToolContent(event.content) as never };
-	});
+	installPiActionGuard(pi, bootstrap?.authority, mode, stats);
+	guardInstalled = true;
 }

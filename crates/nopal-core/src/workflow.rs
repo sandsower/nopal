@@ -69,6 +69,10 @@ pub fn validate_document(root: &serde_json::Value, path: &str) -> Vec<Diagnostic
         validate_babysit(babysit, path, &mut diagnostics);
     }
 
+    if let Some(isolation) = root.get("agent_isolation") {
+        diagnostics.extend(crate::isolation::validate(isolation, path).1);
+    }
+
     diagnostics
 }
 

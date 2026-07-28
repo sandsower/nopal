@@ -34,7 +34,7 @@ macos:
 	install -d "$$stage/Contents/MacOS" "$$stage/Contents/Resources/extensions/policy-gate"; \
 	install -m 0755 "$(RELEASE_DIR)/nopal-field-native" "$$stage/Contents/MacOS/nopal-field-native"; \
 	install -m 0755 "$(RELEASE_DIR)/nopal" "$$stage/Contents/MacOS/nopal"; \
-	for adapter_file in index.ts classifier.ts nopal-cli.ts; do \
+	for adapter_file in index.ts classifier.ts guard.ts nopal-cli.ts; do \
 		install -m 0644 "extensions/policy-gate/$$adapter_file" \
 			"$$stage/Contents/Resources/extensions/policy-gate/$$adapter_file"; \
 	done; \
@@ -83,7 +83,7 @@ linux:
 	install -d "$$stage/extensions/policy-gate"; \
 	install -m 0755 "$(RELEASE_DIR)/nopal-field-native" "$$stage/nopal-field-native"; \
 	install -m 0755 "$(RELEASE_DIR)/nopal" "$$stage/nopal"; \
-	for adapter_file in index.ts classifier.ts nopal-cli.ts; do \
+	for adapter_file in index.ts classifier.ts guard.ts nopal-cli.ts; do \
 		install -m 0644 "extensions/policy-gate/$$adapter_file" \
 			"$$stage/extensions/policy-gate/$$adapter_file"; \
 	done; \
