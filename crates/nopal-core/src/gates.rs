@@ -1,4 +1,4 @@
-//! `nopal.gates/v1` module parsing and validation.
+//! `nopal.gates/v1` explicit and `nopal.gates/v2` generated module validation.
 //!
 //! The gates module declares *what* checks exist and *when* they apply;
 //! nopal selects, decides, and explains but never executes them.
@@ -205,8 +205,8 @@ pub fn parse_gates(text: &str, path: &str) -> (Option<GatesConfig>, Vec<Diagnost
     (Some(config), diagnostics)
 }
 
-/// Validate a parsed `.nopal/gates.jsonc` value against the nopal.gates/v1
-/// schema. Diagnostic-accumulating like the policy validator: everything
+/// Validate a parsed `.nopal/gates.jsonc` value against the explicit v1 or
+/// generated v2 schema. Diagnostic-accumulating like the policy validator: everything
 /// understandable comes back as a best-effort config alongside every
 /// problem found.
 pub fn validate_document(root: &serde_json::Value, path: &str) -> (GatesConfig, Vec<Diagnostic>) {
@@ -322,6 +322,22 @@ fn parse_scaffold_provenance(
             "scaffold provenance must identify at least the baseline template",
         ));
     }
+    if provenance.authority != gate_scaffold::Authority::Generated {
+        diagnostics.push(Diagnostic::error(
+            Code::FieldInvalid,
+            path,
+            "nopal.gates/v2 provenance authority must be \"generated\"; add explicit gates as ordinary gate entries",
+        ));
+    }
+    for template in &provenance.templates {
+        if !gate_scaffold::known_template_id(&template.id) {
+            diagnostics.push(Diagnostic::error(
+                Code::ScaffoldTemplateInvalid,
+                path,
+                format!("unknown generated gate template {:?}", template.id),
+            ));
+        }
+    }
     let declared_gate_ids = gates
         .iter()
         .map(|gate| gate.id.as_str())
@@ -342,6 +358,23 @@ fn parse_scaffold_provenance(
                 format!("scaffold provenance references missing generated gate {id:?}"),
             ));
         }
+    }
+    let has_nonbaseline_template = provenance
+        .templates
+        .iter()
+        .any(|template| template.id != "baseline.git/v1");
+    let has_explicit_gate = declared_gate_ids
+        .iter()
+        .any(|id| !generated_ids.contains(*id));
+    if provenance.readiness == gate_scaffold::Readiness::Ready
+        && !has_nonbaseline_template
+        && !has_explicit_gate
+    {
+        diagnostics.push(Diagnostic::error(
+            Code::GateConfigurationRequired,
+            path,
+            "generated readiness cannot be \"ready\" with only the baseline diff template",
+        ));
     }
     Some(provenance)
 }
@@ -840,7 +873,7 @@ mod tests {
     fn missing_and_wrong_version_are_reported() {
         let (_, diagnostics) = parse(r#"{ "gates": [] }"#);
         assert_eq!(codes(&diagnostics), vec![Code::VersionUnsupported]);
-        let (_, diagnostics) = parse(r#"{ "version": "nopal.gates/v2" }"#);
+        let (_, diagnostics) = parse(r#"{ "version": "nopal.gates/v99" }"#);
         assert_eq!(codes(&diagnostics), vec![Code::VersionUnsupported]);
     }
 

@@ -185,7 +185,32 @@ fn checked_in_gates_ready(dir: &Path) -> io::Result<(bool, Vec<Diagnostic>)> {
                 .gates
                 .iter()
                 .any(|gate| !generated.contains(gate.id.as_str()));
-            nopal_explicit || beislid_explicit || provenance.readiness == Readiness::Ready
+            if nopal_explicit || beislid_explicit {
+                true
+            } else {
+                let detected = nopal_core::gate_scaffold::inspect(dir)?;
+                diagnostics.extend(detected.diagnostics.clone());
+                let expected_text = detected.gates_json().map_err(io::Error::other)?;
+                let expected = serde_json::from_str::<serde_json::Value>(&expected_text)
+                    .map_err(io::Error::other)?;
+                let actual = nopal_core::config::parse_jsonc(
+                    &gates_text,
+                    ".nopal/gates.jsonc",
+                    Code::ModuleParseError,
+                );
+                let matches_current_evidence =
+                    actual.as_ref().is_ok_and(|actual| actual == &expected);
+                if !matches_current_evidence {
+                    diagnostics.push(Diagnostic::error(
+                        Code::GateScaffoldDrift,
+                        ".nopal/gates.jsonc",
+                        "generated gates no longer match current root and declared-workspace evidence; add explicit gates or regenerate from `nopal doctor` evidence",
+                    ));
+                }
+                provenance.readiness == Readiness::Ready
+                    && detected.readiness == Readiness::Ready
+                    && matches_current_evidence
+            }
         }
     };
     let diagnostics_ok = diagnostics
@@ -238,6 +263,7 @@ fn plan_without_nopal(dir: &Path, context: LaunchContext<'_>) -> io::Result<Laun
     )];
     let gate_plan = baseline.gate_scaffold.clone();
     let gate_ready = gate_plan.readiness == Readiness::Ready;
+    let can_scaffold = gate_plan.readiness != Readiness::Blocked;
     if !gate_ready {
         diagnostics.push(Diagnostic::error(
             Code::GateConfigurationRequired,
@@ -254,12 +280,20 @@ fn plan_without_nopal(dir: &Path, context: LaunchContext<'_>) -> io::Result<Laun
         gate_ready,
         process_artifact_ok,
         process_artifact_note,
-        Scaffold::WouldCreate,
+        Scaffold::None,
         distribution,
         diagnostics,
     )?;
+    let can_scaffold = can_scaffold
+        && plan.diagnostics.iter().all(|diagnostic| {
+            diagnostic.severity != Severity::Error
+                || diagnostic.code == Code::GateConfigurationRequired
+        });
     plan.gate_scaffold = Some(gate_plan);
-    plan.prepared_baseline = Some(baseline);
+    if can_scaffold {
+        plan.scaffold = Scaffold::WouldCreate;
+        plan.prepared_baseline = Some(baseline);
+    }
     Ok(plan)
 }
 
@@ -551,15 +585,20 @@ mod tests {
     }
 
     #[test]
-    fn fresh_git_project_plans_complete_offline_scaffold() {
+    fn unknown_git_project_plans_complete_scaffold_without_pi_launch() {
         let temp = tempfile::tempdir().unwrap();
         fs::create_dir(temp.path().join(".git")).unwrap();
         let plan = plan(temp.path(), context(&temp)).unwrap();
-        assert!(plan.ok, "{:?}", plan.diagnostics);
+        assert!(!plan.ok);
         assert_eq!(plan.scaffold, Scaffold::WouldCreate);
         assert_eq!(plan.bundle.packages.len(), 1);
         assert_eq!(plan.bundle.resources.len(), 1);
-        assert_eq!(plan.pi_argv.first().map(String::as_str), Some("--offline"));
+        assert!(plan.pi_argv.is_empty());
+        assert!(
+            plan.diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == Code::GateConfigurationRequired })
+        );
     }
 
     #[test]

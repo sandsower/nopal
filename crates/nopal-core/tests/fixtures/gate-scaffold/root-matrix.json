@@ -1,0 +1,102 @@
+[
+  {
+    "name": "rust-cargo",
+    "files": {"Cargo.toml": "[package]\nname='x'\nversion='0.1.0'\n"},
+    "templates": ["rust.cargo/v1"]
+  },
+  {
+    "name": "javascript-npm",
+    "files": {"package.json": "{\"scripts\":{\"test\":\"node test.js\"}}", "package-lock.json": "{}"},
+    "templates": ["javascript.npm/v1"]
+  },
+  {
+    "name": "javascript-pnpm",
+    "files": {"package.json": "{\"scripts\":{\"lint\":\"eslint .\"}}", "pnpm-lock.yaml": "lockfileVersion: '9.0'"},
+    "templates": ["javascript.pnpm/v1"]
+  },
+  {
+    "name": "javascript-yarn",
+    "files": {"package.json": "{\"scripts\":{\"typecheck\":\"tsc --noEmit\"}}", "yarn.lock": "# yarn"},
+    "templates": ["javascript.yarn/v1"]
+  },
+  {
+    "name": "javascript-bun",
+    "files": {"package.json": "{\"scripts\":{\"check\":\"bun test\"}}", "bun.lock": "{}"},
+    "templates": ["javascript.bun/v1"]
+  },
+  {
+    "name": "python-configured-tools",
+    "files": {"pyproject.toml": "[tool.pytest.ini_options]\n[tool.ruff]\n[tool.mypy]\n"},
+    "templates": ["python.pytest/v1", "python.ruff/v1", "python.mypy/v1"]
+  },
+  {
+    "name": "go",
+    "files": {"go.mod": "module example.test/demo\n"},
+    "templates": ["go.test/v1"]
+  },
+  {
+    "name": "elixir-mix",
+    "files": {"mix.exs": "defmodule Demo.MixProject do\nend\n"},
+    "templates": ["elixir.mix/v1"]
+  },
+  {
+    "name": "ruby-bundler-rspec",
+    "files": {"Gemfile": "gem 'rspec'\n", ".rspec": "--format progress\n"},
+    "templates": ["ruby.rspec/v1"]
+  },
+  {
+    "name": "java-maven",
+    "files": {"pom.xml": "<project></project>\n"},
+    "templates": ["java.maven/v1"]
+  },
+  {
+    "name": "java-gradle",
+    "files": {"build.gradle.kts": "plugins { java }\n", "gradlew": "#!/bin/sh\n"},
+    "templates": ["java.gradle/v1"]
+  },
+  {
+    "name": "dotnet",
+    "files": {"Demo.sln": "Microsoft Visual Studio Solution File\n"},
+    "templates": ["dotnet.test/v1"]
+  },
+  {
+    "name": "swift-package-manager",
+    "files": {"Package.swift": "// swift-tools-version: 6.0\n"},
+    "templates": ["swift.spm/v1"]
+  },
+  {
+    "name": "php-composer-script",
+    "files": {"composer.json": "{\"scripts\":{\"test\":\"phpunit\"}}"},
+    "templates": ["php.composer/v1"]
+  },
+  {
+    "name": "cmake",
+    "files": {"CMakeLists.txt": "enable_testing()\n"},
+    "templates": ["cpp.cmake/v1"]
+  },
+  {
+    "name": "meson",
+    "files": {"meson.build": "project('demo', 'c')\n"},
+    "templates": ["cpp.meson/v1"]
+  },
+  {
+    "name": "make",
+    "files": {"Makefile": "check:\n\t@true\n"},
+    "templates": ["task.make/v1"]
+  },
+  {
+    "name": "just",
+    "files": {"justfile": "test:\n    true\n"},
+    "templates": ["task.just/v1"]
+  },
+  {
+    "name": "taskfile",
+    "files": {"Taskfile.yml": "version: '3'\ntasks:\n  lint:\n    cmds: ['true']\n"},
+    "templates": ["task.taskfile/v1"]
+  },
+  {
+    "name": "mise",
+    "files": {"mise.toml": "[tasks.verify]\nrun = 'true'\n"},
+    "templates": ["task.mise/v1"]
+  }
+]

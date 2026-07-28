@@ -92,12 +92,12 @@ enum Cmd {
     Doctor,
     /// Validate the nopal.project/v1 manifest and profile-required modules
     Validate,
-    /// Inspect nopal.gates/v1 preflights
+    /// Inspect nopal.gates/v1 or generated v2 preflights
     Preflights {
         #[command(subcommand)]
         command: PreflightsCmd,
     },
-    /// Inspect and select nopal.gates/v1 gates
+    /// Inspect and select nopal.gates/v1 or generated v2 gates
     Gates {
         #[command(subcommand)]
         command: GatesCmd,

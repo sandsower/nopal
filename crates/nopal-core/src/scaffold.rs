@@ -134,17 +134,6 @@ pub fn build_baseline(
     )?;
     let lock_text = distribution::lock_json(&lock).map_err(io::Error::other)?;
     let gate_scaffold = gate_scaffold::inspect(&root)?;
-    if !gate_scaffold.ok {
-        return Err(io::Error::other(format!(
-            "gate scaffold detection is blocked: {}",
-            gate_scaffold
-                .diagnostics
-                .iter()
-                .map(|diagnostic| diagnostic.message.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        )));
-    }
     let gates_text = gate_scaffold.gates_json().map_err(io::Error::other)?;
 
     let (_, manifest_diagnostics) =
@@ -227,6 +216,13 @@ pub fn write_baseline(
 /// evidence is not rediscovered between the decision and the capability-based
 /// transaction.
 pub fn write_planned_baseline(root: &Path, baseline: Baseline) -> io::Result<Scaffolded> {
+    if !baseline.gate_scaffold.ok
+        || baseline.gate_scaffold.readiness == gate_scaffold::Readiness::Blocked
+    {
+        return Err(io::Error::other(
+            "refusing to publish a baseline with blocked gate detection",
+        ));
+    }
     let root = std::path::absolute(root)?;
     reject_existing_project_state(&root)?;
     write_built_baseline(&root, baseline)

@@ -4,6 +4,19 @@ use std::fs;
 
 use nopal_core::gate_scaffold::{self, Readiness};
 
+type FixtureFile<'a> = (&'a str, &'a str);
+type MatrixCase<'a> = (&'a str, &'a [FixtureFile<'a>], &'a [&'a str]);
+
+fn write_files(root: &std::path::Path, files: &[FixtureFile<'_>]) {
+    for (path, contents) in files {
+        let path = root.join(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, contents).unwrap();
+    }
+}
+
 #[test]
 fn rust_project_selects_stable_cargo_template_and_complete_gates() {
     let temp = tempfile::tempdir().unwrap();
@@ -77,6 +90,26 @@ fn generated_v2_document_is_accepted_and_malformed_provenance_fails_closed() {
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic.code == nopal_core::diagnostics::Code::VersionUnsupported
     }));
+
+    let unknown = rendered.replace("rust.cargo/v1", "rust.unknown/v1");
+    let (_, diagnostics) = nopal_core::gates::parse_gates(&unknown, ".nopal/gates.jsonc");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == nopal_core::diagnostics::Code::ScaffoldTemplateInvalid
+    }));
+}
+
+#[test]
+fn generated_unknown_baseline_cannot_claim_ready_without_an_explicit_gate() {
+    let temp = tempfile::tempdir().unwrap();
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    let text = plan
+        .gates_json()
+        .unwrap()
+        .replace("needs_configuration", "ready");
+    let (_, diagnostics) = nopal_core::gates::parse_gates(&text, ".nopal/gates.jsonc");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == nopal_core::diagnostics::Code::GateConfigurationRequired
+    }));
 }
 
 #[test]
@@ -99,6 +132,594 @@ fn v1_remains_explicit_authority_but_cannot_smuggle_scaffold_metadata() {
             .iter()
             .any(|diagnostic| { diagnostic.code == nopal_core::diagnostics::Code::FieldInvalid })
     );
+}
+
+#[derive(serde::Deserialize)]
+struct RootFixture {
+    name: String,
+    files: std::collections::BTreeMap<String, String>,
+    templates: Vec<String>,
+}
+
+fn root_fixtures() -> Vec<RootFixture> {
+    serde_json::from_str(include_str!("fixtures/gate-scaffold/root-matrix.json")).unwrap()
+}
+
+#[test]
+fn checked_in_root_fixture_matrix_covers_every_selectable_template() {
+    let fixtures = root_fixtures();
+    let mut covered = std::collections::BTreeSet::from(["baseline.git/v1".to_owned()]);
+    for fixture in fixtures {
+        let temp = tempfile::tempdir().unwrap();
+        for (path, contents) in &fixture.files {
+            write_files(temp.path(), &[(path, contents)]);
+        }
+        let plan = gate_scaffold::inspect(temp.path()).unwrap();
+        let selected = plan
+            .selected_template_ids()
+            .into_iter()
+            .filter(|id| *id != "baseline.git/v1")
+            .collect::<Vec<_>>();
+        assert_eq!(selected, fixture.templates, "fixture {}", fixture.name);
+        covered.extend(fixture.templates);
+    }
+    assert_eq!(
+        covered,
+        nopal_core::gate_scaffold::TEMPLATE_IDS
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+}
+
+#[test]
+fn every_root_fixture_has_negative_ambiguity_and_composition_proof() {
+    let empty = tempfile::tempdir().unwrap();
+    let empty_plan = gate_scaffold::inspect(empty.path()).unwrap();
+    for template_id in nopal_core::gate_scaffold::TEMPLATE_IDS {
+        if template_id != "baseline.git/v1" {
+            assert!(!empty_plan.selected_template_ids().contains(&template_id));
+        }
+    }
+
+    for fixture in root_fixtures() {
+        let ambiguous = tempfile::tempdir().unwrap();
+        for (path, contents) in &fixture.files {
+            write_files(ambiguous.path(), &[(path, contents)]);
+        }
+        write_files(
+            ambiguous.path(),
+            &[
+                ("GNUmakefile", "check:\n\t@true\n"),
+                ("Justfile", "verify:\n    true\n"),
+            ],
+        );
+        let ambiguous_plan = gate_scaffold::inspect(ambiguous.path()).unwrap();
+        assert_eq!(
+            ambiguous_plan.readiness,
+            Readiness::Blocked,
+            "ambiguity fixture {}",
+            fixture.name
+        );
+
+        let composed = tempfile::tempdir().unwrap();
+        for (path, contents) in &fixture.files {
+            write_files(composed.path(), &[(path, contents)]);
+        }
+        write_files(
+            composed.path(),
+            &[
+                ("go.mod", "module example.test/composed\n"),
+                ("Package.swift", "// swift-tools-version: 6.0\n"),
+            ],
+        );
+        let composed_plan = gate_scaffold::inspect(composed.path()).unwrap();
+        for template in &fixture.templates {
+            assert!(
+                composed_plan
+                    .selected_template_ids()
+                    .contains(&template.as_str()),
+                "composition fixture {} omitted {template}",
+                fixture.name
+            );
+        }
+        assert_eq!(
+            composed_plan.readiness,
+            Readiness::Ready,
+            "{}",
+            fixture.name
+        );
+        if fixture
+            .templates
+            .iter()
+            .any(|template| template.starts_with("task."))
+        {
+            assert!(composed_plan.decisions.iter().any(|decision| {
+                decision.outcome.as_str() == "superseded"
+                    && matches!(
+                        decision.template_id.as_deref(),
+                        Some("go.test/v1" | "swift.spm/v1")
+                    )
+            }));
+        } else {
+            assert!(composed_plan.templates.len() >= 3, "{}", fixture.name);
+        }
+    }
+}
+
+#[test]
+fn root_ecosystem_matrix_selects_only_evidence_backed_templates() {
+    let cases: &[MatrixCase<'_>] = &[
+        (
+            "rust",
+            &[("Cargo.toml", "[package]\nname='x'\nversion='0.1.0'\n")],
+            &["rust.cargo/v1"],
+        ),
+        (
+            "npm",
+            &[
+                ("package.json", r#"{"scripts":{"test":"node test.js"}}"#),
+                ("package-lock.json", "{}"),
+            ],
+            &["javascript.npm/v1"],
+        ),
+        (
+            "pnpm",
+            &[
+                ("package.json", r#"{"scripts":{"lint":"eslint ."}}"#),
+                ("pnpm-lock.yaml", "lockfileVersion: '9.0'"),
+            ],
+            &["javascript.pnpm/v1"],
+        ),
+        (
+            "yarn",
+            &[
+                (
+                    "package.json",
+                    r#"{"scripts":{"typecheck":"tsc --noEmit"}}"#,
+                ),
+                ("yarn.lock", "# yarn"),
+            ],
+            &["javascript.yarn/v1"],
+        ),
+        (
+            "bun",
+            &[
+                ("package.json", r#"{"scripts":{"check":"bun test"}}"#),
+                ("bun.lock", "{}"),
+            ],
+            &["javascript.bun/v1"],
+        ),
+        (
+            "python",
+            &[(
+                "pyproject.toml",
+                "[tool.pytest.ini_options]\n[tool.ruff]\n[tool.mypy]\n",
+            )],
+            &["python.pytest/v1", "python.ruff/v1", "python.mypy/v1"],
+        ),
+        (
+            "go",
+            &[("go.mod", "module example.test/demo\n")],
+            &["go.test/v1"],
+        ),
+        (
+            "elixir",
+            &[("mix.exs", "defmodule Demo.MixProject do\nend\n")],
+            &["elixir.mix/v1"],
+        ),
+        (
+            "ruby",
+            &[
+                ("Gemfile", "gem 'rspec'\n"),
+                (".rspec", "--format progress\n"),
+            ],
+            &["ruby.rspec/v1"],
+        ),
+        (
+            "maven",
+            &[("pom.xml", "<project></project>\n")],
+            &["java.maven/v1"],
+        ),
+        (
+            "gradle",
+            &[
+                ("build.gradle.kts", "plugins { java }\n"),
+                ("gradlew", "#!/bin/sh\n"),
+            ],
+            &["java.gradle/v1"],
+        ),
+        (
+            "dotnet",
+            &[("Demo.sln", "Microsoft Visual Studio Solution File\n")],
+            &["dotnet.test/v1"],
+        ),
+        (
+            "swift",
+            &[("Package.swift", "// swift-tools-version: 6.0\n")],
+            &["swift.spm/v1"],
+        ),
+        (
+            "php",
+            &[("composer.json", r#"{"scripts":{"test":"phpunit"}}"#)],
+            &["php.composer/v1"],
+        ),
+        (
+            "cmake",
+            &[("CMakeLists.txt", "enable_testing()\n")],
+            &["cpp.cmake/v1"],
+        ),
+        (
+            "meson",
+            &[("meson.build", "project('demo', 'c')\n")],
+            &["cpp.meson/v1"],
+        ),
+        (
+            "make",
+            &[("Makefile", "check:\n\t@true\n")],
+            &["task.make/v1"],
+        ),
+        (
+            "just",
+            &[("justfile", "test:\n    true\n")],
+            &["task.just/v1"],
+        ),
+        (
+            "taskfile",
+            &[(
+                "Taskfile.yml",
+                "version: '3'\ntasks:\n  lint:\n    cmds: ['true']\n",
+            )],
+            &["task.taskfile/v1"],
+        ),
+        (
+            "mise",
+            &[("mise.toml", "[tasks.verify]\nrun = 'true'\n")],
+            &["task.mise/v1"],
+        ),
+    ];
+
+    for (name, files, expected) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        write_files(temp.path(), files);
+        let plan = gate_scaffold::inspect(temp.path()).unwrap();
+        let selected = plan
+            .selected_template_ids()
+            .into_iter()
+            .filter(|id| *id != "baseline.git/v1")
+            .collect::<Vec<_>>();
+        assert_eq!(selected, *expected, "case {name}: {:#?}", plan.decisions);
+        assert_eq!(plan.readiness, Readiness::Ready, "case {name}");
+    }
+}
+
+#[test]
+fn explicit_repository_tasks_supersede_ecosystem_defaults_in_the_same_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            ("Cargo.toml", "[workspace]\nmembers=[]\n"),
+            ("go.mod", "module example.test/demo\n"),
+            ("Makefile", "check:\n\t@true\n"),
+        ],
+    );
+
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    assert_eq!(
+        plan.selected_template_ids(),
+        vec!["baseline.git/v1", "task.make/v1"]
+    );
+    assert!(plan.decisions.iter().any(|decision| {
+        decision.template_id.as_deref() == Some("rust.cargo/v1")
+            && decision.outcome.as_str() == "superseded"
+    }));
+    assert!(plan.decisions.iter().any(|decision| {
+        decision.template_id.as_deref() == Some("go.test/v1")
+            && decision.outcome.as_str() == "superseded"
+    }));
+}
+
+#[test]
+fn incompatible_manager_and_build_evidence_is_actionable_and_blocks() {
+    let cases = [
+        vec![
+            ("package.json", r#"{"scripts":{"test":"true"}}"#),
+            ("package-lock.json", "{}"),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'"),
+        ],
+        vec![
+            (
+                "package.json",
+                r#"{"packageManager":"pnpm@9","scripts":{"test":"true"}}"#,
+            ),
+            ("package-lock.json", "{}"),
+        ],
+        vec![
+            ("pom.xml", "<project/>"),
+            ("build.gradle", "plugins { id 'java' }"),
+        ],
+        vec![
+            ("CMakeLists.txt", "project(x)"),
+            ("meson.build", "project('x', 'c')"),
+        ],
+        vec![
+            ("Makefile", "test:\n\t@true\n"),
+            ("justfile", "test:\n    true\n"),
+        ],
+    ];
+    for files in cases {
+        let temp = tempfile::tempdir().unwrap();
+        write_files(temp.path(), &files);
+        let plan = gate_scaffold::inspect(temp.path()).unwrap();
+        assert!(!plan.ok, "{:#?}", plan.decisions);
+        assert_eq!(plan.readiness, Readiness::Blocked);
+        assert!(plan.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == nopal_core::diagnostics::Code::GateScaffoldAmbiguous
+        }));
+        assert!(plan.decisions.iter().any(|decision| {
+            decision.outcome.as_str() == "ambiguous" && decision.evidence.len() >= 2
+        }));
+    }
+}
+
+#[test]
+fn independent_root_ecosystems_compose_in_registry_order() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            ("Package.swift", "// swift-tools-version: 6.0\n"),
+            ("go.mod", "module example.test/demo\n"),
+            ("Cargo.toml", "[workspace]\nmembers=[]\n"),
+        ],
+    );
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    assert_eq!(
+        plan.selected_template_ids(),
+        vec![
+            "baseline.git/v1",
+            "rust.cargo/v1",
+            "go.test/v1",
+            "swift.spm/v1",
+        ]
+    );
+}
+
+#[test]
+fn only_declared_confined_workspaces_contribute_in_scope_order() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            (
+                "package.json",
+                r#"{"packageManager":"pnpm@9.0.0","workspaces":["packages/*"]}"#,
+            ),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            (
+                "packages/web/package.json",
+                r#"{"scripts":{"lint":"eslint ."}}"#,
+            ),
+            ("packages/api/pyproject.toml", "[tool.pytest.ini_options]\n"),
+            ("undeclared/go.mod", "module example.test/ignored\n"),
+            ("packages/examples/go.mod", "module example.test/fixture\n"),
+        ],
+    );
+
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    assert_eq!(plan.readiness, Readiness::Ready, "{:#?}", plan.decisions);
+    let selected = plan
+        .templates
+        .iter()
+        .map(|template| (template.scope.as_str(), template.id.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selected,
+        vec![
+            (".", "baseline.git/v1"),
+            ("packages/api", "python.pytest/v1"),
+            ("packages/web", "javascript.pnpm/v1"),
+        ]
+    );
+    assert!(plan.gates.iter().any(|gate| {
+        gate.cwd.as_deref() == Some("packages/api") && gate.argv == ["python", "-m", "pytest"]
+    }));
+    assert!(!plan.decisions.iter().any(|decision| {
+        decision
+            .evidence
+            .iter()
+            .any(|path| path.contains("undeclared") || path.contains("examples"))
+    }));
+}
+
+#[test]
+fn root_workspace_aware_templates_do_not_duplicate_member_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            ("Cargo.toml", "[workspace]\nmembers=['crates/app']\n"),
+            (
+                "crates/app/Cargo.toml",
+                "[package]\nname='app'\nversion='0.1.0'\n",
+            ),
+        ],
+    );
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    assert_eq!(
+        plan.templates
+            .iter()
+            .filter(|template| template.id == "rust.cargo/v1")
+            .count(),
+        1
+    );
+    assert!(plan.decisions.iter().any(|decision| {
+        decision.scope == "crates/app"
+            && decision.template_id.as_deref() == Some("rust.cargo/v1")
+            && decision.reason_code == "root_workspace_coverage"
+    }));
+}
+
+#[test]
+fn workspace_declarations_cover_cargo_pnpm_go_maven_gradle_and_dotnet_forms() {
+    let cases: &[(&[(&str, &str)], &str)] = &[
+        (
+            &[
+                ("Cargo.toml", "[workspace]\nmembers=['members/app']\n"),
+                ("members/app/go.mod", "module example.test/app\n"),
+            ],
+            "members/app",
+        ),
+        (
+            &[
+                ("pnpm-workspace.yaml", "packages:\n  - 'members/app'\n"),
+                ("members/app/go.mod", "module example.test/app\n"),
+            ],
+            "members/app",
+        ),
+        (
+            &[
+                ("go.work", "go 1.24\nuse ./members/app\n"),
+                (
+                    "members/app/Cargo.toml",
+                    "[package]\nname='app'\nversion='0.1.0'\n",
+                ),
+            ],
+            "members/app",
+        ),
+        (
+            &[
+                (
+                    "pom.xml",
+                    "<project><modules><module>members/app</module></modules></project>",
+                ),
+                ("members/app/go.mod", "module example.test/app\n"),
+            ],
+            "members/app",
+        ),
+        (
+            &[
+                ("settings.gradle", "include(':members:app')\n"),
+                ("members/app/go.mod", "module example.test/app\n"),
+            ],
+            "members/app",
+        ),
+        (
+            &[
+                (
+                    "Demo.sln",
+                    "Project(\"x\") = \"App\", \"members/app/App.csproj\", \"x\"\n",
+                ),
+                ("members/app/App.csproj", "<Project/>\n"),
+                ("members/app/go.mod", "module example.test/app\n"),
+            ],
+            "members/app",
+        ),
+    ];
+    for (files, scope) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        write_files(temp.path(), files);
+        let plan = gate_scaffold::inspect(temp.path()).unwrap();
+        assert!(
+            plan.templates
+                .iter()
+                .any(|template| template.scope == *scope),
+            "{:#?}",
+            plan.decisions
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn workspace_traversal_and_symlink_boundaries_fail_closed() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    write_files(
+        outside.path(),
+        &[("go.mod", "module example.test/outside\n")],
+    );
+    write_files(
+        temp.path(),
+        &[("package.json", r#"{"workspaces":["../outside","linked"]}"#)],
+    );
+    symlink(outside.path(), temp.path().join("linked")).unwrap();
+
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    assert!(!plan.ok);
+    assert_eq!(plan.readiness, Readiness::Blocked);
+    assert!(plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == nopal_core::diagnostics::Code::GateWorkspaceInvalid
+    }));
+}
+
+#[test]
+fn checked_in_nopal_and_typed_beislid_gates_supersede_generated_defaults() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            ("Cargo.toml", "[workspace]\nmembers=[]\n"),
+            (
+                ".nopal/gates.jsonc",
+                r#"{"version":"nopal.gates/v1","gates":[{"id":"explicit-nopal","stage":"pre_pr","argv":["true"]}]}"#,
+            ),
+            (
+                ".beislid/workflow.md",
+                "```beislid:gates\n- name: explicit-beislid\n  command: 'cargo test'\n```\n",
+            ),
+        ],
+    );
+
+    let plan = gate_scaffold::inspect_with_checked_in_authority(temp.path()).unwrap();
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert_eq!(plan.authority.as_str(), "explicit_nopal_and_beislid");
+    assert_eq!(plan.readiness, Readiness::Ready);
+    assert_eq!(plan.selected_template_ids(), vec!["baseline.git/v1"]);
+    assert!(plan.decisions.iter().any(|decision| {
+        decision.template_id.as_deref() == Some("rust.cargo/v1")
+            && decision.outcome.as_str() == "superseded"
+            && decision.reason_code == "explicit_gate_precedence"
+    }));
+}
+
+#[test]
+fn doctor_reports_drift_between_checked_in_generation_and_current_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(temp.path(), &[("Cargo.toml", "[workspace]\nmembers=[]\n")]);
+    let generated = gate_scaffold::inspect(temp.path())
+        .unwrap()
+        .gates_json()
+        .unwrap();
+    write_files(temp.path(), &[(".nopal/gates.jsonc", &generated)]);
+    fs::remove_file(temp.path().join("Cargo.toml")).unwrap();
+    write_files(temp.path(), &[("go.mod", "module example.test/demo\n")]);
+
+    let plan = gate_scaffold::inspect_with_checked_in_authority(temp.path()).unwrap();
+    assert!(!plan.ok);
+    assert!(
+        plan.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == nopal_core::diagnostics::Code::GateScaffoldDrift
+        })
+    );
+}
+
+#[test]
+fn malformed_explicit_authority_blocks_doctor_instead_of_falling_back() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            ("Cargo.toml", "[workspace]\nmembers=[]\n"),
+            (".nopal/gates.jsonc", "not json\n"),
+        ],
+    );
+    let plan = gate_scaffold::inspect_with_checked_in_authority(temp.path()).unwrap();
+    assert!(!plan.ok);
+    assert_eq!(plan.readiness, Readiness::Blocked);
 }
 
 #[test]

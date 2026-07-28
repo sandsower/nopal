@@ -95,6 +95,40 @@ fn doctor_reports_unknown_projects_as_needing_configuration() {
 }
 
 #[test]
+fn doctor_reports_explicit_gate_precedence_and_is_deterministic() {
+    let temp = tempfile::tempdir().unwrap();
+    init_git(temp.path());
+    fs::write(
+        temp.path().join("Cargo.toml"),
+        "[workspace]\nmembers = []\n",
+    )
+    .unwrap();
+    fs::create_dir_all(temp.path().join(".nopal")).unwrap();
+    fs::write(
+        temp.path().join(".nopal/gates.jsonc"),
+        r#"{"version":"nopal.gates/v1","gates":[{"id":"explicit","stage":"pre_pr","argv":["true"]}]}"#,
+    )
+    .unwrap();
+
+    let args = ["--dir", temp.path().to_str().unwrap(), "--json", "doctor"];
+    let first = nopal(&args);
+    let second = nopal(&args);
+    assert_eq!(first.status.code(), Some(0), "{}", stdout(&first));
+    assert_eq!(first.stdout, second.stdout);
+    let doc = json(&first);
+    assert_eq!(doc["gate_scaffold"]["authority"], "explicit_nopal");
+    assert!(
+        doc["gate_scaffold"]["decisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|decision| {
+                decision["template_id"] == "rust.cargo/v1" && decision["outcome"] == "superseded"
+            })
+    );
+}
+
+#[test]
 fn export_process_stdout_json_emits_artifact_and_redacts_secrets() {
     let temp = tempfile::tempdir().unwrap();
     write_minimal_project(
@@ -1770,6 +1804,7 @@ fn info_json_reports_version_and_capabilities() {
         capabilities,
         vec![
             "ask",
+            "doctor",
             "export",
             "gates",
             "import",

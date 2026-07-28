@@ -111,6 +111,7 @@ pub enum Code {
     GateScaffoldAmbiguous,
     GateConfigurationRequired,
     GateWorkspaceInvalid,
+    GateScaffoldDrift,
 }
 
 impl Code {
@@ -198,6 +199,7 @@ impl Code {
             Code::GateScaffoldAmbiguous => "gate_scaffold_ambiguous",
             Code::GateConfigurationRequired => "gate_configuration_required",
             Code::GateWorkspaceInvalid => "gate_workspace_invalid",
+            Code::GateScaffoldDrift => "gate_scaffold_drift",
         }
     }
 }

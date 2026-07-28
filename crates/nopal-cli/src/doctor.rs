@@ -17,7 +17,7 @@ pub struct DoctorReport {
 }
 
 pub fn inspect(root: &Path) -> io::Result<DoctorReport> {
-    let gate_scaffold = gate_scaffold::inspect(root)?;
+    let gate_scaffold = gate_scaffold::inspect_with_checked_in_authority(root)?;
     Ok(DoctorReport {
         kind: DOCTOR_KIND,
         ok: gate_scaffold.ok,
