@@ -413,9 +413,21 @@ fn select_required_gates(
     let Some(stage) = action_stage(action) else {
         return Vec::new();
     };
+    let explicit_authority = gate_sources
+        .iter()
+        .any(|(_, gates)| gates.has_explicit_gates());
     let mut selected: Vec<(String, SelectedGate)> = Vec::new();
     for (source, gates) in gate_sources {
-        for gate in selection::select(gates, stage.clone(), &[]).selected {
+        let suppressed_generated = if explicit_authority && gates.scaffold.is_some() {
+            gates.generated_gate_ids()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        for gate in selection::select(gates, stage.clone(), &[])
+            .selected
+            .into_iter()
+            .filter(|gate| !suppressed_generated.contains(gate.id.as_str()))
+        {
             if let Some((previous_source, previous)) =
                 selected.iter().find(|(_, existing)| existing.id == gate.id)
             {

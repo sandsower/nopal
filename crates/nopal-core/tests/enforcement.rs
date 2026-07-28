@@ -37,6 +37,51 @@ fn project(root: &Path) {
 }
 
 #[test]
+fn explicit_nopal_or_beislid_gates_supersede_generated_templates() {
+    for authority in ["nopal", "beislid"] {
+        let temp = tempfile::tempdir().unwrap();
+        project(temp.path());
+        write(&temp.path().join("Cargo.toml"), "[workspace]\nmembers=[]\n");
+        let plan = nopal_core::gate_scaffold::inspect(temp.path()).unwrap();
+        let mut gates: serde_json::Value =
+            serde_json::from_str(&plan.gates_json().unwrap()).unwrap();
+        if authority == "nopal" {
+            gates["gates"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({
+                    "id": "explicit-nopal",
+                    "stage": "pre_pr",
+                    "argv": ["true"]
+                }));
+        } else {
+            write(
+                &temp.path().join(".beislid/workflow.md"),
+                "```beislid:gates\n- name: explicit-beislid\n  command: 'cargo test'\n```\n",
+            );
+        }
+        write(
+            &temp.path().join(".nopal/gates.jsonc"),
+            &serde_json::to_string_pretty(&gates).unwrap(),
+        );
+
+        let report = enforcement::plan(EnforcementRequest {
+            root: temp.path(),
+            config_dir: None,
+            mode: Mode::SupervisedAuto,
+            action: "git.push",
+            classes: &[ActionClass::GitRemote],
+            run_dir: None,
+            receipt_key: None,
+        })
+        .unwrap();
+        assert!(report.ok, "{authority}: {:?}", report.diagnostics);
+        assert_eq!(report.required_gates.len(), 1, "{authority}");
+        assert_eq!(report.required_gates[0].id, format!("explicit-{authority}"));
+    }
+}
+
+#[test]
 fn normal_push_requires_pre_pr_gate_while_force_push_is_denied() {
     let temp = tempfile::tempdir().unwrap();
     project(temp.path());

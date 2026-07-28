@@ -193,6 +193,32 @@ pub struct GatesConfig {
     pub selectors: Vec<Selector>,
 }
 
+impl GatesConfig {
+    pub fn generated_gate_ids(&self) -> BTreeSet<&str> {
+        self.scaffold
+            .as_ref()
+            .map(|provenance| {
+                provenance
+                    .generated_gate_ids
+                    .iter()
+                    .map(String::as_str)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn has_explicit_gates(&self) -> bool {
+        let generated = self.generated_gate_ids();
+        if self.scaffold.is_none() {
+            return !self.gates.is_empty() || !self.preflights.is_empty();
+        }
+        self.gates
+            .iter()
+            .any(|gate| !generated.contains(gate.id.as_str()))
+            || !self.preflights.is_empty()
+    }
+}
+
 /// Parse and validate gates module text. Entries with a usable `id` are kept
 /// even when they carry errors, so listings can show what the file declares;
 /// `config` is `None` only when the file did not parse as JSONC.

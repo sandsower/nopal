@@ -20,6 +20,8 @@ pub enum SkipReason {
     StageMismatch,
     /// Selectors are configured and none that matched references it.
     NotSelected,
+    /// A checked-in explicit gate replaces generated template gates.
+    SupersededByExplicitAuthority,
 }
 
 impl SkipReason {
@@ -27,6 +29,7 @@ impl SkipReason {
         match self {
             SkipReason::StageMismatch => "stage_mismatch",
             SkipReason::NotSelected => "not_selected",
+            SkipReason::SupersededByExplicitAuthority => "superseded_by_explicit_authority",
         }
     }
 }
@@ -141,6 +144,11 @@ pub fn select(config: &GatesConfig, stage: GateStage, changed_files: &[String]) 
         }
     }
 
+    let suppressed_generated = if config.has_explicit_gates() && config.scaffold.is_some() {
+        config.generated_gate_ids()
+    } else {
+        std::collections::BTreeSet::new()
+    };
     let mut selected = Vec::new();
     let mut skipped = Vec::new();
 
@@ -150,7 +158,14 @@ pub fn select(config: &GatesConfig, stage: GateStage, changed_files: &[String]) 
         let Some(gate) = find_gate(config, id) else {
             continue;
         };
-        if gate.stage == stage {
+        if suppressed_generated.contains(gate.id.as_str()) {
+            skipped.push(SkippedGate {
+                id: gate.id.clone(),
+                stage: gate.stage.clone(),
+                reason: SkipReason::SupersededByExplicitAuthority,
+                via: Some(via.clone()),
+            });
+        } else if gate.stage == stage {
             selected.push(SelectedGate {
                 id: gate.id.clone(),
                 stage: gate.stage.clone(),
@@ -177,7 +192,11 @@ pub fn select(config: &GatesConfig, stage: GateStage, changed_files: &[String]) 
             skipped.push(SkippedGate {
                 id: gate.id.clone(),
                 stage: gate.stage.clone(),
-                reason: SkipReason::NotSelected,
+                reason: if suppressed_generated.contains(gate.id.as_str()) {
+                    SkipReason::SupersededByExplicitAuthority
+                } else {
+                    SkipReason::NotSelected
+                },
                 via: None,
             });
         }

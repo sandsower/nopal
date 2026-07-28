@@ -52,6 +52,18 @@ fn rust_project_selects_stable_cargo_template_and_complete_gates() {
 }
 
 #[test]
+fn doctor_trace_records_skipped_templates_with_stable_reasons() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(temp.path(), &[("Cargo.toml", "[workspace]\nmembers=[]\n")]);
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    assert!(plan.decisions.iter().any(|decision| {
+        decision.template_id.as_deref() == Some("javascript.npm/v1")
+            && decision.outcome.as_str() == "skipped"
+            && decision.reason_code == "template_evidence_absent"
+    }));
+}
+
+#[test]
 fn unknown_project_gets_baseline_but_needs_explicit_configuration() {
     let temp = tempfile::tempdir().unwrap();
     fs::write(temp.path().join("README.md"), "unknown\n").unwrap();
@@ -96,6 +108,43 @@ fn generated_v2_document_is_accepted_and_malformed_provenance_fails_closed() {
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic.code == nopal_core::diagnostics::Code::ScaffoldTemplateInvalid
     }));
+}
+
+#[test]
+fn explicit_gate_selection_suppresses_generated_template_gates() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(temp.path(), &[("Cargo.toml", "[workspace]\nmembers=[]\n")]);
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&plan.gates_json().unwrap()).unwrap();
+    value["gates"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "id": "explicit",
+            "stage": "pre_pr",
+            "argv": ["true"]
+        }));
+    let (config, diagnostics) = nopal_core::gates::parse_gates(
+        &serde_json::to_string(&value).unwrap(),
+        ".nopal/gates.jsonc",
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let selected =
+        nopal_core::selection::select(&config.unwrap(), nopal_core::gates::GateStage::PrePr, &[]);
+    assert_eq!(
+        selected
+            .selected
+            .iter()
+            .map(|gate| gate.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["explicit"]
+    );
+    assert!(
+        selected
+            .skipped
+            .iter()
+            .any(|gate| { gate.reason.as_str() == "superseded_by_explicit_authority" })
+    );
 }
 
 #[test]
@@ -464,6 +513,24 @@ fn incompatible_manager_and_build_evidence_is_actionable_and_blocks() {
 }
 
 #[test]
+fn python_and_ruby_require_structured_tool_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            (
+                "pyproject.toml",
+                "[project]\ndescription='mentions [tool.pytest but configures nothing'\n",
+            ),
+            (".rspec", "--format progress\n"),
+        ],
+    );
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    assert!(!plan.selected_template_ids().contains(&"python.pytest/v1"));
+    assert!(!plan.selected_template_ids().contains(&"ruby.rspec/v1"));
+}
+
+#[test]
 fn independent_root_ecosystems_compose_in_registry_order() {
     let temp = tempfile::tempdir().unwrap();
     write_files(
@@ -656,6 +723,74 @@ fn workspace_declarations_cover_cargo_pnpm_go_maven_gradle_and_dotnet_forms() {
 }
 
 #[test]
+fn pnpm_workspace_lock_proves_child_package_manager_without_root_package_json() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[
+            ("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n"),
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+            (
+                "packages/web/package.json",
+                r#"{"scripts":{"test":"node test.js"}}"#,
+            ),
+        ],
+    );
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    assert!(plan.ok, "{:?}", plan.diagnostics);
+    assert!(plan.templates.iter().any(|template| {
+        template.scope == "packages/web" && template.id == "javascript.pnpm/v1"
+    }));
+}
+
+#[test]
+fn workspace_expansion_has_a_total_result_bound() {
+    let temp = tempfile::tempdir().unwrap();
+    write_files(
+        temp.path(),
+        &[("package.json", r#"{"workspaces":["packages/*"]}"#)],
+    );
+    for index in 0..257 {
+        fs::create_dir_all(temp.path().join(format!("packages/member-{index:03}"))).unwrap();
+    }
+    let plan = gate_scaffold::inspect(temp.path()).unwrap();
+    assert!(!plan.ok);
+    assert!(plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == nopal_core::diagnostics::Code::GateWorkspaceInvalid
+            && diagnostic.message.contains("256-workspace")
+    }));
+}
+
+#[test]
+fn workspace_normalization_cannot_hide_parent_traversal() {
+    for declaration in [" ../outside ", "'../outside'"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        write_files(&outside, &[("Makefile", "test:\n\t@true\n")]);
+        write_files(
+            &root,
+            &[(
+                "package.json",
+                &format!(r#"{{"workspaces":["{declaration}"]}}"#),
+            )],
+        );
+        let plan = gate_scaffold::inspect(&root).unwrap();
+        assert!(!plan.ok, "{declaration}: {:#?}", plan.decisions);
+        assert!(plan.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == nopal_core::diagnostics::Code::GateWorkspaceInvalid
+        }));
+        assert!(
+            !plan
+                .templates
+                .iter()
+                .any(|template| template.scope.contains(".."))
+        );
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn workspace_traversal_and_symlink_boundaries_fail_closed() {
     use std::os::unix::fs::symlink;
@@ -677,6 +812,17 @@ fn workspace_traversal_and_symlink_boundaries_fail_closed() {
     assert_eq!(plan.readiness, Readiness::Blocked);
     assert!(plan.diagnostics.iter().any(|diagnostic| {
         diagnostic.code == nopal_core::diagnostics::Code::GateWorkspaceInvalid
+    }));
+
+    let evidence_root = temp.path().join("evidence-root");
+    fs::create_dir_all(&evidence_root).unwrap();
+    let outside_manifest = outside.path().join("package.json");
+    fs::write(&outside_manifest, r#"{"scripts":{"test":"true"}}"#).unwrap();
+    symlink(&outside_manifest, evidence_root.join("package.json")).unwrap();
+    let evidence_plan = gate_scaffold::inspect(&evidence_root).unwrap();
+    assert!(!evidence_plan.ok);
+    assert!(evidence_plan.diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == nopal_core::diagnostics::Code::GateScaffoldEvidenceInvalid
     }));
 }
 

@@ -220,6 +220,37 @@ fn generated_gate_evidence_drift_blocks_launch_until_explicit_authority_exists()
         .output()
         .unwrap();
     assert_eq!(explicit.status.code(), Some(0), "{explicit:?}");
+
+    let selection = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args([
+            "--dir",
+            repo.to_str().unwrap(),
+            "--json",
+            "gates",
+            "select",
+            "--stage",
+            "pre_pr",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(selection.status.code(), Some(0), "{selection:?}");
+    let selected: serde_json::Value = serde_json::from_slice(&selection.stdout).unwrap();
+    assert_eq!(
+        selected["selected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|gate| gate["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["explicit-go"]
+    );
+    assert!(
+        selected["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gate| { gate["reason"] == "superseded_by_explicit_authority" })
+    );
 }
 
 #[test]

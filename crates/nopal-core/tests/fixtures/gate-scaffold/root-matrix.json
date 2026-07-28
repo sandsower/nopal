@@ -91,7 +91,7 @@
   },
   {
     "name": "taskfile",
-    "files": {"Taskfile.yml": "version: '3'\ntasks:\n  lint:\n    cmds: ['true']\n"},
+    "files": {"Taskfile.yml": "version: '3'\ntasks:\n    lint:\n        cmds: ['true']\n"},
     "templates": ["task.taskfile/v1"]
   },
   {

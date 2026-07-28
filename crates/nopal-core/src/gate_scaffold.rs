@@ -6,9 +6,10 @@
 //! workspaces.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read as _};
 use std::path::Path;
 
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use serde::{Deserialize, Serialize};
 
 use crate::diagnostics::{Code, Diagnostic, Severity};
@@ -218,6 +219,10 @@ pub fn inspect(root: &Path) -> io::Result<GateScaffoldPlan> {
     let inherited_manager = root_package_manager_hint(&root);
     let mut plan = inspect_scope(&root, None)?;
     let workspaces = discover_workspaces(&root, &mut plan)?;
+    if plan.readiness == Readiness::Blocked {
+        crate::diagnostics::sort(&mut plan.diagnostics);
+        return Ok(plan);
+    }
     let mut unknown_workspace = false;
     for workspace in workspaces {
         let child = inspect_scope(&root.join(&workspace.path), inherited_manager.as_ref())?;
@@ -333,7 +338,9 @@ pub fn inspect_with_checked_in_authority(root: &Path) -> io::Result<GateScaffold
             (true, true) => Authority::Generated,
         };
         for decision in &mut plan.decisions {
-            if decision.template_id.as_deref() != Some("baseline.git/v1") {
+            if decision.template_id.as_deref() != Some("baseline.git/v1")
+                && decision.outcome != DecisionOutcome::Skipped
+            {
                 decision.outcome = DecisionOutcome::Superseded;
                 decision.reason_code = "explicit_gate_precedence".to_owned();
                 decision.message =
@@ -420,6 +427,7 @@ fn inspect_scope(
     if plan.readiness != Readiness::Blocked {
         detect_ecosystem_defaults(root, &mut plan, suppression)?;
     }
+    record_skipped_templates(&mut plan);
 
     if plan.readiness != Readiness::Blocked && plan.templates.len() > 1 {
         plan.readiness = Readiness::Ready;
@@ -440,6 +448,25 @@ fn inspect_scope(
             .all(|diagnostic| diagnostic.severity != Severity::Error);
     crate::diagnostics::sort(&mut plan.diagnostics);
     Ok(plan)
+}
+
+fn record_skipped_templates(plan: &mut GateScaffoldPlan) {
+    for template_id in TEMPLATE_IDS {
+        if !plan
+            .decisions
+            .iter()
+            .any(|decision| decision.template_id.as_deref() == Some(template_id))
+        {
+            plan.decisions.push(DetectionDecision {
+                scope: ".".to_owned(),
+                template_id: Some(template_id.to_owned()),
+                outcome: DecisionOutcome::Skipped,
+                reason_code: "template_evidence_absent".to_owned(),
+                evidence: Vec::new(),
+                message: "the manifest, configured tool, or explicit task evidence required by this template was not present in the scope".to_owned(),
+            });
+        }
+    }
 }
 
 fn select_baseline(plan: &mut GateScaffoldPlan) {
@@ -498,10 +525,11 @@ fn merge_workspace_plan(
         .copied()
         .collect::<std::collections::BTreeSet<_>>();
     for decision in &mut child.decisions {
-        if decision
-            .template_id
-            .as_deref()
-            .is_some_and(|template| covered_by_root.contains(template))
+        if decision.outcome == DecisionOutcome::Selected
+            && decision
+                .template_id
+                .as_deref()
+                .is_some_and(|template| covered_by_root.contains(template))
         {
             decision.outcome = DecisionOutcome::Superseded;
             decision.reason_code = "root_workspace_coverage".to_owned();
@@ -597,8 +625,9 @@ fn hex_prefix(bytes: &[u8], count: usize) -> String {
 }
 
 fn root_package_manager_hint(root: &Path) -> Option<PackageManagerChoice> {
-    let text = fs::read_to_string(root.join("package.json")).ok()?;
-    let package: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let package = fs::read_to_string(root.join("package.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
     let candidates = [
         ("javascript.npm/v1", "npm", "package-lock.json"),
         ("javascript.pnpm/v1", "pnpm", "pnpm-lock.yaml"),
@@ -608,7 +637,10 @@ fn root_package_manager_hint(root: &Path) -> Option<PackageManagerChoice> {
     ];
     let mut found = candidates
         .iter()
-        .filter(|candidate| root.join(candidate.2).is_file())
+        .filter(|candidate| {
+            fs::symlink_metadata(root.join(candidate.2))
+                .is_ok_and(|metadata| metadata.file_type().is_file())
+        })
         .collect::<Vec<_>>();
     found.dedup_by_key(|candidate| candidate.0);
     if found.len() == 1 {
@@ -620,6 +652,7 @@ fn root_package_manager_hint(root: &Path) -> Option<PackageManagerChoice> {
         });
     }
     package
+        .as_ref()?
         .get("packageManager")
         .and_then(serde_json::Value::as_str)
         .and_then(|manager| {
@@ -656,49 +689,67 @@ fn discover_workspaces(
     collect_json_workspace_patterns(root, plan, &mut patterns)?;
     collect_line_workspace_patterns(root, plan, &mut patterns, &mut coverage_patterns)?;
 
+    let mut budget = ExpansionBudget::default();
     let mut excluded_workspaces = std::collections::BTreeSet::new();
-    for pattern in excludes {
+    for raw_pattern in excludes {
+        let Some(pattern) = normalize_workspace_pattern(&raw_pattern) else {
+            block_workspace(
+                plan,
+                &raw_pattern,
+                "workspace exclusion is empty after normalization",
+            );
+            continue;
+        };
         if invalid_workspace_pattern(&pattern) {
             block_workspace(
                 plan,
-                &pattern,
+                &raw_pattern,
                 "workspace exclusions must be relative and cannot contain parent traversal",
             );
             continue;
         }
-        excluded_workspaces.extend(expand_workspace_pattern(root, &pattern, plan)?);
+        excluded_workspaces.extend(expand_workspace_pattern(root, &pattern, plan, &mut budget)?);
     }
 
     let mut workspaces: std::collections::BTreeMap<
         String,
         std::collections::BTreeSet<&'static str>,
     > = std::collections::BTreeMap::new();
-    for pattern in patterns {
+    for raw_pattern in patterns {
+        let coverage = coverage_patterns
+            .get(&raw_pattern)
+            .cloned()
+            .unwrap_or_default();
+        let Some(pattern) = normalize_workspace_pattern(&raw_pattern) else {
+            block_workspace(
+                plan,
+                &raw_pattern,
+                "workspace declaration is empty after normalization",
+            );
+            continue;
+        };
         if invalid_workspace_pattern(&pattern) {
             block_workspace(
                 plan,
-                &pattern,
+                &raw_pattern,
                 "workspace declarations must be relative and cannot contain parent traversal",
             );
             continue;
         }
-        let expanded = expand_workspace_pattern(root, &pattern, plan)?;
+        let expanded = expand_workspace_pattern(root, &pattern, plan, &mut budget)?;
         if expanded.is_empty() && !pattern.contains(['*', '?', '[']) {
             block_workspace(
                 plan,
-                &pattern,
+                &raw_pattern,
                 "declared workspace does not resolve to a confined directory",
             );
         }
         for workspace in expanded {
             if !excluded_workspaces.contains(&workspace) {
-                workspaces.entry(workspace).or_default().extend(
-                    coverage_patterns
-                        .get(&pattern)
-                        .into_iter()
-                        .flatten()
-                        .copied(),
-                );
+                workspaces
+                    .entry(workspace)
+                    .or_default()
+                    .extend(coverage.iter().copied());
             }
         }
     }
@@ -942,7 +993,9 @@ fn collect_line_workspace_patterns(
         }
     }
     for solution in root_files_with_extensions(root, &["sln"])? {
-        let text = fs::read_to_string(root.join(&solution))?;
+        let Some(text) = read_optional_evidence(root, &solution, plan)? else {
+            continue;
+        };
         for quoted in quoted_values(&text) {
             let normalized = quoted.replace('\\', "/");
             if ["csproj", "fsproj", "vbproj"]
@@ -1042,6 +1095,17 @@ fn quoted_values(text: &str) -> Vec<String> {
     values
 }
 
+fn normalize_workspace_pattern(pattern: &str) -> Option<String> {
+    let normalized = pattern
+        .trim()
+        .trim_matches(['\'', '"'])
+        .trim()
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_owned();
+    (!normalized.is_empty() && normalized != ".").then_some(normalized)
+}
+
 fn invalid_workspace_pattern(pattern: &str) -> bool {
     let path = Path::new(pattern);
     path.is_absolute()
@@ -1075,22 +1139,77 @@ const WORKSPACE_EXCLUDED_COMPONENTS: [&str; 17] = [
     "coverage",
 ];
 
+const MAX_WORKSPACE_DIRECTORY_ENTRIES: usize = 4096;
+const MAX_DECLARED_WORKSPACES: usize = 256;
+
+#[derive(Default)]
+struct ExpansionBudget {
+    directory_entries: usize,
+    matched_workspaces: usize,
+    exhausted: bool,
+}
+
+impl ExpansionBudget {
+    fn consume_entry(&mut self, plan: &mut GateScaffoldPlan, path: &Path) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        self.directory_entries += 1;
+        if self.directory_entries > MAX_WORKSPACE_DIRECTORY_ENTRIES {
+            self.exhaust(
+                plan,
+                path,
+                "workspace expansion exceeded the 4096-entry inspection bound",
+            );
+            return false;
+        }
+        true
+    }
+
+    fn consume_workspace(&mut self, plan: &mut GateScaffoldPlan, path: &Path) -> bool {
+        if self.exhausted {
+            return false;
+        }
+        self.matched_workspaces += 1;
+        if self.matched_workspaces > MAX_DECLARED_WORKSPACES {
+            self.exhaust(
+                plan,
+                path,
+                "workspace expansion exceeded the 256-workspace result bound",
+            );
+            return false;
+        }
+        true
+    }
+
+    fn exhaust(&mut self, plan: &mut GateScaffoldPlan, path: &Path, message: &str) {
+        if !self.exhausted {
+            block_workspace(plan, &path.to_string_lossy(), message);
+            self.exhausted = true;
+        }
+    }
+}
+
 fn expand_workspace_pattern(
     root: &Path,
     pattern: &str,
     plan: &mut GateScaffoldPlan,
+    budget: &mut ExpansionBudget,
 ) -> io::Result<Vec<String>> {
-    let normalized = pattern
-        .trim()
-        .trim_matches(['\'', '"'])
-        .trim_start_matches("./")
-        .trim_end_matches('/');
-    if normalized.is_empty() || normalized == "." {
+    if budget.exhausted {
         return Ok(Vec::new());
     }
-    let components = normalized.split('/').collect::<Vec<_>>();
+    let components = pattern.split('/').collect::<Vec<_>>();
     let mut matches = Vec::new();
-    expand_components(root, Path::new(""), &components, 0, &mut matches, plan)?;
+    expand_components(
+        root,
+        Path::new(""),
+        &components,
+        0,
+        &mut matches,
+        plan,
+        budget,
+    )?;
     matches.sort();
     matches.dedup();
     Ok(matches)
@@ -1103,9 +1222,13 @@ fn expand_components(
     depth: usize,
     matches: &mut Vec<String>,
     plan: &mut GateScaffoldPlan,
+    budget: &mut ExpansionBudget,
 ) -> io::Result<()> {
+    if budget.exhausted {
+        return Ok(());
+    }
     if components.is_empty() {
-        if !relative.as_os_str().is_empty() {
+        if !relative.as_os_str().is_empty() && budget.consume_workspace(plan, relative) {
             matches.push(relative.to_string_lossy().replace('\\', "/"));
         }
         return Ok(());
@@ -1120,9 +1243,17 @@ fn expand_components(
     }
     let component = components[0];
     if component == "**" {
-        expand_components(root, relative, &components[1..], depth + 1, matches, plan)?;
-        for child in confined_child_directories(root, relative, plan)? {
-            expand_components(root, &child, components, depth + 1, matches, plan)?;
+        expand_components(
+            root,
+            relative,
+            &components[1..],
+            depth + 1,
+            matches,
+            plan,
+            budget,
+        )?;
+        for child in confined_child_directories(root, relative, plan, budget)? {
+            expand_components(root, &child, components, depth + 1, matches, plan, budget)?;
         }
         return Ok(());
     }
@@ -1134,13 +1265,21 @@ fn expand_components(
                 return Ok(());
             }
         };
-        for child in confined_child_directories(root, relative, plan)? {
+        for child in confined_child_directories(root, relative, plan, budget)? {
             let name = child
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or_default();
             if glob.is_match(name) {
-                expand_components(root, &child, &components[1..], depth + 1, matches, plan)?;
+                expand_components(
+                    root,
+                    &child,
+                    &components[1..],
+                    depth + 1,
+                    matches,
+                    plan,
+                    budget,
+                )?;
             }
         }
         return Ok(());
@@ -1149,6 +1288,9 @@ fn expand_components(
         return Ok(());
     }
     let next = relative.join(component);
+    if !budget.consume_entry(plan, &next) {
+        return Ok(());
+    }
     let path = root.join(&next);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1159,7 +1301,15 @@ fn expand_components(
             );
         }
         Ok(metadata) if metadata.is_dir() => {
-            expand_components(root, &next, &components[1..], depth + 1, matches, plan)?;
+            expand_components(
+                root,
+                &next,
+                &components[1..],
+                depth + 1,
+                matches,
+                plan,
+                budget,
+            )?;
         }
         Ok(_) | Err(_) => {}
     }
@@ -1170,10 +1320,14 @@ fn confined_child_directories(
     root: &Path,
     relative: &Path,
     plan: &mut GateScaffoldPlan,
+    budget: &mut ExpansionBudget,
 ) -> io::Result<Vec<std::path::PathBuf>> {
     let mut children = Vec::new();
     for entry in fs::read_dir(root.join(relative))? {
         let entry = entry?;
+        if !budget.consume_entry(plan, &relative.join(entry.file_name())) {
+            break;
+        }
         let name = entry.file_name();
         let name_text = name.to_string_lossy();
         if excluded_component(&name_text) {
@@ -1442,6 +1596,7 @@ fn line_colon_tasks(text: &str) -> Vec<String> {
 
 fn yaml_tasks(text: &str) -> Vec<String> {
     let mut in_tasks = false;
+    let mut task_indent = None;
     let mut declared = Vec::new();
     for line in text.lines() {
         if line.trim() == "tasks:" && !line.starts_with(char::is_whitespace) {
@@ -1451,15 +1606,18 @@ fn yaml_tasks(text: &str) -> Vec<String> {
         if in_tasks && !line.trim().is_empty() && !line.starts_with(char::is_whitespace) {
             break;
         }
-        if in_tasks {
+        if in_tasks && !line.trim().is_empty() && !line.trim_start().starts_with('#') {
             let spaces = line
                 .chars()
                 .take_while(|character| *character == ' ')
                 .count();
-            if spaces == 2
-                && let Some(name) = line.trim().strip_suffix(':')
+            if task_indent.is_none() {
+                task_indent = Some(spaces);
+            }
+            if task_indent == Some(spaces)
+                && let Some((name, _)) = line.trim().split_once(':')
             {
-                declared.push(name);
+                declared.push(name.trim());
             }
         }
     }
@@ -1687,35 +1845,48 @@ fn detect_ecosystem_defaults(
         );
     }
 
-    let pyproject = read_optional_evidence(root, "pyproject.toml", plan)?;
+    let pyproject = match read_optional_evidence(root, "pyproject.toml", plan)? {
+        Some(text) => match toml::from_str::<toml::Value>(&text) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                block_invalid_evidence(
+                    plan,
+                    "pyproject.toml",
+                    format!("invalid TOML evidence: {error}"),
+                );
+                None
+            }
+        },
+        None => None,
+    };
     let python_tools = [
         (
-            "[tool.pytest",
+            &["tool", "pytest"][..],
             &["pytest.ini"][..],
             "python.pytest/v1",
             "pytest",
             &["python", "-m", "pytest"][..],
         ),
         (
-            "[tool.ruff",
+            &["tool", "ruff"][..],
             &["ruff.toml", ".ruff.toml"][..],
             "python.ruff/v1",
             "ruff-check",
             &["python", "-m", "ruff", "check", "."][..],
         ),
         (
-            "[tool.mypy",
+            &["tool", "mypy"][..],
             &["mypy.ini", ".mypy.ini"][..],
             "python.mypy/v1",
             "mypy",
             &["python", "-m", "mypy", "."][..],
         ),
     ];
-    for (marker, config_paths, template, purpose, command) in python_tools {
+    for (keys, config_paths, template, purpose, command) in python_tools {
         let mut evidence = Vec::new();
         if pyproject
-            .as_deref()
-            .is_some_and(|contents| contents.contains(marker))
+            .as_ref()
+            .is_some_and(|value| toml_path_exists(value, keys))
         {
             evidence.push("pyproject.toml".to_owned());
         }
@@ -1773,10 +1944,8 @@ fn detect_ecosystem_defaults(
 
     let gemfile = read_optional_evidence(root, "Gemfile", plan)?;
     let rspec = has_evidence(root, ".rspec", plan)?;
-    if rspec
-        || gemfile
-            .as_deref()
-            .is_some_and(|text| text.contains("rspec"))
+    if let Some(gemfile) = gemfile
+        && (rspec || gemfile_declares_rspec(&gemfile))
     {
         let mut evidence = vec!["Gemfile".to_owned()];
         if rspec {
@@ -1801,6 +1970,27 @@ fn detect_ecosystem_defaults(
     )?;
     detect_cpp(root, plan, suppressed)?;
     Ok(())
+}
+
+fn gemfile_declares_rspec(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("gem ")
+            && quoted_values(line)
+                .first()
+                .is_some_and(|name| name == "rspec" || name.starts_with("rspec-"))
+    })
+}
+
+fn toml_path_exists(value: &toml::Value, keys: &[&str]) -> bool {
+    let mut current = value;
+    for key in keys {
+        let Some(next) = current.get(*key) else {
+            return false;
+        };
+        current = next;
+    }
+    true
 }
 
 fn detect_java(root: &Path, plan: &mut GateScaffoldPlan, suppressed: bool) -> io::Result<()> {
@@ -2065,12 +2255,51 @@ fn read_optional_evidence(
     relative: &str,
     plan: &mut GateScaffoldPlan,
 ) -> io::Result<Option<String>> {
-    if !has_evidence(root, relative, plan)? {
+    const MAX_EVIDENCE_BYTES: usize = 1024 * 1024;
+    let directory = match open_evidence_directory(root) {
+        Ok(directory) => directory,
+        Err(error) => {
+            block_invalid_evidence(
+                plan,
+                relative,
+                format!("could not hold the evidence scope directory: {error}"),
+            );
+            return Ok(None);
+        }
+    };
+    let mut options = CapOpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match directory.open_with(relative, &options) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            block_invalid_evidence(
+                plan,
+                relative,
+                format!("could not open regular no-follow ecosystem evidence: {error}"),
+            );
+            return Ok(None);
+        }
+    };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        block_invalid_evidence(
+            plan,
+            relative,
+            "ecosystem evidence must remain a regular non-symlink file".to_owned(),
+        );
         return Ok(None);
     }
-    let path = root.join(relative);
-    let metadata = fs::metadata(&path)?;
-    if metadata.len() > 1024 * 1024 {
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((MAX_EVIDENCE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_EVIDENCE_BYTES {
         block_invalid_evidence(
             plan,
             relative,
@@ -2078,7 +2307,47 @@ fn read_optional_evidence(
         );
         return Ok(None);
     }
-    fs::read_to_string(path).map(Some)
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) => {
+            block_invalid_evidence(
+                plan,
+                relative,
+                format!("ecosystem manifest is not UTF-8: {error}"),
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn open_evidence_directory(root: &Path) -> io::Result<Dir> {
+    let metadata = fs::symlink_metadata(root)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "evidence scope must be a regular non-symlink directory",
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let directory = options.open(root)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(io::Error::other(
+            "evidence scope changed while it was opened",
+        ));
+    }
+    Ok(Dir::from_std_file(directory))
 }
 
 fn root_files_with_extensions(root: &Path, extensions: &[&str]) -> io::Result<Vec<String>> {
