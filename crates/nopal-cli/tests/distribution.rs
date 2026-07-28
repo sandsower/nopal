@@ -1,8 +1,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
-use std::process::Command;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
+use std::sync::OnceLock;
 
 use base64::Engine as _;
 use flate2::Compression;
@@ -11,6 +14,45 @@ use sha2::{Digest as _, Sha512};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+/// Every subprocess in this suite gets a deterministic empty user home.
+/// Launch tests exercise repository-owned configuration and must not inherit
+/// a developer or CI runner's Git target rewriting, credential helpers, or
+/// executable user configuration.
+struct Command(StdCommand);
+
+impl Command {
+    fn new(program: impl AsRef<OsStr>) -> Self {
+        static HOME: OnceLock<PathBuf> = OnceLock::new();
+        let home = HOME.get_or_init(|| {
+            let path = std::env::temp_dir().join(format!(
+                "nopal-distribution-test-home-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(path.join(".config")).unwrap();
+            path
+        });
+        let mut command = StdCommand::new(program);
+        command
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"));
+        Self(command)
+    }
+}
+
+impl Deref for Command {
+    type Target = StdCommand;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Command {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
