@@ -5,6 +5,7 @@
 //! launch writes only when this plan reports `WouldCreate`, then re-runs this
 //! same planner against the committed files before executing anything.
 
+use std::fs;
 use std::io;
 use std::path::Path;
 
@@ -13,6 +14,7 @@ use nopal_core::diagnostics::{self, Code, Diagnostic, Severity};
 use nopal_core::distribution::{
     self, BuiltinDistribution, DistributionContext, DistributionReport, ResolvedResource,
 };
+use nopal_core::gate_scaffold::{GateScaffoldPlan, Readiness};
 use nopal_core::process_artifact;
 use nopal_core::scaffold::{self, ScaffoldSource};
 use nopal_core::toon::{self, Value};
@@ -56,6 +58,12 @@ pub struct LaunchPlan {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_artifact_note: Option<String>,
     pub scaffold: Scaffold,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gate_scaffold: Option<GateScaffoldPlan>,
+    /// The baseline is runtime preparation state, not report authority. It is
+    /// retained so publication uses the exact evidence snapshot just shown.
+    #[serde(skip)]
+    pub prepared_baseline: Option<scaffold::Baseline>,
     /// Kept under the historical `bundle` field so machine consumers receive
     /// a compatible report position while its content is now the stronger
     /// contract-plus-lock distribution report.
@@ -111,8 +119,17 @@ fn plan_configured(dir: &Path, context: LaunchContext<'_>) -> io::Result<LaunchP
     // old optional-module exception made invalid configuration depend on the
     // selected profile and contradicted fail-closed project portability.
     let validity_ok = validation.ok();
-    let ready = validation.ok();
     let mut diagnostics = validation.diagnostics;
+    let (gate_ready, gate_diagnostics) = checked_in_gates_ready(dir)?;
+    diagnostics.extend(gate_diagnostics);
+    if !gate_ready {
+        diagnostics.push(Diagnostic::error(
+            Code::GateConfigurationRequired,
+            ".nopal/gates.jsonc",
+            "detected project has only the baseline diff check; add explicit Nopal or typed Beislið gates before launch",
+        ));
+    }
+    let ready = validity_ok && gate_ready;
     let (process_artifact_ok, process_artifact_note) =
         check_process_artifact(dir, &mut diagnostics)?;
     let distribution = distribution::inspect(DistributionContext {
@@ -130,6 +147,51 @@ fn plan_configured(dir: &Path, context: LaunchContext<'_>) -> io::Result<LaunchP
         distribution,
         diagnostics,
     )
+}
+
+fn checked_in_gates_ready(dir: &Path) -> io::Result<(bool, Vec<Diagnostic>)> {
+    let gates_path = dir.join(".nopal/gates.jsonc");
+    let gates_text = fs::read_to_string(&gates_path)?;
+    let (config, mut diagnostics) =
+        nopal_core::gates::parse_gates(&gates_text, ".nopal/gates.jsonc");
+    let Some(config) = config else {
+        return Ok((false, diagnostics));
+    };
+
+    let workflow_path = dir.join(".beislid/workflow.md");
+    let workflow_text = fs::read_to_string(&workflow_path)?;
+    let compiled = nopal_core::beislid_import::compile_text(&workflow_text, ".beislid/workflow.md");
+    let beislid_explicit = compiled.modules.get("gates").is_some_and(|value| {
+        value
+            .get("gates")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+            || value
+                .get("preflights")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+    });
+    diagnostics.extend(compiled.diagnostics);
+
+    let ready = match &config.scaffold {
+        None => !config.gates.is_empty() || !config.preflights.is_empty(),
+        Some(provenance) => {
+            let generated = provenance
+                .generated_gate_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>();
+            let nopal_explicit = config
+                .gates
+                .iter()
+                .any(|gate| !generated.contains(gate.id.as_str()));
+            nopal_explicit || beislid_explicit || provenance.readiness == Readiness::Ready
+        }
+    };
+    let diagnostics_ok = diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.severity != Severity::Error);
+    Ok((ready && diagnostics_ok, diagnostics))
 }
 
 fn plan_without_nopal(dir: &Path, context: LaunchContext<'_>) -> io::Result<LaunchPlan> {
@@ -174,18 +236,31 @@ fn plan_without_nopal(dir: &Path, context: LaunchContext<'_>) -> io::Result<Laun
         &baseline.source,
         &baseline.files,
     )];
+    let gate_plan = baseline.gate_scaffold.clone();
+    let gate_ready = gate_plan.readiness == Readiness::Ready;
+    if !gate_ready {
+        diagnostics.push(Diagnostic::error(
+            Code::GateConfigurationRequired,
+            ".nopal/gates.jsonc",
+            "no evidence-backed validation template was detected; Nopal can create the baseline but will not launch Pi until explicit gates are added",
+        ));
+    }
+    diagnostics.extend(gate_plan.diagnostics.clone());
     diagnostics.extend(distribution.diagnostics.clone());
     let (process_artifact_ok, process_artifact_note) =
         check_process_artifact(dir, &mut diagnostics)?;
-    finish_plan(
+    let mut plan = finish_plan(
         true,
-        true,
+        gate_ready,
         process_artifact_ok,
         process_artifact_note,
         Scaffold::WouldCreate,
         distribution,
         diagnostics,
-    )
+    )?;
+    plan.gate_scaffold = Some(gate_plan);
+    plan.prepared_baseline = Some(baseline);
+    Ok(plan)
 }
 
 fn finish_plan(
@@ -228,6 +303,8 @@ fn finish_plan(
         ambient_kinds,
         process_artifact_note,
         scaffold,
+        gate_scaffold: None,
+        prepared_baseline: None,
         bundle: distribution,
         pi_argv,
         diagnostics,
@@ -245,6 +322,8 @@ fn blocked_unconfigured_plan(diagnostic: Diagnostic) -> LaunchPlan {
         ambient_kinds: Vec::new(),
         process_artifact_note: None,
         scaffold: Scaffold::None,
+        gate_scaffold: None,
+        prepared_baseline: None,
         bundle: empty_distribution(vec![diagnostic.clone()]),
         pi_argv: Vec::new(),
         diagnostics: vec![diagnostic],

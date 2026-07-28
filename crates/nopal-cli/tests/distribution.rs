@@ -32,6 +32,7 @@ fn fresh_bare_launch_writes_complete_baseline_and_executes_pi_offline() {
     let env_file = temp.path().join("pi-offline");
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q"]);
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
 
     let stub = temp.path().join("pi-stub.sh");
     fs::write(
@@ -82,6 +83,45 @@ fn fresh_bare_launch_writes_complete_baseline_and_executes_pi_offline() {
     assert!(args.lines().any(|arg| arg == "-e"), "{args}");
     assert!(args.lines().any(|arg| arg == "--no-session"), "{args}");
     assert_eq!(fs::read_to_string(env_file).unwrap().trim(), "1");
+}
+
+#[test]
+#[cfg(unix)]
+fn unknown_first_run_writes_complete_baseline_but_does_not_start_pi() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    let marker = temp.path().join("pi-started");
+    let stub = temp.path().join("pi-stub.sh");
+    fs::write(
+        &stub,
+        format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", repo.to_str().unwrap(), "--json"])
+        .env("NOPAL_PI_BIN", &stub)
+        .env("NOPAL_DATA_DIR", temp.path().join("data"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!marker.exists());
+    assert!(repo.join(".nopal/nopal.jsonc").is_file());
+    let gates = fs::read_to_string(repo.join(".nopal/gates.jsonc")).unwrap();
+    assert!(gates.contains("nopal.gates/v2"));
+    assert!(gates.contains("needs_configuration"));
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        document["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| { diagnostic["code"] == "gate_configuration_required" })
+    );
 }
 
 #[test]
@@ -174,6 +214,7 @@ fn ambient_resources_are_disabled_by_default_and_only_checked_in_non_executable_
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q"]);
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
     let stub = temp.path().join("pi-stub.sh");
     fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();

@@ -6,14 +6,16 @@
 //! every problem it can see, and `config` is `None` only when the file
 //! itself did not parse.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
 use crate::config;
 use crate::diagnostics::{Code, Diagnostic};
+use crate::gate_scaffold::{self, ScaffoldProvenance};
 
 pub const GATES_KIND: &str = "nopal.gates/v1";
+pub const GENERATED_GATES_KIND: &str = "nopal.gates/v2";
 
 /// Placeholder names an executor is expected to substitute. v1 keeps this
 /// deliberately small; growing it is additive and cheap.
@@ -179,6 +181,10 @@ pub struct Selector {
 
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct GatesConfig {
+    /// Present only on generated v2 documents. V1 remains explicit checked-in
+    /// authority and cannot carry launch-readiness metadata that old readers
+    /// would ignore.
+    pub scaffold: Option<ScaffoldProvenance>,
     pub preflights: Vec<Preflight>,
     pub gates: Vec<Gate>,
     /// Set name -> set, iterated in name order (BTreeMap) for determinism;
@@ -206,17 +212,22 @@ pub fn parse_gates(text: &str, path: &str) -> (Option<GatesConfig>, Vec<Diagnost
 pub fn validate_document(root: &serde_json::Value, path: &str) -> (GatesConfig, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
 
-    match root.get("version").and_then(|v| v.as_str()) {
-        Some(GATES_KIND) => {}
+    let version = root.get("version").and_then(|value| value.as_str());
+    match version {
+        Some(GATES_KIND | GENERATED_GATES_KIND) => {}
         Some(other) => diagnostics.push(Diagnostic::error(
             Code::VersionUnsupported,
             path,
-            format!("unsupported gates version {other:?}; expected {GATES_KIND:?}"),
+            format!(
+                "unsupported gates version {other:?}; expected {GATES_KIND:?} or {GENERATED_GATES_KIND:?}"
+            ),
         )),
         None => diagnostics.push(Diagnostic::error(
             Code::VersionUnsupported,
             path,
-            format!("missing string field \"version\"; expected {GATES_KIND:?}"),
+            format!(
+                "missing string field \"version\"; expected {GATES_KIND:?} or {GENERATED_GATES_KIND:?}"
+            ),
         )),
     }
 
@@ -240,9 +251,11 @@ pub fn validate_document(root: &serde_json::Value, path: &str) -> (GatesConfig, 
 
     let gate_sets = parse_gate_sets(root, &gates, path, &mut diagnostics);
     let selectors = parse_selectors(root, &gate_sets, path, &mut diagnostics);
+    let scaffold = parse_scaffold_provenance(root, version, &gates, path, &mut diagnostics);
 
     (
         GatesConfig {
+            scaffold,
             preflights,
             gates,
             gate_sets,
@@ -250,6 +263,87 @@ pub fn validate_document(root: &serde_json::Value, path: &str) -> (GatesConfig, 
         },
         diagnostics,
     )
+}
+
+fn parse_scaffold_provenance(
+    root: &serde_json::Value,
+    version: Option<&str>,
+    gates: &[Gate],
+    path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<ScaffoldProvenance> {
+    if version == Some(GATES_KIND) {
+        if root.get("scaffold").is_some() {
+            diagnostics.push(Diagnostic::error(
+                Code::FieldInvalid,
+                path,
+                "nopal.gates/v1 cannot carry scaffold readiness metadata; use nopal.gates/v2",
+            ));
+        }
+        return None;
+    }
+    if version != Some(GENERATED_GATES_KIND) {
+        return None;
+    }
+    let Some(value) = root.get("scaffold") else {
+        diagnostics.push(Diagnostic::error(
+            Code::FieldInvalid,
+            path,
+            "nopal.gates/v2 requires an object field \"scaffold\"",
+        ));
+        return None;
+    };
+    let provenance: ScaffoldProvenance = match serde_json::from_value(value.clone()) {
+        Ok(provenance) => provenance,
+        Err(error) => {
+            diagnostics.push(Diagnostic::error(
+                Code::FieldInvalid,
+                path,
+                format!("invalid scaffold provenance: {error}"),
+            ));
+            return None;
+        }
+    };
+    if provenance.version != gate_scaffold::PLAN_KIND {
+        diagnostics.push(Diagnostic::error(
+            Code::VersionUnsupported,
+            path,
+            format!(
+                "unsupported scaffold provenance version {:?}; expected {:?}",
+                provenance.version,
+                gate_scaffold::PLAN_KIND
+            ),
+        ));
+    }
+    if provenance.templates.is_empty() {
+        diagnostics.push(Diagnostic::error(
+            Code::FieldInvalid,
+            path,
+            "scaffold provenance must identify at least the baseline template",
+        ));
+    }
+    let declared_gate_ids = gates
+        .iter()
+        .map(|gate| gate.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut generated_ids = BTreeSet::new();
+    for id in &provenance.generated_gate_ids {
+        if !generated_ids.insert(id.as_str()) {
+            diagnostics.push(Diagnostic::error(
+                Code::DuplicateId,
+                path,
+                format!("duplicate generated gate id {id:?} in scaffold provenance"),
+            ));
+        }
+        if !declared_gate_ids.contains(id.as_str()) {
+            diagnostics.push(Diagnostic::error(
+                Code::GateRefUnknown,
+                path,
+                format!("scaffold provenance references missing generated gate {id:?}"),
+            ));
+        }
+    }
+    Some(provenance)
 }
 
 /// Read a top-level array field; a missing field is an empty list, a

@@ -34,6 +34,7 @@ use nopal_core::{gates::GateStage, policy};
 
 mod coordinator;
 mod distribution_adapter;
+mod doctor;
 mod herdr_bridge;
 mod info;
 mod launch;
@@ -87,6 +88,8 @@ enum Cmd {
         #[arg(long)]
         write: bool,
     },
+    /// Explain evidence-backed first-run gate detection without writing files
+    Doctor,
     /// Validate the nopal.project/v1 manifest and profile-required modules
     Validate,
     /// Inspect nopal.gates/v1 preflights
@@ -797,6 +800,15 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
         }
         Some(Cmd::Sync) => run_distribution_sync(cli, &root),
         Some(Cmd::Update { write }) => run_distribution_update(cli, &root, *write),
+        Some(Cmd::Doctor) => {
+            let report = doctor::inspect(&root)?;
+            print_report_and_exit(
+                report.ok,
+                cli.json,
+                || serde_json::to_string_pretty(&report),
+                || doctor::to_toon(&report),
+            )
+        }
         Some(Cmd::Validate) => {
             let report = nopal_core::status::validation_report(&root)?;
             print_report_and_exit(
@@ -1836,8 +1848,8 @@ fn dispatch_launch(
         store_root: &store_root,
         builtin,
     };
-    let plan = launch::plan(root, context)?;
-    if dry_run || !plan.ok {
+    let mut plan = launch::plan(root, context)?;
+    if dry_run || (!plan.ok && plan.scaffold != launch::Scaffold::WouldCreate) {
         return print_report_and_exit(
             plan.ok,
             cli.json,
@@ -1848,8 +1860,10 @@ fn dispatch_launch(
 
     let mut created_paths = None;
     let plan = if plan.scaffold == launch::Scaffold::WouldCreate {
-        let baseline = scaffold::build_baseline(root, builtin)?;
-        let scaffolded = scaffold::write_baseline(root, builtin)?;
+        let baseline = plan.prepared_baseline.take().ok_or_else(|| {
+            std::io::Error::other("launch plan omitted its prepared scaffold baseline")
+        })?;
+        let scaffolded = scaffold::write_planned_baseline(root, baseline.clone())?;
         let rescaffolded = launch::plan(root, context)?;
         let marked = launch::mark_scaffolded(rescaffolded, &baseline);
         eprintln!("{}", scaffold_notice(&scaffolded));

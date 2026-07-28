@@ -21,6 +21,7 @@ pub mod distribution;
 pub mod enforcement;
 pub mod field;
 pub mod field_store;
+pub mod gate_scaffold;
 pub mod gates;
 pub mod gates_report;
 pub mod guidance;
