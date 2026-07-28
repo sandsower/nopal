@@ -58,6 +58,8 @@ fn run_with_capability(root: &Path, state: &Path, args: &[&str], capability: &st
     capability_file.write_all(RECEIPT_KEY.as_bytes()).unwrap();
     capability_file.seek(std::io::SeekFrom::Start(0)).unwrap();
     let source_fd = capability_file.as_raw_fd();
+    let home = state.join("test-home");
+    fs::create_dir_all(&home).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_nopal"));
     command
         .args(["--dir", root.to_str().unwrap(), "--json"])
@@ -66,6 +68,9 @@ fn run_with_capability(root: &Path, state: &Path, args: &[&str], capability: &st
         .env("NOPAL_CONFIG_DIR", state.join("config"))
         .env("NOPAL_ENFORCEMENT_CAPABILITY_FD", CAPABILITY_FD.to_string())
         .env("PROOF_GIT_BIN", git_executable())
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("NOPAL_TEST_CLEAN_GIT_CONFIG", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
