@@ -25,6 +25,27 @@ function envelope(overrides: Record<string, unknown> = {}): string {
 	});
 }
 
+function enforcementEnvelope(overrides: Record<string, unknown> = {}): string {
+	return JSON.stringify({
+		kind: "nopal.enforcement.plan/v2",
+		ok: true,
+		root: "/repo",
+		decision: "allow",
+		decision_winners: ["repository policy"],
+		placement: "shared_user_runtime",
+		placement_winners: ["repository policy"],
+		required_stages: ["continuous"],
+		required_gates: [],
+		receipts: [],
+		contract_digest: "contract",
+		workspace_fingerprint: "workspace",
+		authorization_binding: "binding",
+		approval_current: false,
+		authorized: true,
+		...overrides,
+	});
+}
+
 test("resolvePolicyMode: defaults to supervised_auto", () => {
 	assert.equal(resolvePolicyMode({}), "supervised_auto");
 });
@@ -138,25 +159,46 @@ test("decidePolicy: deny decision is passed through unchanged", async () => {
 });
 
 test("parseEnforcementPlanOutput accepts selected command and argv gates", () => {
-	const result = parseEnforcementPlanOutput(JSON.stringify({
-		kind: "nopal.enforcement.plan/v1",
-		ok: true,
-		root: "/repo",
-		decision: "allow",
+	const result = parseEnforcementPlanOutput(enforcementEnvelope({
 		required_gates: [
-			{ id: "fmt", run: { command: "cargo fmt --check" } },
-			{ id: "test", run: { argv: ["cargo", "test"] }, cwd: "crate" },
+			{ id: "fmt", run: { command: "cargo fmt --check" }, autofix: "cargo fmt", parallel_safe: false, mutates: false },
+			{ id: "test", run: { argv: ["cargo", "test"] }, cwd: "crate", autofix: null, parallel_safe: true, mutates: false },
 		],
 		receipts: [
 			{ gate_id: "fmt", current: false, gate_definition_digest: "fmt-digest" },
 			{ gate_id: "test", current: false, gate_definition_digest: "test-digest" },
 		],
-		contract_digest: "contract",
-		workspace_fingerprint: "workspace",
 	}), 0);
 	assert.equal(result.failClosed, false);
 	assert.equal(result.root, "/repo");
+	assert.equal(result.placement, "shared_user_runtime");
+	assert.match(result.explanation, /repository policy/);
 	assert.deepEqual(result.requiredGates.map((gate) => gate.id), ["fmt", "test"]);
+	assert.deepEqual(result.requiredGates[0], {
+		id: "fmt",
+		run: { command: "cargo fmt --check" },
+		autofix: "cargo fmt",
+		parallelSafe: false,
+		mutates: false,
+		definitionDigest: "fmt-digest",
+	});
+	assert.equal(result.requiredGates[1].parallelSafe, true);
+	assert.equal(result.requiredGates[1].mutates, false);
+});
+
+test("parseEnforcementPlanOutput rejects malformed gate concurrency metadata", () => {
+	for (const malformed of [
+		{ parallel_safe: "true", mutates: false },
+		{ parallel_safe: true, mutates: "false" },
+		{ parallel_safe: true, mutates: false, autofix: false },
+	]) {
+		const result = parseEnforcementPlanOutput(enforcementEnvelope({
+			required_gates: [{ id: "proof", run: { argv: ["true"] }, ...malformed }],
+			receipts: [{ gate_id: "proof", current: false, gate_definition_digest: "proof-digest" }],
+		}), 0);
+		assert.equal(result.failClosed, true);
+		assert.equal(result.ok, false);
+	}
 });
 
 test("enforcement subprocess helpers use the initialized run and fail closed", async () => {
@@ -164,19 +206,10 @@ test("enforcement subprocess helpers use the initialized run and fail closed", a
 	const exec: ExecFn = async (command, args) => {
 		calls.push({ command, args });
 		if (args.includes("record-gate")) {
-			return { stdout: JSON.stringify({ kind: "nopal.enforcement.record_gate/v1", ok: true }), stderr: "", code: 0 };
+			return { stdout: JSON.stringify({ kind: "nopal.enforcement.record_gate/v2", ok: true }), stderr: "", code: 0 };
 		}
 		return {
-			stdout: JSON.stringify({
-				kind: "nopal.enforcement.plan/v1",
-				ok: true,
-				root: "/repo",
-				decision: "deny",
-				required_gates: [],
-				receipts: [],
-				contract_digest: "contract",
-				workspace_fingerprint: "workspace",
-			}),
+			stdout: enforcementEnvelope({ decision: "deny" }),
 			stderr: "",
 			code: 0,
 		};
@@ -196,6 +229,7 @@ test("enforcement subprocess helpers use the initialized run and fail closed", a
 		contractDigest: "contract",
 		workspaceFingerprint: "workspace",
 		gateDefinitionDigest: "fmt-digest",
+		authorizationBinding: "binding",
 	}), true);
 	assert.ok(calls.every((call) => call.args.includes("run-1")));
 	assert.ok(calls.every((call) => call.command === params.nopalBin));
@@ -203,29 +237,20 @@ test("enforcement subprocess helpers use the initialized run and fail closed", a
 });
 
 test("reauthorization preserves an approved ask only for the exact current context", () => {
-	const initial = parseEnforcementPlanOutput(JSON.stringify({
-		kind: "nopal.enforcement.plan/v1",
-		ok: true,
-		root: "/repo",
+	const initial = parseEnforcementPlanOutput(enforcementEnvelope({
 		decision: "ask",
 		required_gates: [{ id: "proof", run: { command: "true" } }],
 		receipts: [{ gate_id: "proof", current: false, gate_definition_digest: "proof-digest" }],
-		contract_digest: "contract",
-		workspace_fingerprint: "workspace",
 	}), 0);
-	const current = parseEnforcementPlanOutput(JSON.stringify({
-		kind: "nopal.enforcement.plan/v1",
-		ok: true,
-		root: "/repo",
+	const current = parseEnforcementPlanOutput(enforcementEnvelope({
 		decision: "ask",
 		required_gates: [],
 		receipts: [{ gate_id: "proof", current: true, gate_definition_digest: "proof-digest" }],
-		contract_digest: "contract",
-		workspace_fingerprint: "workspace",
 	}), 0);
 	assert.equal(reauthorizationIsCurrent(initial, current, true), true);
 	assert.equal(reauthorizationIsCurrent(initial, current, false), false);
 	assert.equal(reauthorizationIsCurrent(initial, { ...current, contractDigest: "changed" }, true), false);
+	assert.equal(reauthorizationIsCurrent(initial, { ...current, authorizationBinding: "changed" }, true), false);
 	assert.equal(
 		reauthorizationIsCurrent(initial, { ...current, decision: "allow", workspaceFingerprint: "changed" }, true),
 		false,

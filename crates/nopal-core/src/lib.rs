@@ -27,6 +27,7 @@ pub mod gates;
 pub mod gates_report;
 pub mod guidance;
 pub mod integrations;
+pub mod isolation;
 pub mod plot;
 pub mod plot_establishment;
 pub mod plot_execution;

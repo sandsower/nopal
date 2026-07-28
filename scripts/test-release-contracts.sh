@@ -82,6 +82,23 @@ release_pr=$(
 [ -z "$release_pr" ] \
   || fail "release classifier accepted an unrelated pull request"
 
+release_workflow="$repo_root/.github/workflows/release.yml"
+grep -Fq 'tests::trusted_runtime_profile_is_complete_for_this_release_target' \
+  "$release_workflow" \
+  || fail "release targets do not prove a compiled native runtime identity profile"
+for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+  grep -Fq "target: $target" "$release_workflow" \
+    || fail "release workflow omitted runtime-locked target $target"
+done
+runtime_source="$repo_root/crates/nopal-cli/src/main.rs"
+for digest in \
+  913b144fdb40638b1acef7974ab3c33fbd527cc0974cb5da467ab1e6ac51b4d4 \
+  bf0e0ff20d4e5a16436d1ec372e47161e52be8e487db8070ae3f06b01efbba0c \
+  1bec56ef7cfa9a76f3e0b7c0a87f220eb73f23102b9c0b4c7529a3f7c3ce7c31; do
+  grep -Fq "$digest" "$runtime_source" \
+    || fail "release runtime source omitted target Node identity $digest"
+done
+
 version_workflow="$repo_root/.github/workflows/version-bump.yml"
 grep -Fq 'cancel-in-progress: false' "$version_workflow" \
   || fail "release coordination can cancel an in-flight artifact build"
@@ -149,7 +166,7 @@ app_target="$tmp/app-target"
 app_tools="$tmp/app-tools"
 mkdir -p "$app_fixture/extensions/policy-gate" "$app_target/release" "$app_tools"
 cp "$repo_root/Makefile" "$repo_root/Cargo.toml" "$app_fixture/"
-for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+for adapter_file in index.ts classifier.ts guard.ts nopal-cli.ts; do
   cp "$repo_root/extensions/policy-gate/$adapter_file" \
     "$app_fixture/extensions/policy-gate/$adapter_file"
 done
@@ -168,11 +185,11 @@ macos_adapter="$app_fixture/Nopal.app/Contents/Resources/extensions/policy-gate"
   || fail "macOS app does not contain the source-free built-in adapter layout"
 find "$macos_adapter" -type f -exec basename {} \; | LC_ALL=C sort \
   > "$tmp/macos-adapter-files"
-printf '%s\n' classifier.ts index.ts nopal-cli.ts \
+printf '%s\n' classifier.ts guard.ts index.ts nopal-cli.ts \
   > "$tmp/expected-adapter-files"
 cmp "$tmp/expected-adapter-files" "$tmp/macos-adapter-files" \
-  || fail "macOS app does not contain exactly the three built-in adapter files"
-for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+  || fail "macOS app does not contain exactly the four built-in adapter files"
+for adapter_file in index.ts classifier.ts guard.ts nopal-cli.ts; do
   cmp "$repo_root/extensions/policy-gate/$adapter_file" \
     "$macos_adapter/$adapter_file" \
     || fail "macOS app adapter $adapter_file bytes changed"
@@ -187,8 +204,8 @@ linux_adapter="$app_fixture/Nopal-linux/extensions/policy-gate"
 find "$linux_adapter" -type f -exec basename {} \; | LC_ALL=C sort \
   > "$tmp/linux-adapter-files"
 cmp "$tmp/expected-adapter-files" "$tmp/linux-adapter-files" \
-  || fail "Linux app does not contain exactly the three built-in adapter files"
-for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+  || fail "Linux app does not contain exactly the four built-in adapter files"
+for adapter_file in index.ts classifier.ts guard.ts nopal-cli.ts; do
   cmp "$repo_root/extensions/policy-gate/$adapter_file" \
     "$linux_adapter/$adapter_file" \
     || fail "Linux app adapter $adapter_file bytes changed"
@@ -273,6 +290,7 @@ printf '%s\n' \
   "$stem/extensions" \
   "$stem/extensions/policy-gate" \
   "$stem/extensions/policy-gate/classifier.ts" \
+  "$stem/extensions/policy-gate/guard.ts" \
   "$stem/extensions/policy-gate/index.ts" \
   "$stem/extensions/policy-gate/nopal-cli.ts" \
   "$stem/nopal" \
@@ -297,7 +315,7 @@ cmp "$fake_rondo_source/NOTICE" "$unpacked/$stem/Rondo-NOTICE" \
   || fail "Rondo NOTICE bytes changed"
 cmp "$fake_third_party_licenses" "$unpacked/$stem/THIRD_PARTY_LICENSES.html" \
   || fail "third-party license report bytes changed"
-for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+for adapter_file in index.ts classifier.ts guard.ts nopal-cli.ts; do
   cmp "$repo_root/extensions/policy-gate/$adapter_file" \
     "$unpacked/$stem/extensions/policy-gate/$adapter_file" \
     || fail "enforcement adapter $adapter_file bytes changed"
@@ -315,7 +333,7 @@ done
   || fail "packaged Rondo NOTICE is unexpectedly executable"
 [ ! -x "$unpacked/$stem/THIRD_PARTY_LICENSES.html" ] \
   || fail "packaged third-party license report is unexpectedly executable"
-for adapter_file in index.ts classifier.ts nopal-cli.ts; do
+for adapter_file in index.ts classifier.ts guard.ts nopal-cli.ts; do
   [ ! -x "$unpacked/$stem/extensions/policy-gate/$adapter_file" ] \
     || fail "packaged enforcement adapter $adapter_file is unexpectedly executable"
 done

@@ -21,7 +21,25 @@ It never falls back to an unenforced Pi session when initialization fails.
 ## Installation
 
 Each GitHub release provides the `nopal` binary for Apple Silicon macOS, Intel macOS, and x86-64 Linux.
-Install the matching archive and ensure `nopal`, `pi`, and `beislid` are available on `PATH`.
+Install the matching archive and ensure `nopal`, exact Pi `0.80.6`, `beislid`, and the official Node.js `22.22.0` distribution are available on `PATH`.
+Package-manager rebuilds of Node are not equivalent because production launch verifies the canonical executable bytes.
+
+Download Node from `https://nodejs.org/download/release/v22.22.0/`, then verify the selected executable:
+
+```sh
+node --version
+openssl dgst -sha256 "$(command -v node)"
+```
+
+The version must report `v22.22.0` and the executable digest must match the release platform:
+
+| Platform | Official Node executable SHA-256 |
+| --- | --- |
+| Apple Silicon macOS | `913b144fdb40638b1acef7974ab3c33fbd527cc0974cb5da467ab1e6ac51b4d4` |
+| Intel macOS | `bf0e0ff20d4e5a16436d1ec372e47161e52be8e487db8070ae3f06b01efbba0c` |
+| x86-64 Linux | `1bec56ef7cfa9a76f3e0b7c0a87f220eb73f23102b9c0b4c7529a3f7c3ce7c31` |
+
+Nopal reports an explicit expected/observed digest error when a different runtime is selected.
 Nopal v0.3 does not require tmux for its canonical Pi launch.
 
 ## Quick start
@@ -78,7 +96,10 @@ Invalid recognized blocks fail closed, while unrecognized Beislið-owned blocks 
 
 ## Distribution synchronization
 
-Bare `nopal` only verifies local locked evidence and always starts Pi offline.
+Bare `nopal` only verifies local locked evidence and always starts Pi offline through the canonical entrypoint, complete platform-specific package and dependency closure, and exact Node runtime pinned for `@earendil-works/pi-coding-agent`.
+The closure digest covers manifests, dependency bytes, native/WASM assets, symlink targets, and executable modes.
+After verification, launch clones the Pi closure and the official Node executable into a private read-only content-addressed run snapshot, rehashes both, and executes only from that snapshot.
+The pinned Node build has no non-system dynamic-library closure, so mutable package-manager libraries cannot sit outside its identity.
 It never installs packages, updates versions, or contacts a registry.
 Missing or changed package and resource bytes prevent launch.
 
@@ -99,8 +120,10 @@ allow < ask < deny
 ```
 
 Repository and workflow policy may tighten user policy but cannot weaken it.
-Normal `git push` and force push have distinct action identities.
-The walking skeleton maps `git.push` to the `pre_pr` gate stage and denies `git.push_force` through policy.
+The enforced distribution pins `supervised_auto`; ambient environment variables cannot select another mode.
+Normal `git push` and destructive push forms have distinct action identities.
+Force options, deletion refspecs, mirror, prune, and equivalent destructive forms compile to `git.push_force`, which remains a non-approvable safety-floor denial in every Core mode.
+Continuous enforcement maps ordinary `git.push` to the `pre_pr` stage while mediating every supported Pi tool throughout the session.
 
 ## Enforcement flow
 
@@ -109,33 +132,49 @@ For a protected Pi tool call, the bundled adapter:
 1. Classifies the complete shell envelope before execution.
 2. Rejects compound, dynamic, redirected, expanded, or otherwise unsupported shell syntax rather than authorizing only part of it.
 3. Requests an action plan from Nopal Core through the resolved launch binary.
-4. Resolves `ask` only through Pi's user interface and binds approval to the exact contract and workspace context.
-5. Executes each missing gate returned by Core.
-6. Records the observed exit code against the original contract, workspace, and gate-definition digests.
-7. Reauthorizes the action and releases the original tool call only when current authenticated evidence exists.
+4. Executes each missing gate returned by Core in a canonical-root-confined, non-profile, output-bounded, process-group-bounded, capability-free subprocess.
+5. Resolves executors for every potentially applicable `continuous`, `per_edit`, `pre_commit`, and `pre_pr` gate before launch, independent of current policy, selectors, or changed files, pins canonical paths and bytes in a run-private alias directory, and revalidates that manifest before every private authorization transition.
+6. Uses a private gate home and cache paths so proof tools do not create authority or cache files in the repository.
+7. Records the observed exit code against the exact contract, workspace, executor identity, gate definition, and authorization binding.
+8. Resolves `ask` only through Pi's user interface and durably binds the response to the exact action context.
+9. Reauthorizes the action, consumes any one-shot approval, and releases the original tool call only when current authenticated evidence exists.
+10. Records success, error, cancellation, or shutdown interruption against the exact authenticated release before its lease is cleared.
+
+Pi receives an explicit environment allowlist, a system-only base `PATH`, a private per-run `HOME`, and a private configuration directory containing only bounded no-follow authentication state.
+Ambient user Git, curl, npm, pip, Kubernetes, Cargo, and related tool configuration is disabled or redirected to that protected empty home; system and repository Git configuration remains observed and bound by the workspace adapter.
+External transfer authorization supports only the exact shape `curl --disable <literal-http-url>` (or `-q`), with no other options; redirects, config files, proxies, URL globbing, multiple targets, alternate protocols, and unaudited transfer tools fail closed.
+Executable, symlinked, or multiply-linked project settings fail launch, and the exact settings file is revalidated before every private authorization transaction, so ambient Pi settings cannot select a custom shell, command prefix, or executable resource.
+Executable Git and ripgrep environment or configuration carriers fail closed before protected effects.
 
 Nopal Core never executes gate commands.
 The Pi adapter is the execution boundary.
 
 Every executable Pi extension is verified against an identity embedded in the installed Nopal binary before Pi starts.
+The launch probe requires the complete audited `bash`, `edit`, `find`, `grep`, `ls`, `read`, and `write` catalog after the guard is installed.
+Missing built-ins, unknown active tools, and caller-supplied tool-catalog overrides block launch.
 The default bundle includes only the enforcement adapter, and enforced launch rejects ambient, injected, or untrusted sibling extensions.
-The adapter also protects its source, the Nopal executable, project authority files, user policy, and enforcement ledger state from agent tools.
+The adapter also protects its source, the Nopal executable, project authority files, executable Pi project settings, user policy, and enforcement ledger state from agent tools for the entire session.
 Adapter subprocesses use the resolved current Nopal executable rather than a `PATH` lookup.
+Filesystem inspection uses Pi's audited `read`, `grep`, `find`, and `ls` tools rather than ambient shell executables.
+The shell read grammar admits only non-file identity commands (`pwd`, `uname`, `whoami`, and `id`) plus separately audited Git reads; commands whose option or positional surfaces can mutate, execute helpers, or disclose secrets fail closed.
 
 ## Gate receipts
 
+Each passing receipt is immutable and stored under its exact gate plus authorization binding, so concurrent calls cannot replace one another's evidence.
 A passing receipt binds:
 
-- the action identity;
-- repository and workspace content;
-- the effective enforcement contract;
-- the exact gate definition;
-- the observed exit code;
+- the launch, session, tool call, tool name, and canonical input;
+- the action identity and exact target;
+- repository, worktree, placement, and changed-file selector evidence;
+- the effective policy, workflow, and distribution contract;
+- the exact run-private gate executor manifest, gate definition, and observed exit code;
 - an ephemeral per-launch receipt capability.
 
-The capability lives in a mode-0600 file inside the protected enforcement run directory.
-It never enters the Pi process environment, extension globals, subprocess arguments, project data, or ledger events.
-The internal Nopal CLI reads it directly to authenticate receipts with HMAC-SHA256.
+The capability lives only in an anonymous inherited descriptor and is never published to the run directory.
+The launcher maps that descriptor into the trusted extension, which reads and closes it before agent activity and retains only the private value.
+Each private adapter subprocess receives a fresh unlinked mode-0600 one-shot capability channel; the matching proof travels through bounded stdin, never through command-line arguments or gate environments.
+The capability never enters project data, run artifacts, gate processes, or ledger events.
+The internal Nopal CLI authenticates receipts with HMAC-SHA256.
 A forged, unsigned, stale, or context-mismatched receipt cannot authorize an action.
 
 ## Workflow Run Ledger
@@ -146,7 +185,8 @@ Enforcement evidence lives outside the repository at:
 ${BEISLID_STATE_DIR:-~/.local/state/beislid}/runs/enforcement/<repo_hash>/<run_id>/
 ```
 
-The ledger records action decisions, gate attempts, passing receipts, checkpoints, interruption, and outcomes.
+Independent read-only calls may remain in flight concurrently, but a mutator is exclusive against every other protected call.
+The ledger records action decisions, gate attempts, passing receipts, exact one-shot releases, and terminal success, error, cancellation, or interruption outcomes.
 It is a bounded evidence surface, not a dashboard, session registry, or coordination product.
 
 ## Workspace
@@ -161,6 +201,7 @@ The active v0.3 path currently centers on:
 | `.nopal/` | Checked-in project, policy, gate, package, and exact distribution-lock contracts |
 | `docs/adr/0012-reset-nopal-to-an-enforced-pi-distribution.md` | v0.3 product and assurance-boundary decision |
 | `docs/adr/0013-lock-portable-project-distributions.md` | Offline launch and explicit package synchronization decision |
+| `docs/adr/0015-mediate-every-protected-pi-tool-call.md` | Exact continuous action authorization and Pi guard decision |
 
 Other legacy crates remain only until the dedicated removal slice deletes them from active main.
 
@@ -179,14 +220,14 @@ The real Pi enforcement proof is opt-in because it requires an installed Pi bina
 
 ```sh
 NOPAL_RUN_REAL_PI_ENFORCEMENT_E2E=1 \
-NOPAL_PI_BIN="$(command -v pi)" \
+NOPAL_TEST_PI_BIN="$(command -v pi)" \
 cargo test -p nopal-cli --test real_pi_enforcement -- --ignored --nocapture --test-threads=1
 ```
 
 That proof uses a deterministic local provider and local bare Git remote.
-It covers allowed push, stale-receipt rerun, force-push denial, unsupported shell bypass attempts, authority-file protection, trusted adapter identity, resolved CLI identity, and durable ledger evidence without an external network provider.
+It covers every built-in Pi tool adapter and protected action class, allowed effects, explicit RPC approval, denial, stale and foreign receipts, force-push and shell bypass attempts, repository-policy protection, trusted adapter acknowledgement and identity, resolved CLI identity, and durable ledger evidence without an external network provider.
 
 ## Architectural decisions
 
 Durable decisions live under [`docs/adr/`](docs/adr/README.md).
-Start with [ADR 0012](docs/adr/0012-reset-nopal-to-an-enforced-pi-distribution.md) for the v0.3 product boundary and [ADR 0013](docs/adr/0013-lock-portable-project-distributions.md) for portable distribution locking.
+Start with [ADR 0012](docs/adr/0012-reset-nopal-to-an-enforced-pi-distribution.md) for the v0.3 product boundary, [ADR 0013](docs/adr/0013-lock-portable-project-distributions.md) for portable distribution locking, and [ADR 0015](docs/adr/0015-mediate-every-protected-pi-tool-call.md) for continuous tool-call authorization.

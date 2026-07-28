@@ -17,6 +17,7 @@ fn write_adapter(root: &Path) {
         "export const classify = 1;\n",
     )
     .unwrap();
+    fs::write(adapter.join("guard.ts"), "export const guard = 1;\n").unwrap();
     fs::write(adapter.join("nopal-cli.ts"), "export const cli = 1;\n").unwrap();
 }
 

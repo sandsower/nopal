@@ -4,6 +4,7 @@
 - Date: 2026-07-27
 - Decision owners: Nopal maintainers
 - Supersedes the Field and agent-management product decisions in ADR 0010.
+- The capability transport mechanism below is superseded by the anonymous inherited-descriptor design in ADR 0015.
 
 ## Context
 
@@ -39,7 +40,8 @@ Compound, dynamically constructed, redirected, expanded, or otherwise unsupporte
 The adapter has no disable switch and internal enforcement commands are not agent-callable actions.
 
 A gate receipt is bound to repository and workspace content, the effective enforcement contract, and the exact gate definition.
-Each receipt is authenticated with an ephemeral session capability stored in a mode-0600 file inside the protected run directory and omitted from the Pi environment, extension state, subprocess arguments, project data, and ledger events.
+This ADR originally stored each receipt capability in a protected mode-0600 run-directory file.
+ADR 0015 supersedes that transport with anonymous inherited one-shot descriptors; no capability file is published.
 The launcher verifies every executable extension against identities embedded in the Nopal executable, rejects ambient or injected extensions, and makes the enforcement adapter the only executable extension in the default bundle.
 Adapter subprocesses invoke the resolved Nopal executable rather than a PATH lookup.
 Gate recording rejects results when the contract, workspace, or gate definition differs from the execution plan.

@@ -1556,7 +1556,7 @@ fn hash_builtin_package(root: &Path, request: &PackageRequest) -> io::Result<Str
             && path.file_name().is_some_and(|name| name == "index.ts")
         {
             let parent = path.parent().unwrap_or_else(|| Path::new(""));
-            for support in ["classifier.ts", "nopal-cli.ts"] {
+            for support in ["classifier.ts", "guard.ts", "nopal-cli.ts"] {
                 selected.insert(parent.join(support).to_string_lossy().into_owned());
             }
         }

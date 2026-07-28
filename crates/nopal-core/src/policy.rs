@@ -47,11 +47,12 @@ pub const POLICY_KIND: &str = "nopal.policy/v1";
 // ---------------------------------------------------------------------------
 
 const BUILTIN_MODES: [&str; 4] = ["manual", "supervised_auto", "unattended_auto", "ci"];
-const KNOWN_CLASSES: [&str; 8] = [
+const KNOWN_CLASSES: [&str; 9] = [
     "read",
     "workspace_write",
     "dependency_install",
     "network_read",
+    "network_write",
     "git_local",
     "git_remote",
     "destructive",
@@ -171,6 +172,8 @@ impl ActionClass {
     #[allow(non_upper_case_globals)]
     pub const NetworkRead: ActionClass = ActionClass("network_read");
     #[allow(non_upper_case_globals)]
+    pub const NetworkWrite: ActionClass = ActionClass("network_write");
+    #[allow(non_upper_case_globals)]
     pub const GitLocal: ActionClass = ActionClass("git_local");
     #[allow(non_upper_case_globals)]
     pub const GitRemote: ActionClass = ActionClass("git_remote");
@@ -178,11 +181,12 @@ impl ActionClass {
     pub const Destructive: ActionClass = ActionClass("destructive");
     #[allow(non_upper_case_globals)]
     pub const SecretBearing: ActionClass = ActionClass("secret_bearing");
-    pub const ALL: [ActionClass; 8] = [
+    pub const ALL: [ActionClass; 9] = [
         ActionClass::Read,
         ActionClass::WorkspaceWrite,
         ActionClass::DependencyInstall,
         ActionClass::NetworkRead,
+        ActionClass::NetworkWrite,
         ActionClass::GitLocal,
         ActionClass::GitRemote,
         ActionClass::Destructive,
@@ -199,6 +203,7 @@ impl ActionClass {
             "workspace_write" => ActionClass::WorkspaceWrite,
             "dependency_install" => ActionClass::DependencyInstall,
             "network_read" => ActionClass::NetworkRead,
+            "network_write" => ActionClass::NetworkWrite,
             "git_local" => ActionClass::GitLocal,
             "git_remote" => ActionClass::GitRemote,
             "destructive" => ActionClass::Destructive,
@@ -881,6 +886,7 @@ pub enum Source {
     Rule,
     ModeDefault,
     BuiltinDefault,
+    SafetyFloor,
 }
 
 impl Source {
@@ -889,6 +895,7 @@ impl Source {
             Source::Rule => "rule",
             Source::ModeDefault => "mode_default",
             Source::BuiltinDefault => "builtin_default",
+            Source::SafetyFloor => "safety_floor",
         }
     }
 }
@@ -1013,7 +1020,7 @@ pub fn evaluate(doc: &PolicyDoc, req: &EvalRequest) -> Evaluation {
         }
     }
 
-    let (mut decision, decision_source) =
+    let (mut decision, mut decision_source) =
         match matched_rules.iter().filter_map(|r| r.decision).max() {
             Some(decision) => (decision, Source::Rule),
             None => match mode_policy.and_then(|p| p.default_decision) {
@@ -1021,7 +1028,7 @@ pub fn evaluate(doc: &PolicyDoc, req: &EvalRequest) -> Evaluation {
                 None => (req.mode.builtin_default_decision(), Source::BuiltinDefault),
             },
         };
-    let (mut placement, placement_source) =
+    let (mut placement, mut placement_source) =
         match matched_rules.iter().filter_map(|r| r.placement).max() {
             Some(placement) => (placement, Source::Rule),
             None => match mode_policy.and_then(|p| p.default_placement) {
@@ -1030,9 +1037,26 @@ pub fn evaluate(doc: &PolicyDoc, req: &EvalRequest) -> Evaluation {
             },
         };
 
+    if req.action == "git.push_force" {
+        decision_source = Source::SafetyFloor;
+        placement_source = Source::SafetyFloor;
+        decision = decision.max(Decision::Deny);
+        placement = placement.max(Placement::Blocked);
+        class_notes.push(
+            "action git.push_force: safety floor keeps decision deny and placement blocked"
+                .to_owned(),
+        );
+    }
+
     for class in &classes {
         match class.as_str() {
             "destructive" => {
+                if decision < Decision::Deny {
+                    decision_source = Source::SafetyFloor;
+                }
+                if placement < Placement::Blocked {
+                    placement_source = Source::SafetyFloor;
+                }
                 decision = decision.max(Decision::Deny);
                 placement = placement.max(Placement::Blocked);
                 class_notes.push(
@@ -1041,6 +1065,9 @@ pub fn evaluate(doc: &PolicyDoc, req: &EvalRequest) -> Evaluation {
                 );
             }
             "secret_bearing" => {
+                if placement < Placement::DedicatedRunRuntime {
+                    placement_source = Source::SafetyFloor;
+                }
                 placement = placement.max(Placement::DedicatedRunRuntime);
                 class_notes.push(
                     "class secret_bearing: safety floor keeps placement at least dedicated_run_runtime"
@@ -1048,6 +1075,12 @@ pub fn evaluate(doc: &PolicyDoc, req: &EvalRequest) -> Evaluation {
                 );
             }
             _ if !class.is_known() => {
+                if decision < Decision::Deny {
+                    decision_source = Source::SafetyFloor;
+                }
+                if placement < Placement::DedicatedRunRuntime {
+                    placement_source = Source::SafetyFloor;
+                }
                 decision = decision.max(Decision::Deny);
                 placement = placement.max(Placement::DedicatedRunRuntime);
                 class_notes.push(format!(
@@ -1238,6 +1271,7 @@ fn explain(what: &str, verdict: &str, source: Source, mode: &Mode, rule_phrase: 
              default)",
             mode.as_str()
         ),
+        Source::SafetyFloor => format!("{what} {verdict}: protected safety floor"),
     }
 }
 
@@ -1429,6 +1463,31 @@ mod tests {
         assert_eq!(eval.decision, Decision::Deny);
         assert_eq!(eval.decision_source, Source::Rule);
         assert_eq!(eval.matched_rules.len(), 2);
+    }
+
+    #[test]
+    fn force_push_safety_floor_cannot_be_weakened_by_manual_mode_or_rules() {
+        let (doc, _) = doc_from(
+            r#"{
+              "version": "nopal.policy/v1",
+              "modes": { "manual": { "rules": [
+                { "id": "attempted-allow", "actions": ["git.push_force"], "decision": "allow" }
+              ] } }
+            }"#,
+        );
+        let eval = evaluate(
+            &doc,
+            &EvalRequest {
+                mode: Mode::Manual,
+                action: "git.push_force",
+                classes: &[ActionClass::GitRemote],
+                env: &[],
+            },
+        );
+        assert_eq!(eval.decision, Decision::Deny);
+        assert_eq!(eval.placement, Placement::Blocked);
+        assert_eq!(eval.decision_source, Source::SafetyFloor);
+        assert_eq!(eval.placement_source, Source::SafetyFloor);
     }
 
     #[test]

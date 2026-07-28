@@ -3,14 +3,32 @@ import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 const PROVIDER = "nopal-enforcement-proof";
 const MODEL = "deterministic";
 const PROMPT = "enforcement walking skeleton proof";
+const ASK_PROMPT = "explicit ask approval proof";
+const FOREIGN_PROMPT = "foreign receipt proof";
+const FAILING_GATE_PROMPT = "failing gate proof";
 const GIT_BIN = process.env.PROOF_GIT_BIN ?? "/usr/bin/git";
+const BYPASS_MARKER = process.env.PROOF_BYPASS_MARKER ?? "/tmp/nopal-enforcement-bypass";
 const STEPS = [
 	{ id: "push-initial", name: "bash", arguments: { command: "git push origin HEAD:refs/heads/main" } },
+	{ id: "delete-refspec-denied", name: "bash", arguments: { command: "git push origin :refs/heads/protected-delete-proof" } },
+	{ id: "read-parallel-a", name: "read", arguments: { path: "source.txt" } },
+	{ id: "read-parallel-b", name: "read", arguments: { path: "source.txt" } },
+	{ id: "read-direct", name: "read", arguments: { path: "source.txt" } },
+	{ id: "grep-direct", name: "grep", arguments: { pattern: "initial", path: "source.txt" } },
+	{ id: "find-direct", name: "find", arguments: { pattern: "source.txt", path: "." } },
+	{ id: "ls-direct", name: "ls", arguments: { path: "." } },
 	{ id: "write-change", name: "write", arguments: { path: "source.txt", content: "initial\nchanged\n" } },
+	{ id: "edit-change", name: "edit", arguments: { path: "source.txt", oldText: "changed", newText: "changed-edited" } },
 	{ id: "add-change", name: "bash", arguments: { command: "git add source.txt" } },
 	{ id: "commit-change", name: "bash", arguments: { command: "git commit -m changed" } },
 	{ id: "push-stale", name: "bash", arguments: { command: "git push origin HEAD:refs/heads/main" } },
-	{ id: "write-attack", name: "write", arguments: { path: "source.txt", content: "initial\nchanged\nattack\n" } },
+	{ id: "rg-config-read", name: "bash", arguments: { command: "rg initial source.txt" } },
+	{ id: "network-read-allowed", name: "bash", arguments: { command: "gh pr view" } },
+	{ id: "repository-weakening-denied", name: "bash", arguments: { command: "vercel deploy" } },
+	{ id: "dependency-install-denied", name: "bash", arguments: { command: "npm install left-pad" } },
+	{ id: "secret-bearing-denied", name: "bash", arguments: { command: "env" } },
+	{ id: "unknown-denied", name: "bash", arguments: { command: "nopal-unknown-command" } },
+	{ id: "write-attack", name: "write", arguments: { path: "source.txt", content: "initial\nchanged-edited\nattack\n" } },
 	{ id: "add-attack", name: "bash", arguments: { command: "git add source.txt" } },
 	{ id: "commit-attack", name: "bash", arguments: { command: "git commit -m attack" } },
 	{ id: "mutation-push-denied", name: "bash", arguments: { command: "printf hidden >> source.txt && git push origin HEAD:refs/heads/main" } },
@@ -41,6 +59,14 @@ const STEPS = [
 		},
 	},
 	{
+		id: "pi-settings-write-denied",
+		name: "write",
+		arguments: {
+			path: ".pi/settings.json",
+			content: "{\"shellCommandPrefix\":\"touch bypass\"}",
+		},
+	},
+	{
 		id: "adapter-write-denied",
 		name: "write",
 		arguments: {
@@ -57,6 +83,22 @@ const STEPS = [
 		},
 	},
 	{ id: "force-denied", name: "bash", arguments: { command: "git push --force origin HEAD:refs/heads/main" } },
+	{ id: "bundled-force-denied", name: "bash", arguments: { command: "git push -qf origin HEAD:refs/heads/main" } },
+	{ id: "helper-remote-denied", name: "bash", arguments: { command: "git push evil::payload main" } },
+	{ id: "tmux-format-exec-denied", name: "bash", arguments: { command: `tmux display-message -p '#(touch ${BYPASS_MARKER})'` } },
+	{ id: "tmux-list-format-exec-denied", name: "bash", arguments: { command: `tmux list-sessions -F '#(touch ${BYPASS_MARKER})'` } },
+	{ id: "find-output-denied", name: "bash", arguments: { command: `find . -fls ${BYPASS_MARKER}` } },
+	{ id: "ancestor-read-denied", name: "bash", arguments: { command: "rg . /Users" } },
+];
+const ASK_STEPS = [
+	{ id: "network-write-ask", name: "bash", arguments: { command: "curl --disable https://nopal.invalid/proof" } },
+];
+const FOREIGN_STEPS = [
+	{ id: "foreign-run-push", name: "bash", arguments: { command: "git push origin HEAD:refs/heads/main" } },
+];
+const FAILING_GATE_STEPS = [
+	{ id: "write-failing-gate", name: "write", arguments: { path: "gate-proof.sh", content: "#!/bin/sh\nexit 9\n" } },
+	{ id: "failing-gate-push-denied", name: "bash", arguments: { command: "git push origin HEAD:refs/heads/main" } },
 ];
 
 function userText(message) {
@@ -73,8 +115,16 @@ function latestPrompt(context) {
 	return "";
 }
 
-function completedSteps(context) {
-	return STEPS.filter(({ id }) => context.messages.some((message) => message?.role === "toolResult" && message.toolCallId === id)).length;
+function stepsForPrompt(prompt) {
+	if (prompt === PROMPT) return STEPS;
+	if (prompt === ASK_PROMPT) return ASK_STEPS;
+	if (prompt === FOREIGN_PROMPT) return FOREIGN_STEPS;
+	if (prompt === FAILING_GATE_PROMPT) return FAILING_GATE_STEPS;
+	return [];
+}
+
+function completedSteps(context, steps) {
+	return steps.filter(({ id }) => context.messages.some((message) => message?.role === "toolResult" && message.toolCallId === id)).length;
 }
 
 function outputMessage(model, stopReason) {
@@ -94,19 +144,24 @@ function stream(model, context) {
 	const events = createAssistantMessageEventStream();
 	queueMicrotask(() => {
 		const prompt = latestPrompt(context);
-		const step = prompt === PROMPT ? completedSteps(context) : STEPS.length;
-		const needsTool = step < STEPS.length;
+		const steps = stepsForPrompt(prompt);
+		const step = completedSteps(context, steps);
+		const needsTool = step < steps.length;
 		const output = outputMessage(model, needsTool ? "toolUse" : "stop");
 		events.push({ type: "start", partial: structuredClone(output) });
 		if (needsTool) {
-			const { id, name, arguments: args } = STEPS[step];
-			const contentIndex = 0;
-			const toolCall = { type: "toolCall", id, name, arguments: args };
-			output.content.push({ ...toolCall, arguments: {} });
-			events.push({ type: "toolcall_start", contentIndex, partial: structuredClone(output) });
-			output.content[contentIndex].arguments = toolCall.arguments;
-			events.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(toolCall.arguments), partial: structuredClone(output) });
-			events.push({ type: "toolcall_end", contentIndex, toolCall, partial: structuredClone(output) });
+			const batch = steps[step].id === "read-parallel-a"
+				? steps.slice(step, step + 2)
+				: [steps[step]];
+			for (const { id, name, arguments: args } of batch) {
+				const contentIndex = output.content.length;
+				const toolCall = { type: "toolCall", id, name, arguments: args };
+				output.content.push({ ...toolCall, arguments: {} });
+				events.push({ type: "toolcall_start", contentIndex, partial: structuredClone(output) });
+				output.content[contentIndex].arguments = toolCall.arguments;
+				events.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(toolCall.arguments), partial: structuredClone(output) });
+				events.push({ type: "toolcall_end", contentIndex, toolCall, partial: structuredClone(output) });
+			}
 		} else {
 			const contentIndex = 0;
 			const text = "enforcement proof complete";

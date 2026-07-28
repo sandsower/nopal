@@ -1,18 +1,14 @@
 import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 
 /**
  * Pure classification and protected-floor logic for policy-gate.
  *
- * Ported from the legacy safety-gate extension
- * (`~/.pi/agent/git/github.com/sandsower/pi-extensions/extensions/safety-gate.ts`):
- * the shell-segment parsing, credential-path list, and command-shape rule
- * matching are the same proven mechanism. The difference is what a match
- * produces: safety-gate resolved a decision (allow/confirm/block) locally;
- * this module only classifies a bash command into an open-vocab
- * `{ action, class }` token pair. The actual allow/deny/ask decision is made
- * by `nopal policy decide` (see `nopal-cli.ts`), which this module never
- * calls or imports.
+ * Shell parsing, protected paths, and command-shape rules compile only into
+ * Core's closed `{ action, class }` vocabulary. Unknown tools, actions, and
+ * ambiguous command envelopes cannot receive authority or human approval.
+ * This module never decides authority.
  *
  * No pi imports here: this file (and its tests) must run as plain node
  * modules with no extension host and no subprocess.
@@ -26,6 +22,21 @@ export type Classification = {
 export type CommandClassifications = {
 	classifications: Classification[];
 	complete: boolean;
+	reason?: string;
+};
+
+export type ToolIntent = Classification & {
+	kind: "nopal.enforcement.tool_intent/v1";
+	toolName: string;
+	inputDigest: string;
+	targetDigest: string;
+	changedFiles: string[];
+	mutates: boolean;
+};
+
+export type ToolIntentResult = {
+	complete: boolean;
+	intent?: ToolIntent;
 	reason?: string;
 };
 
@@ -81,6 +92,10 @@ export type EnforcementAuthority = {
 	adapterDir: string;
 	nopalBin: string;
 	runId: string;
+	adapterCapability: string;
+	gateExecutorBin: string;
+	gateHome: string;
+	gateExecutorDigest: string;
 };
 
 function isWithin(candidate: string, root: string): boolean {
@@ -92,6 +107,7 @@ function resolvedPathIsProtected(resolved: string, authority: EnforcementAuthori
 	const stateDir = resolveThroughExistingAncestor(path.resolve(authority.stateDir)) ?? path.resolve(authority.stateDir);
 	if (isWithin(resolved, path.join(projectRoot, ".nopal"))) return true;
 	if (resolved === path.join(projectRoot, ".beislid", "workflow.md")) return true;
+	if (resolved === path.join(projectRoot, ".pi", "settings.json")) return true;
 	if (isWithin(resolved, stateDir)) return true;
 	const adapterDir = resolveThroughExistingAncestor(path.resolve(authority.adapterDir)) ?? path.resolve(authority.adapterDir);
 	const nopalBin = resolveThroughExistingAncestor(path.resolve(authority.nopalBin)) ?? path.resolve(authority.nopalBin);
@@ -135,11 +151,13 @@ export function commandReferencesEnforcementAuthority(command: string, cwd: stri
 		authority.adapterDir,
 		authority.nopalBin,
 		authority.runId,
+		authority.adapterCapability,
 		"NOPAL_ENFORCEMENT_RUN_ID",
 		"NOPAL_ENFORCEMENT_STATE_DIR",
 		"NOPAL_ENFORCEMENT_ROOT",
 		"NOPAL_ENFORCEMENT_ADAPTER_DIR",
 		"NOPAL_ENFORCEMENT_CLI",
+		"NOPAL_ENFORCEMENT_CAPABILITY",
 		"BEISLID_STATE_DIR",
 		"NOPAL_CONFIG_DIR",
 	]
@@ -148,6 +166,7 @@ export function commandReferencesEnforcementAuthority(command: string, cwd: stri
 	if (
 		/(^|[\s'"`])(?:\.\/)?\.nopal(?:\/|[\s'"`]|$)/.test(normalized)
 		|| /\.beislid\/workflow\.md/.test(normalized)
+		|| /(?:^|\/)\.pi\/settings\.json(?:[\s'"`]|$)/.test(normalized)
 		|| protectedStrings.some((value) => normalized.includes(value))
 	) return true;
 
@@ -268,7 +287,11 @@ function stripEnvAssignments(argv: string[]): string[] {
 
 function unsupportedShellSyntax(command: string): string | undefined {
 	if (/[\r\n]/.test(command)) return "multi-command newlines are not supported";
-	const topLevelArgv = stripEnvAssignments(shellWords(command));
+	const rawTopLevelArgv = shellWords(command);
+	if (rawTopLevelArgv.some((word, index) => index === 0 && /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(word))) {
+		return "command-local environment assignments are not supported";
+	}
+	const topLevelArgv = stripEnvAssignments(rawTopLevelArgv);
 	const shellNames = new Set(["bash", "sh", "dash", "zsh", "ksh", "fish"]);
 	for (let index = 0; index < topLevelArgv.length; index++) {
 		if (!shellNames.has(path.basename(topLevelArgv[index]))) continue;
@@ -327,6 +350,9 @@ function normalizeExecutableSegment(segment: Segment): { segment?: Segment; reas
 	const [rawCommand, ...rawArgs] = segment.argv;
 	if (!rawCommand) return { reason: "missing executable" };
 	const command = path.basename(rawCommand);
+	if (rawCommand !== command) {
+		return { reason: "executable paths are not supported; use the audited command name" };
+	}
 	if (command === "env" && rawArgs.length > 0) {
 		return { reason: "environment command wrappers are not supported" };
 	}
@@ -342,21 +368,12 @@ function normalizeExecutableSegment(segment: Segment): { segment?: Segment; reas
 			args.shift();
 			continue;
 		}
-		if (option === "-C" && args[1]) {
-			args.splice(0, 2);
-			continue;
+		if (option === "-C" || (option.startsWith("-C") && option.length > 2)) {
+			return { reason: "Git -C can retarget authorization to another repository" };
 		}
-		if (option.startsWith("-C") && option.length > 2) {
-			args.shift();
-			continue;
-		}
-		if (["--git-dir", "--work-tree", "--namespace", "--super-prefix"].includes(option) && args[1]) {
-			args.splice(0, 2);
-			continue;
-		}
-		if (["--git-dir=", "--work-tree=", "--namespace=", "--super-prefix="].some((prefix) => option.startsWith(prefix))) {
-			args.shift();
-			continue;
+		if (["--git-dir", "--work-tree", "--namespace", "--super-prefix"].includes(option)
+			|| ["--git-dir=", "--work-tree=", "--namespace=", "--super-prefix="].some((prefix) => option.startsWith(prefix))) {
+			return { reason: `Git option ${JSON.stringify(option)} can retarget authorization` };
 		}
 		return { reason: `unsupported Git global option ${JSON.stringify(option)}` };
 	}
@@ -364,8 +381,66 @@ function normalizeExecutableSegment(segment: Segment): { segment?: Segment; reas
 	return { segment: { ...segment, argv: ["git", ...args] } };
 }
 
+function unsafeAuditedOptions(segment: Segment): string | undefined {
+	const [command, subcommand] = segment.argv;
+	const commandArgs = segment.argv.slice(1);
+	const gitArgs = segment.argv.slice(2);
+	const has = (args: string[], ...options: string[]) => args.some((arg) => options.includes(arg) || options.some((option) => arg.startsWith(`${option}=`)));
+	if (command === "git" && ["diff", "log", "show"].includes(subcommand ?? "")
+		&& has(gitArgs, "--ext-diff", "--textconv", "--output")) {
+		return "Git read options that execute helpers or write output are not supported";
+	}
+	if (command === "git" && subcommand === "commit"
+		&& !gitArgs.some((arg) => arg === "-m" || arg.startsWith("--message=")
+			|| arg === "-F" || arg.startsWith("--file=") || arg === "--no-edit")) {
+		return "Git commits require an explicit non-interactive message source";
+	}
+	if (command === "git" && subcommand === "push"
+		&& (has(gitArgs, "--receive-pack", "--exec", "--upload-pack", "--repo")
+			|| gitArgs.some((arg) => /^[A-Za-z0-9_-]+::/.test(arg)))) {
+		return "Git transport helper and repository overrides are not supported";
+	}
+	if (command === "rg" && has(commandArgs, "--pre", "--pre-glob", "--hostname-bin")) {
+		return "ripgrep helper execution is not supported";
+	}
+	if (["sort", "uniq", "file", "date", "ps", "pgrep", "jq"].includes(command ?? "")) {
+		return `${command} is not in Nopal's closed read-command grammar`;
+	}
+	if (command === "find" && commandArgs.some((arg) => ["-fprint", "-fprint0", "-fprintf", "-fls"].includes(arg))) {
+		return "find output-file options are not supported in a read action";
+	}
+	if (command === "date" && has(commandArgs, "-s", "--set")) {
+		return "date mutation options are not supported in a read action";
+	}
+	return undefined;
+}
+
 function isNetworkTransferCommand(command: string | undefined): boolean {
 	return Boolean(command && ["curl", "wget", "nc", "netcat", "scp", "rsync", "ftp", "sftp"].includes(command));
+}
+
+function externalTargetIsExact(segment: Segment): string | undefined {
+	const [command, ...args] = segment.argv;
+	if (!isNetworkTransferCommand(command)) return undefined;
+	if (command !== "curl") {
+		return `${command} has no audited exact-target adapter`;
+	}
+	if (args.length !== 2 || !["--disable", "-q"].includes(args[0])) {
+		return "curl exact-target authorization permits only: curl --disable <literal-http-url>";
+	}
+	const targetText = args[1];
+	if (!/^https?:\/\/[^\s]+$/i.test(targetText) || /[{}\[\]]/.test(targetText)) {
+		return "curl requires one non-globbing literal HTTP or HTTPS target";
+	}
+	try {
+		const target = new URL(targetText);
+		if (!target.hostname || target.username || target.password) {
+			return "curl target credentials and missing hostnames are not supported";
+		}
+	} catch {
+		return "curl target is not a valid literal URL";
+	}
+	return undefined;
 }
 
 function isCredentialArgument(arg: string): boolean {
@@ -419,16 +494,9 @@ function classifyCredentialCommand(segment: Segment): Classification | null {
 }
 
 // ---------------------------------------------------------------------------
-// Command-shape rule table (ported from safety-gate's builtInPolicy, with
-// decisions replaced by open-vocab class tokens). `secret_bearing` and
-// `read`/`workspace_write`/`network_read`/`git_local`/`git_remote`/
-// `destructive` are nopal-core's known vocabulary
-// (crates/nopal-core/src/policy.rs KNOWN_CLASSES); `network_write` is an
-// additional open-vocab token this classifier mints for remote/infra
-// mutations that don't fit any known class - unknown classes fail closed in
-// nopal-core (treated as protected/unsafe), which is the conservative
-// behavior we want for these until a project's `.nopal/policy.jsonc`
-// explicitly configures a rule for them.
+// Command-shape rule table. Every emitted class and action belongs to Core's
+// closed vocabulary. Unknown or ambiguous command shapes stop before policy,
+// and infrastructure failures remain non-approvable.
 // ---------------------------------------------------------------------------
 
 const HIGH_SEVERITY_RULES: ClassRule[] = [
@@ -456,12 +524,27 @@ const HIGH_SEVERITY_RULES: ClassRule[] = [
 			segment.argv.slice(2).some((arg) =>
 				arg === "-f"
 				|| arg === "--force"
+				|| /^-[^-]*f/.test(arg)
 				|| arg.startsWith("--force-with-lease")
+				|| arg === "--force-if-includes"
+				|| arg === "--mirror"
+				|| arg === "--delete"
+				|| arg === "-d"
+				|| /^-[^-]*d/.test(arg)
+				|| arg === "--prune"
 				|| arg.startsWith("+")
+				|| arg.startsWith(":")
 				|| /[$`*?\[]/.test(arg)
 			)
 				? "git.push_force"
 				: "git.push",
+	},
+	{
+		id: "dependency-install",
+		command: ["npm", "pnpm", "yarn", "bun", "pip", "pip3", "cargo", "gem", "composer"],
+		argsPrefixAny: [["install"], ["ci"], ["add"], ["update"]],
+		class: "dependency_install",
+		action: "dependency.install",
 	},
 	{ id: "git-add", command: "git", argsPrefixAny: [["add"]], class: "git_local", action: "git.add" },
 	{ id: "git-commit", command: "git", argsPrefixAny: [["commit"]], class: "git_local", action: "git.commit" },
@@ -473,12 +556,13 @@ const HIGH_SEVERITY_RULES: ClassRule[] = [
 		action: "rm.recursive",
 	},
 	{ id: "sudo", command: "sudo", argsPrefixAny: [[]], class: "destructive", action: "sudo.exec" },
+	{ id: "tmux-environment", command: "tmux", argsPrefixAny: [["show-environment"]], class: "secret_bearing", action: "env.dump" },
 	{ id: "chmod-777", command: "chmod", argsPrefixAny: [["777"], ["-R", "777"]], class: "destructive", action: "chmod.perm_777" },
 	{ id: "chown", command: "chown", argsPrefixAny: [[]], class: "destructive", action: "chown.exec" },
 	{ id: "raw-disk", command: ["dd", "mkfs", "mkfs.ext4", "mkfs.xfs"], argsPrefixAny: [[]], class: "destructive", action: "disk.raw_write" },
 	{ id: "shutdown", command: ["shutdown", "reboot", "poweroff"], argsPrefixAny: [[]], class: "destructive", action: "system.shutdown" },
 	{ id: "find-delete", command: "find", argsContainsAny: ["-delete"], class: "destructive", action: "find.delete" },
-	{ id: "find-exec", command: "find", argsContainsAny: ["-exec", "-execdir"], class: "destructive", action: "find.exec" },
+	{ id: "find-exec", command: "find", argsContainsAny: ["-exec", "-execdir", "-ok", "-okdir"], class: "destructive", action: "find.exec" },
 	{
 		id: "gh-pr-mutations",
 		command: "gh",
@@ -551,15 +635,8 @@ const ROUTINE_RULES: ClassRule[] = [
 	},
 	{
 		id: "filesystem-read-only",
-		command: ["ls", "pwd", "rg", "grep", "head", "tail", "wc", "sort", "uniq", "date", "jq", "file", "stat", "du", "df", "uname", "whoami", "id", "ps", "pgrep", "find"],
+		command: ["pwd", "uname", "whoami", "id"],
 		argsPrefixAny: [[]],
-		class: "read",
-		action: "fs.read",
-	},
-	{
-		id: "tmux-read-only",
-		command: "tmux",
-		argsPrefixAny: [["list-sessions"], ["ls"], ["list-windows"], ["list-panes"], ["display-message"], ["show-options"], ["show-environment"]],
 		class: "read",
 		action: "fs.read",
 	},
@@ -590,15 +667,10 @@ function resolveAction(action: ClassRule["action"], segment: Segment): string {
 }
 
 /**
- * Classify a bash command into an open-vocab `{ action, class }` token pair.
- * Never returns a decision; the caller routes the result through
- * `nopal policy decide` (nopal-cli.ts) to get an allow/deny/ask verdict.
- *
- * Unmatched/unclassifiable commands get `class: "unknown"` rather than an
- * implicit allow - this is the key behavior change from safety-gate, whose
- * default for an unmatched command was `allow`. Under policy-gate, the
- * default is "let the core decide", and the core treats unknown classes as
- * protected/unsafe.
+ * Classify one supported bash envelope into Core's closed action vocabulary.
+ * Never returns a decision. Unmatched or incomplete commands carry an
+ * `unknown` diagnostic projection here, and Core rejects that projection as
+ * an unapprovable contract error.
  */
 export function classifyBashCommandSet(command: string): CommandClassifications {
 	const unsupported = unsupportedShellSyntax(command);
@@ -620,6 +692,10 @@ export function classifyBashCommandSet(command: string): CommandClassifications 
 	if (segments.length === 0) {
 		return { classifications: [], complete: false, reason: "no executable shell segment was found" };
 	}
+	const unsafeOption = segments.map(unsafeAuditedOptions).find((reason) => reason !== undefined);
+	if (unsafeOption) return { classifications: [], complete: false, reason: unsafeOption };
+	const targetFailure = segments.map(externalTargetIsExact).find((reason) => reason !== undefined);
+	if (targetFailure) return { classifications: [], complete: false, reason: targetFailure };
 
 	const classifications: Classification[] = [];
 	const exfil = classifyNetworkCredentialExfil(inspectionCommand);
@@ -650,6 +726,108 @@ export function classifyBashCommandSet(command: string): CommandClassifications 
 			all.findIndex((entry) => entry.action === candidate.action && entry.class === candidate.class) === index
 		),
 		complete: true,
+	};
+}
+
+function canonicalJson(value: unknown): string {
+	if (value === undefined) return JSON.stringify("<undefined>");
+	if (value === null || typeof value !== "object") return JSON.stringify(value);
+	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	const entries = Object.entries(value as Record<string, unknown>)
+		.sort(([left], [right]) => left.localeCompare(right));
+	return `{${entries.map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`).join(",")}}`;
+}
+
+function digest(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
+function shellArgumentsAreConfined(command: string, cwd: string, projectRoot: string): string | undefined {
+	for (const raw of parseShellSegments(command)) {
+		const normalized = normalizeExecutableSegment(raw);
+		if (!normalized.segment) continue;
+		for (const argument of normalized.segment.argv.slice(1)) {
+			if (argument.startsWith("~")) return `shell path expansion escapes exact target binding: ${argument}`;
+			const checked = confinedToolPath(argument, cwd, projectRoot);
+			if (checked.reason) return checked.reason;
+		}
+	}
+	return undefined;
+}
+
+function confinedToolPath(candidate: string, cwd: string, projectRoot: string): { absolute?: string; relative?: string; reason?: string } {
+	const root = resolveThroughExistingAncestor(path.resolve(projectRoot)) ?? path.resolve(projectRoot);
+	const lexical = path.resolve(cwd, candidate.replace(/^@/, ""));
+	const resolved = resolveThroughExistingAncestor(lexical) ?? lexical;
+	if (!isWithin(resolved, root)) return { reason: `tool path escapes the Nopal worktree: ${candidate}` };
+	const relative = path.relative(root, resolved).split(path.sep).join("/") || ".";
+	return { absolute: resolved, relative };
+}
+
+/**
+ * Compile one real Pi tool call into the closed Nopal intent vocabulary.
+ * Unknown tools and incomplete input fail before policy, so a human approval
+ * can never turn missing mediation support into authority.
+ */
+export function classifyPiToolCall(
+	toolName: string,
+	input: Record<string, unknown>,
+	cwd: string,
+	projectRoot: string,
+): ToolIntentResult {
+	const inputDigest = digest(canonicalJson(input));
+	if (toolName === "bash") {
+		const command = input.command;
+		if (typeof command !== "string" || !command.trim()) {
+			return { complete: false, reason: "bash input requires one non-empty command" };
+		}
+		const classified = classifyBashCommandSet(command);
+		if (!classified.complete || classified.classifications.length !== 1) {
+			return { complete: false, reason: classified.reason ?? "bash command did not produce one stable action" };
+		}
+		const confinementFailure = shellArgumentsAreConfined(command, cwd, projectRoot);
+		if (confinementFailure) return { complete: false, reason: confinementFailure };
+		const classification = classified.classifications[0];
+		return {
+			complete: true,
+			intent: {
+				kind: "nopal.enforcement.tool_intent/v1",
+				toolName,
+				...classification,
+				inputDigest,
+				targetDigest: digest(command),
+				changedFiles: [],
+				mutates: !["read", "network_read"].includes(classification.class),
+			},
+		};
+	}
+
+	if (!["read", "grep", "find", "ls", "write", "edit"].includes(toolName)) {
+		return { complete: false, reason: `unsupported Pi tool ${JSON.stringify(toolName)}` };
+	}
+	const rawPath = input.path ?? ".";
+	if (typeof rawPath !== "string" || !rawPath.trim()) {
+		return { complete: false, reason: `${toolName} input requires a path string` };
+	}
+	const confined = confinedToolPath(rawPath, cwd, projectRoot);
+	if (!confined.absolute || !confined.relative) return { complete: false, reason: confined.reason };
+	const mutates = toolName === "write" || toolName === "edit";
+	if (mutates && isProtectedCredentialPath(confined.absolute)) {
+		return { complete: false, reason: `resolved mutation target is a protected credential path: ${rawPath}` };
+	}
+	const credentialRead = !mutates && isProtectedCredentialPath(confined.absolute);
+	return {
+		complete: true,
+		intent: {
+			kind: "nopal.enforcement.tool_intent/v1",
+			toolName,
+			action: credentialRead ? "file.read_credential" : mutates ? "fs.write" : "fs.read",
+			class: credentialRead ? "secret_bearing" : mutates ? "workspace_write" : "read",
+			inputDigest,
+			targetDigest: digest(confined.absolute),
+			changedFiles: mutates && confined.relative !== "." ? [confined.relative] : [],
+			mutates,
+		},
 	};
 }
 

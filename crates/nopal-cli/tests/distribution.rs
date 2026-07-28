@@ -1,8 +1,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
-use std::process::Command;
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
+use std::sync::OnceLock;
 
 use base64::Engine as _;
 use flate2::Compression;
@@ -11,6 +14,47 @@ use sha2::{Digest as _, Sha512};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+
+/// Every subprocess in this suite gets a deterministic empty user home.
+/// Launch tests exercise repository-owned configuration and must not inherit
+/// a developer or CI runner's Git target rewriting, credential helpers, or
+/// executable user configuration.
+struct Command(StdCommand);
+
+impl Command {
+    fn new(program: impl AsRef<OsStr>) -> Self {
+        static HOME: OnceLock<PathBuf> = OnceLock::new();
+        let home = HOME.get_or_init(|| {
+            let path = std::env::temp_dir().join(format!(
+                "nopal-distribution-test-home-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(path.join(".config")).unwrap();
+            path
+        });
+        let mut command = StdCommand::new(program);
+        command
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("NOPAL_TEST_CLEAN_GIT_CONFIG", "1");
+        Self(command)
+    }
+}
+
+impl Deref for Command {
+    type Target = StdCommand;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Command {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 fn git(dir: &Path, args: &[&str]) {
     assert!(
@@ -38,7 +82,7 @@ fn fresh_bare_launch_writes_complete_baseline_and_executes_pi_offline() {
     fs::write(
         &stub,
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' \"$PI_OFFLINE\" > {}\nexit 17\n",
+            "#!/bin/sh\nif [ \"$NOPAL_ENFORCEMENT_PROBE\" = \"1\" ]; then printf '%s' \"$NOPAL_ENFORCEMENT_PROBE_TOKEN\" > \"$NOPAL_ENFORCEMENT_PROBE_ACK\"; exit 0; fi\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' \"$PI_OFFLINE\" > {}\nexit 17\n",
             args_file.display(),
             env_file.display()
         ),
@@ -48,7 +92,7 @@ fn fresh_bare_launch_writes_complete_baseline_and_executes_pi_offline() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
         .args(["--dir", repo.to_str().unwrap(), "--", "--no-session"])
-        .env("NOPAL_PI_BIN", &stub)
+        .env("NOPAL_TEST_PI_BIN", &stub)
         .env("NOPAL_DATA_DIR", temp.path().join("data"))
         .env("BEISLID_STATE_DIR", temp.path().join("state"))
         .output()
@@ -87,6 +131,282 @@ fn fresh_bare_launch_writes_complete_baseline_and_executes_pi_offline() {
 
 #[test]
 #[cfg(unix)]
+fn caller_cannot_remove_or_replace_the_audited_pi_tool_catalog() {
+    for argument in ["--no-tools", "--tools=read,bash"] {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+        let marker = temp.path().join("pi-started");
+        let pi = temp.path().join("pi-stub.sh");
+        fs::write(&pi, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        fs::set_permissions(&pi, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
+            .args(["--dir", repo.to_str().unwrap(), "--", argument])
+            .env("NOPAL_TEST_PI_BIN", &pi)
+            .env("NOPAL_DATA_DIR", temp.path().join("data"))
+            .env("BEISLID_STATE_DIR", temp.path().join("state"))
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(2), "{argument}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("active tool catalog"),
+            "{argument}: {output:?}"
+        );
+        assert!(!marker.exists());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn stage_specific_missing_executor_blocks_launch_even_when_push_is_denied() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let marker = temp.path().join("pi-started");
+    let pi = temp.path().join("pi-stub.sh");
+    fs::write(
+        &pi,
+        format!(
+            "#!/bin/sh\nif [ \"$NOPAL_ENFORCEMENT_PROBE\" = 1 ]; then printf '%s' \"$NOPAL_ENFORCEMENT_PROBE_TOKEN\" > \"$NOPAL_ENFORCEMENT_PROBE_ACK\"; exit 0; fi\ntouch {}\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&pi, fs::Permissions::from_mode(0o700)).unwrap();
+    let launch = || {
+        Command::new(env!("CARGO_BIN_EXE_nopal"))
+            .args(["--dir", repo.to_str().unwrap(), "--", "--no-session"])
+            .env("NOPAL_TEST_PI_BIN", &pi)
+            .env("NOPAL_DATA_DIR", temp.path().join("data"))
+            .env("BEISLID_STATE_DIR", temp.path().join("state"))
+            .output()
+            .unwrap()
+    };
+    let initial = launch();
+    assert!(initial.status.success(), "{initial:?}");
+    fs::remove_file(&marker).unwrap();
+    fs::write(
+        repo.join(".nopal/policy.jsonc"),
+        r#"{
+          "version": "nopal.policy/v1",
+          "modes": { "supervised_auto": { "rules": [
+            { "id": "deny-push", "actions": ["git.push"], "decision": "deny" }
+          ] } }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        repo.join(".nopal/gates.jsonc"),
+        r#"{
+          "version": "nopal.gates/v1",
+          "gates": [
+            { "id": "ready", "stage": "pre_pr", "argv": ["true"] },
+            { "id": "edit-proof", "stage": "per_edit", "argv": ["per-edit-proof-absent"] }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    let blocked = launch();
+    assert_eq!(blocked.status.code(), Some(2), "{blocked:?}");
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("unavailable executor"),
+        "{blocked:?}"
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn repository_path_gate_executor_shadow_blocks_before_the_runtime_probe() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let shadow_bin = repo.join("shadow-bin");
+    fs::create_dir_all(&shadow_bin).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let shadow_marker = temp.path().join("shadow-ran");
+    let cargo_shadow = shadow_bin.join("cargo");
+    fs::write(
+        &cargo_shadow,
+        format!("#!/bin/sh\ntouch {}\n", shadow_marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&cargo_shadow, fs::Permissions::from_mode(0o700)).unwrap();
+    let pi_marker = temp.path().join("pi-started");
+    let pi = temp.path().join("pi-stub.sh");
+    fs::write(&pi, format!("#!/bin/sh\ntouch {}\n", pi_marker.display())).unwrap();
+    fs::set_permissions(&pi, fs::Permissions::from_mode(0o700)).unwrap();
+    let inherited_path = std::env::var_os("PATH").unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(shadow_bin.clone()).chain(std::env::split_paths(&inherited_path)),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", repo.to_str().unwrap()])
+        .env("PATH", path)
+        .env("NOPAL_TEST_PI_BIN", &pi)
+        .env("NOPAL_DATA_DIR", temp.path().join("data"))
+        .env("BEISLID_STATE_DIR", temp.path().join("state"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("repository or temporary authority"),
+        "{output:?}"
+    );
+    assert!(!shadow_marker.exists());
+    assert!(!pi_marker.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn executable_project_pi_settings_block_before_the_runtime_probe() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join(".pi")).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    fs::write(
+        repo.join(".pi/settings.json"),
+        r#"{"shellPath":"/tmp/substituted-shell"}"#,
+    )
+    .unwrap();
+    let marker = temp.path().join("pi-started");
+    let stub = temp.path().join("pi-stub.sh");
+    fs::write(
+        &stub,
+        format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", repo.to_str().unwrap()])
+        .env("NOPAL_TEST_PI_BIN", &stub)
+        .env("NOPAL_DATA_DIR", temp.path().join("data"))
+        .env("BEISLID_STATE_DIR", temp.path().join("state"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("executable authority"),
+        "{output:?}"
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn symlinked_project_pi_settings_directory_blocks_before_runtime_probe() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let internal = repo.join("internal-config");
+    fs::create_dir_all(&internal).unwrap();
+    fs::write(internal.join("settings.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(&internal, repo.join(".pi")).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let marker = temp.path().join("pi-started");
+    let stub = temp.path().join("pi-stub.sh");
+    fs::write(
+        &stub,
+        format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", repo.to_str().unwrap()])
+        .env("NOPAL_TEST_PI_BIN", &stub)
+        .env("NOPAL_DATA_DIR", temp.path().join("data"))
+        .env("BEISLID_STATE_DIR", temp.path().join("state"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("real directory"),
+        "{output:?}"
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_that_does_not_acknowledge_the_enforcement_hook_cannot_launch() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let stub = temp.path().join("pi-without-hooks.sh");
+    fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", repo.to_str().unwrap()])
+        .env("NOPAL_TEST_PI_BIN", &stub)
+        .env("NOPAL_DATA_DIR", temp.path().join("data"))
+        .env("BEISLID_STATE_DIR", temp.path().join("state"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("without a readable enforcement acknowledgement"),
+        "{output:?}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn pi_executable_changed_after_hook_probe_cannot_receive_the_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
+    let stub = temp.path().join("changing-pi.sh");
+    let marker = temp.path().join("user-session-started");
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\nif [ \"$NOPAL_ENFORCEMENT_PROBE\" = \"1\" ]; then printf '%s' \"$NOPAL_ENFORCEMENT_PROBE_TOKEN\" > \"$NOPAL_ENFORCEMENT_PROBE_ACK\"; printf '\\n# changed\\n' >> {:?}; exit 0; fi\ntouch {:?}\n",
+            stub, marker
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args(["--dir", repo.to_str().unwrap()])
+        .env("NOPAL_TEST_PI_BIN", &stub)
+        .env("NOPAL_DATA_DIR", temp.path().join("data"))
+        .env("BEISLID_STATE_DIR", temp.path().join("state"))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("changed between enforcement probe and session handoff")
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+#[cfg(unix)]
 fn unknown_first_run_writes_complete_baseline_but_does_not_start_pi() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
@@ -103,7 +423,7 @@ fn unknown_first_run_writes_complete_baseline_but_does_not_start_pi() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
         .args(["--dir", repo.to_str().unwrap(), "--json"])
-        .env("NOPAL_PI_BIN", &stub)
+        .env("NOPAL_TEST_PI_BIN", &stub)
         .env("NOPAL_DATA_DIR", temp.path().join("data"))
         .output()
         .unwrap();
@@ -485,11 +805,15 @@ fn ambient_resources_are_disabled_by_default_and_only_checked_in_non_executable_
     git(&repo, &["init", "-q"]);
     fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
     let stub = temp.path().join("pi-stub.sh");
-    fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::write(
+        &stub,
+        "#!/bin/sh\nif [ \"$NOPAL_ENFORCEMENT_PROBE\" = \"1\" ]; then printf '%s' \"$NOPAL_ENFORCEMENT_PROBE_TOKEN\" > \"$NOPAL_ENFORCEMENT_PROBE_ACK\"; exit 0; fi\nexit 0\n",
+    )
+    .unwrap();
     fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
     let scaffold = Command::new(env!("CARGO_BIN_EXE_nopal"))
         .args(["--dir", repo.to_str().unwrap()])
-        .env("NOPAL_PI_BIN", &stub)
+        .env("NOPAL_TEST_PI_BIN", &stub)
         .env("NOPAL_DATA_DIR", temp.path().join("data"))
         .output()
         .unwrap();
