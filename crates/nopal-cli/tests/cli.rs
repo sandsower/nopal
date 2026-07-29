@@ -37,6 +37,41 @@ fn json(out: &Output) -> serde_json::Value {
     serde_json::from_str(&stdout(out)).expect("stdout is not valid JSON")
 }
 
+#[test]
+fn removed_product_routes_return_actionable_v03_migration_diagnostics() {
+    let cases: &[(&str, &[&str])] = &[
+        ("cli", &["--dry-run"]),
+        ("ask", &["list", "--all"]),
+        ("plot", &["establish", "--event", "kickoff"]),
+        ("field", &["inspect", "--all"]),
+        ("bridge", &["herdr", "--once"]),
+        ("placement", &["--action", "run.start"]),
+        ("rondo", &["health"]),
+        ("run", &["start"]),
+        ("workflow", &["show"]),
+    ];
+
+    for (surface, legacy_args) in cases {
+        let mut args = vec!["--json", *surface];
+        args.extend_from_slice(legacy_args);
+        let out = nopal(&args);
+
+        assert_eq!(out.status.code(), Some(1), "{surface}: {}", stdout(&out));
+        let doc = json(&out);
+        assert_eq!(doc["kind"], "nopal.migration/v1", "{surface}");
+        assert_eq!(doc["ok"], false, "{surface}");
+        assert_eq!(doc["code"], "product_surface_removed", "{surface}");
+        assert_eq!(doc["surface"], *surface, "{surface}");
+        assert_eq!(doc["removed_in"], "0.3.0", "{surface}");
+        assert!(
+            doc["migration"]
+                .as_str()
+                .is_some_and(|message| message.contains("v0.3")),
+            "{surface}: {doc:#}"
+        );
+    }
+}
+
 fn init_git(root: &Path) {
     let status = Command::new("git")
         .args(["init", "--quiet"])
@@ -265,7 +300,7 @@ fn import_beislid_workflow_json_preview_contains_module_drafts_and_diagnostics()
     let doc = json(&out);
     assert_eq!(doc["kind"], "nopal.beislid_import/v1");
     assert_eq!(doc["ok"], true);
-    assert_eq!(doc["outputs"].as_array().unwrap().len(), 3);
+    assert_eq!(doc["outputs"].as_array().unwrap().len(), 2);
     let gates = doc["outputs"]
         .as_array()
         .unwrap()
@@ -284,18 +319,11 @@ fn import_beislid_workflow_json_preview_contains_module_drafts_and_diagnostics()
         .iter()
         .filter_map(|diagnostic| diagnostic["code"].as_str())
         .collect();
-    assert_eq!(
-        codes,
-        vec![
-            "beislid_import_unsupported",
-            "beislid_import_unsupported",
-            "beislid_import_unsupported"
-        ]
-    );
+    assert_eq!(codes, vec!["beislid_import_unsupported"; 8]);
 }
 
 #[test]
-fn import_beislid_workflow_maps_required_sections() {
+fn import_beislid_workflow_maps_authority_and_keeps_host_integration_beislid_side() {
     let temp = tempfile::tempdir().unwrap();
     write_minimal_project(temp.path(), "");
     fs::create_dir_all(temp.path().join(".beislid")).unwrap();
@@ -334,7 +362,7 @@ workflows:
 ```beislid:workflow_signals
 mode: auto
 sinks:
-  - type: tmux-glance
+  - type: terminal-glance
 skills:
   babysit: auto
 ```
@@ -364,24 +392,17 @@ context:
         json_from_file(&temp.path().join(".nopal/gates.jsonc"))["gate_sets"]["fast"]["gates"][0],
         "fmt"
     );
+    assert!(!temp.path().join(".nopal/integrations.jsonc").exists());
     assert_eq!(
-        json_from_file(&temp.path().join(".nopal/integrations.jsonc"))["model_routing"]["defaults"]
-            ["model"],
-        "gpt-5"
-    );
-    assert_eq!(
-        json_from_file(&temp.path().join(".nopal/integrations.jsonc"))["model_routing"]["overrides"]
-            [0]["skills"][0],
-        "blueprint"
-    );
-    assert_eq!(
-        json_from_file(&temp.path().join(".nopal/integrations.jsonc"))["visual_surfaces"]["mode"],
-        "suggest"
-    );
-    assert_eq!(
-        json_from_file(&temp.path().join(".nopal/integrations.jsonc"))["workflow_signals"]["sinks"]
-            [0]["type"],
-        "tmux-glance"
+        import_doc["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|diagnostic| diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Beislið-owned")))
+            .count(),
+        3
     );
     assert_eq!(
         json_from_file(&temp.path().join(".nopal/guidance.jsonc"))["hints"]["skills"][0],
@@ -473,10 +494,7 @@ fn import_beislid_workflow_write_creates_modules_without_overwriting() {
         policy["modes"]["supervised_auto"]["rules"][0]["classes"][0],
         "network_read"
     );
-    assert_eq!(
-        json_from_file(&temp.path().join(".nopal/integrations.jsonc"))["probe_cache"]["ttl_hours"],
-        24
-    );
+    assert!(!temp.path().join(".nopal/integrations.jsonc").exists());
 
     let blocked = nopal(&[
         "--dir",
@@ -550,7 +568,7 @@ fn import_beislid_workflow_check_accepts_semantically_equal_jsonc_and_preserves_
         .iter()
         .filter(|diagnostic| diagnostic["code"] == "beislid_import_unsupported")
         .count();
-    assert_eq!(unsupported, 3);
+    assert_eq!(unsupported, 8);
 }
 
 #[test]
@@ -612,7 +630,7 @@ fn import_beislid_workflow_check_fails_for_missing_generated_modules() {
             .iter()
             .filter(|diagnostic| diagnostic["code"] == "beislid_import_missing")
             .count(),
-        3
+        2
     );
 }
 
@@ -853,173 +871,6 @@ fn import_beislid_workflow_maps_review_policy_and_split_policy_fences() {
 }
 
 #[test]
-fn migration_bridge_proof_imports_current_workflows_exports_artifacts_redacts_and_detects_drift() {
-    let cases: &[(&str, &[&str])] = &[
-        (
-            "nopal-current.md",
-            &["integrations", "gates", "policy", "workflow"],
-        ),
-        (
-            "rondo-runner.md",
-            &["integrations", "gates", "policy", "workflow"],
-        ),
-        (
-            "memento-memory-provider.md",
-            &["integrations", "gates", "policy", "workflow"],
-        ),
-        ("review-policy.md", &["gates", "review_policy"]),
-    ];
-
-    for (fixture_name, expected_modules) in cases {
-        let temp = tempfile::tempdir().unwrap();
-        copy_beislid_workflow(temp.path(), fixture_name);
-
-        let import = nopal(&[
-            "--dir",
-            temp.path().to_str().unwrap(),
-            "--json",
-            "import",
-            "beislid-workflow",
-            "--write",
-        ]);
-        let import_text = stdout(&import);
-        assert_eq!(
-            import.status.code(),
-            Some(0),
-            "fixture {fixture_name} import failed\nstdout: {import_text}\nstderr: {}",
-            String::from_utf8_lossy(&import.stderr)
-        );
-        let import_doc: serde_json::Value = serde_json::from_str(&import_text).unwrap();
-        assert_eq!(import_doc["kind"], "nopal.beislid_import/v1");
-        assert_eq!(import_doc["ok"], true);
-        let output_modules: Vec<&str> = import_doc["outputs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|output| output["module"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            output_modules, *expected_modules,
-            "fixture {fixture_name} generated unexpected modules"
-        );
-        assert!(
-            import_doc["diagnostics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|diagnostic| diagnostic["severity"] != "error"),
-            "fixture {fixture_name} import diagnostics: {:?}",
-            import_doc["diagnostics"]
-        );
-
-        write_minimal_project(
-            temp.path(),
-            r#",
-  "api_token": "migration-proof-token",
-  "bearer_literal": "Bearer migration-proof-fake""#,
-        );
-
-        let validate = nopal(&["--dir", temp.path().to_str().unwrap(), "--json", "validate"]);
-        assert_eq!(
-            validate.status.code(),
-            Some(0),
-            "fixture {fixture_name} generated invalid .nopal drafts\nstdout: {}\nstderr: {}",
-            stdout(&validate),
-            String::from_utf8_lossy(&validate.stderr)
-        );
-
-        let export = nopal(&[
-            "--dir",
-            temp.path().to_str().unwrap(),
-            "--json",
-            "export",
-            "process",
-            "--stdout",
-        ]);
-        let artifact_text = stdout(&export);
-        assert_eq!(
-            export.status.code(),
-            Some(0),
-            "fixture {fixture_name} export failed\nstdout: {artifact_text}\nstderr: {}",
-            String::from_utf8_lossy(&export.stderr)
-        );
-        assert!(
-            !artifact_text.contains("migration-proof-token")
-                && !artifact_text.contains("Bearer migration-proof-fake"),
-            "fixture {fixture_name} leaked fake secret material: {artifact_text}"
-        );
-        let artifact: serde_json::Value = serde_json::from_str(&artifact_text).unwrap();
-        assert_eq!(artifact["kind"], "nopal.process_artifact/v1");
-        assert!(
-            artifact["sources"][0]["hash"]
-                .as_str()
-                .unwrap()
-                .starts_with("sha256:")
-        );
-        assert_eq!(artifact["modules"]["manifest"]["api_token"], "<redacted>");
-        assert_eq!(
-            artifact["modules"]["manifest"]["bearer_literal"],
-            "<redacted>"
-        );
-        for expected_module in *expected_modules {
-            assert!(
-                artifact["modules"].get(*expected_module).is_some(),
-                "fixture {fixture_name} artifact missing module {expected_module}"
-            );
-        }
-
-        if *fixture_name == "nopal-current.md" {
-            let artifact_path = temp.path().join("process-artifact.json");
-            let export_file = nopal(&[
-                "--dir",
-                temp.path().to_str().unwrap(),
-                "export",
-                "process",
-                "--output",
-                artifact_path.to_str().unwrap(),
-            ]);
-            assert_eq!(export_file.status.code(), Some(0));
-
-            let fresh_check = nopal(&[
-                "--dir",
-                temp.path().to_str().unwrap(),
-                "--json",
-                "export",
-                "process",
-                "--output",
-                artifact_path.to_str().unwrap(),
-                "--check",
-            ]);
-            assert_eq!(fresh_check.status.code(), Some(0));
-            assert_eq!(json(&fresh_check)["ok"], true);
-
-            let manifest_path = temp.path().join(".nopal/nopal.jsonc");
-            let manifest = fs::read_to_string(&manifest_path).unwrap();
-            fs::write(&manifest_path, format!("{manifest}\n")).unwrap();
-            let stale_check = nopal(&[
-                "--dir",
-                temp.path().to_str().unwrap(),
-                "--json",
-                "export",
-                "process",
-                "--output",
-                artifact_path.to_str().unwrap(),
-                "--check",
-            ]);
-            assert_eq!(stale_check.status.code(), Some(1));
-            let stale_doc = json(&stale_check);
-            assert!(
-                stale_doc["diagnostics"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|diagnostic| diagnostic["code"] == "process_artifact_drift")
-            );
-        }
-    }
-}
-
-#[test]
 fn export_process_rejects_conflicting_stdout_flags() {
     let temp = tempfile::tempdir().unwrap();
     write_minimal_project(temp.path(), "");
@@ -1134,8 +985,7 @@ fn validate_minimal_matches_golden_toon() {
 
 #[test]
 fn status_minimal_matches_golden_toon_and_exits_zero() {
-    // Explicit `status` subcommand: bare invocation opens the field
-    //; the launcher lives at `nopal cli`.
+    // Status remains a read-only project-contract report.
     let out = nopal(&["--dir", &example("minimal"), "status"]);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(stdout(&out), include_str!("golden/status-minimal.toon"));
@@ -1230,12 +1080,10 @@ fn manifest_defined_profile_requires_modules_without_core_variant() {
 }
 
 #[test]
-fn validate_invalid_workflow_integrations_and_guidance_examples_fail() {
+fn validate_invalid_workflow_and_guidance_examples_fail() {
     let cases = [
         ("workflow-invalid", "workflow_event_unknown"),
         ("workflow-invalid", "workflow_action_type_unknown"),
-        ("integrations-invalid", "integration_provider_invalid"),
-        ("integrations-invalid", "workflow_event_unknown"),
         ("guidance-invalid", "guidance_authority_invalid"),
     ];
     for (name, code) in cases {
@@ -1259,14 +1107,14 @@ fn json_status_emits_versioned_envelope() {
     assert_eq!(doc["ready"], true);
     assert_eq!(doc["project"], "minimal-example");
     assert_eq!(doc["profile"], "minimal");
-    assert_eq!(doc["modules"].as_array().unwrap().len(), 7);
+    assert_eq!(doc["modules"].as_array().unwrap().len(), 6);
     assert!(!doc["help"].as_array().unwrap().is_empty());
 }
 
 #[test]
 fn pre_distribution_lock_examples_are_preserved_and_rejected_before_launch() {
     for name in ["bundle-valid", "bundle-invalid"] {
-        let out = nopal(&["cli", "--dir", &example(name), "--json", "--dry-run"]);
+        let out = nopal(&["--dir", &example(name), "--json", "--dry-run"]);
         assert_eq!(out.status.code(), Some(1), "{name}: {out:?}");
         let doc = json(&out);
         assert_eq!(doc["ok"], false, "{name}: {doc}");
@@ -1490,7 +1338,7 @@ fn policy_decide_matches_golden_toon_and_exits_zero() {
         "--dir",
         &example("nopal"),
         "--mode",
-        "rondo_afk",
+        "unattended_auto",
         "--action",
         "git.push",
         "--class",
@@ -1515,7 +1363,7 @@ fn policy_evaluate_matches_golden_toon() {
         "--dir",
         &example("nopal"),
         "--mode",
-        "nopal_tui",
+        "supervised_auto",
         "--action",
         "fs.rm",
         "--class",
@@ -1524,7 +1372,7 @@ fn policy_evaluate_matches_golden_toon() {
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         stdout(&out),
-        include_str!("golden/policy-evaluate-tui-destructive.toon")
+        include_str!("golden/policy-evaluate-supervised-destructive.toon")
     );
 }
 
@@ -1555,7 +1403,7 @@ fn json_policy_decide_emits_versioned_envelope_with_explanations() {
         "--dir",
         &example("nopal"),
         "--mode",
-        "rondo_afk",
+        "unattended_auto",
         "--action",
         "git.push",
         "--class",
@@ -1568,7 +1416,7 @@ fn json_policy_decide_emits_versioned_envelope_with_explanations() {
     let doc = json(&out);
     assert_eq!(doc["kind"], "nopal.policy_decision/v1");
     assert_eq!(doc["ok"], true);
-    assert_eq!(doc["mode"], "rondo_afk");
+    assert_eq!(doc["mode"], "unattended_auto");
     assert_eq!(doc["decision"], "allow");
     assert_eq!(doc["decision_source"], "rule");
     assert_eq!(doc["placement"], "dedicated_run_runtime");
@@ -1637,7 +1485,7 @@ fn policy_with_invalid_policy_module_exits_one_with_policy_codes() {
         "--dir",
         &example("portable-bad-policy"),
         "--mode",
-        "rondo_afk",
+        "unattended_auto",
         "--action",
         "git.push",
         "--json",
@@ -1738,7 +1586,7 @@ fn policy_output_is_deterministic_across_runs() {
             "--dir",
             &nopal_example,
             "--mode",
-            "nopal_tui",
+            "supervised_auto",
             "--action",
             "shell.rm",
             "--class",
@@ -1760,7 +1608,7 @@ fn policy_output_is_deterministic_across_runs() {
             "--dir",
             &nopal_example,
             "--mode",
-            "rondo_afk",
+            "unattended_auto",
             "--action",
             "git.push",
             "--class",
@@ -1803,14 +1651,12 @@ fn info_json_reports_version_and_capabilities() {
     assert_eq!(
         capabilities,
         vec![
-            "ask",
             "doctor",
             "export",
             "gates",
             "import",
             "info",
             "ledger",
-            "placement",
             "policy",
             "preflights",
             "review-risk",
@@ -1819,7 +1665,6 @@ fn info_json_reports_version_and_capabilities() {
             "update",
             "validate",
             "verify",
-            "workflow",
         ]
     );
 }
@@ -1849,15 +1694,6 @@ fn info_exits_zero_without_a_nopal_directory() {
     let out = nopal(&["info", "--json", "--dir", &temp.path().to_string_lossy()]);
     assert_eq!(out.status.code(), Some(0));
     assert!(!temp.path().join(".nopal").exists());
-}
-
-#[test]
-fn herdr_bridge_help_documents_the_conservative_default_interval() {
-    let out = nopal(&["bridge", "herdr", "--help"]);
-    assert_eq!(out.status.code(), Some(0));
-    let help = stdout(&out);
-    assert!(help.contains("--interval <INTERVAL>"), "stdout: {help}");
-    assert!(help.contains("[default: 5]"), "stdout: {help}");
 }
 
 #[test]

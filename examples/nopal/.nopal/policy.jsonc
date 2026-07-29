@@ -1,9 +1,9 @@
 {
   // nopal.policy/v1: action decisions and runtime isolation placement.
-  // nopal_tui is the interactive field; rondo_afk is unattended execution.
+  // supervised_auto is interactive; unattended_auto is headless execution.
   "version": "nopal.policy/v1",
   "modes": {
-    "nopal_tui": {
+    "supervised_auto": {
       "default_decision": "ask",
       "default_placement": "shared_user_runtime",
       "rules": [
@@ -16,11 +16,11 @@
           "id": "deny-destructive",
           "classes": ["destructive"],
           "decision": "deny",
-          "reason": "destructive work never runs from the field"
+          "reason": "destructive work remains denied"
         }
       ]
     },
-    "rondo_afk": {
+    "unattended_auto": {
       "default_decision": "ask",
       "default_placement": "dedicated_repo_runtime",
       "rules": [

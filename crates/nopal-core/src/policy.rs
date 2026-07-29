@@ -1392,7 +1392,7 @@ mod tests {
     const VALID: &str = r#"{
         "version": "nopal.policy/v1",
         "modes": {
-            "rondo_afk": {
+            "unattended_auto": {
                 "default_decision": "ask",
                 "default_placement": "dedicated_repo_runtime",
                 "rules": [
@@ -1454,7 +1454,7 @@ mod tests {
         let eval = evaluate(
             &doc,
             &EvalRequest {
-                mode: Mode::parse("rondo_afk").unwrap(),
+                mode: Mode::parse("unattended_auto").unwrap(),
                 action: "git.push",
                 classes: &[ActionClass::Destructive],
                 env: &[],
@@ -1497,7 +1497,7 @@ mod tests {
         let eval = evaluate(
             &doc,
             &EvalRequest {
-                mode: Mode::parse("rondo_afk").unwrap(),
+                mode: Mode::parse("unattended_auto").unwrap(),
                 action: "fs.rm",
                 classes: &[ActionClass::Read, ActionClass::Destructive],
                 env: &[],
@@ -1513,7 +1513,7 @@ mod tests {
         let eval = evaluate(
             &doc,
             &EvalRequest {
-                mode: Mode::parse("rondo_afk").unwrap(),
+                mode: Mode::parse("unattended_auto").unwrap(),
                 action: "git.push",
                 classes: &[ActionClass::GitRemote],
                 env: &["API_TOKEN".to_owned(), "NOT_LISTED".to_owned()],
@@ -1539,7 +1539,7 @@ mod tests {
         let eval = evaluate(
             &doc,
             &EvalRequest {
-                mode: Mode::parse("rondo_afk").unwrap(),
+                mode: Mode::parse("unattended_auto").unwrap(),
                 action: "ticket.fetch",
                 classes: &[ActionClass::NetworkRead],
                 env: &[],
@@ -1681,7 +1681,7 @@ mod tests {
         let (doc, diags) = doc_from(VALID);
         assert_eq!(diags, vec![]);
         let eval_req = EvalRequest {
-            mode: Mode::parse("rondo_afk").unwrap(),
+            mode: Mode::parse("unattended_auto").unwrap(),
             action: "git.push",
             classes: &[ActionClass::GitRemote],
             env: &["API_TOKEN".to_owned()],

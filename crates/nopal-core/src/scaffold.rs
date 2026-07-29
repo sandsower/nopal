@@ -112,7 +112,8 @@ pub fn build_baseline(
       "source": {{ "type": "builtin", "package": "nopal" }},
       "requirement": "={}",
       "resources": [
-        {{ "kind": "extension", "path": "index.ts" }}
+        {{ "kind": "extension", "path": "extensions/policy-gate/index.ts" }},
+        {{ "kind": "skill", "path": "resources/beislid/skills" }}
       ]
     }}
   ]
@@ -594,11 +595,19 @@ mod tests {
     use super::*;
 
     fn write_adapter(root: &Path) {
-        fs::create_dir_all(root).unwrap();
-        fs::write(root.join("index.ts"), "export default 1;\n").unwrap();
-        fs::write(root.join("classifier.ts"), "export const classify = 1;\n").unwrap();
-        fs::write(root.join("guard.ts"), "export const guard = 1;\n").unwrap();
-        fs::write(root.join("nopal-cli.ts"), "export const cli = 1;\n").unwrap();
+        let adapter = root.join("extensions/policy-gate");
+        fs::create_dir_all(&adapter).unwrap();
+        fs::write(adapter.join("index.ts"), "export default 1;\n").unwrap();
+        fs::write(
+            adapter.join("classifier.ts"),
+            "export const classify = 1;\n",
+        )
+        .unwrap();
+        fs::write(adapter.join("guard.ts"), "export const guard = 1;\n").unwrap();
+        fs::write(adapter.join("nopal-cli.ts"), "export const cli = 1;\n").unwrap();
+        let skills = root.join("resources/beislid/skills/kickoff");
+        fs::create_dir_all(&skills).unwrap();
+        fs::write(skills.join("SKILL.md"), "# Kickoff\n").unwrap();
     }
 
     #[test]
@@ -633,7 +642,7 @@ mod tests {
     fn complete_baseline_creates_every_contract_file_and_a_valid_lock() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
-        let adapter = temp.path().join("distribution/extensions/policy-gate");
+        let adapter = temp.path().join("distribution");
         fs::create_dir_all(&root).unwrap();
         write_adapter(&adapter);
 
@@ -670,7 +679,7 @@ mod tests {
         })
         .unwrap();
         assert!(report.ok, "{:?}", report.diagnostics);
-        assert_eq!(report.resources.len(), 1);
+        assert_eq!(report.resources.len(), 2);
     }
 
     #[test]

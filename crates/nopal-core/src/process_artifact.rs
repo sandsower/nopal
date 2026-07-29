@@ -17,7 +17,6 @@ use crate::diagnostics::{self, Code, Diagnostic, Severity};
 use crate::discover;
 use crate::gates;
 use crate::guidance;
-use crate::integrations;
 use crate::policy;
 use crate::profile::{Module, Profile};
 use crate::review_policy;
@@ -352,7 +351,6 @@ fn validate_module(module: Module, value: &serde_json::Value, rel: &str) -> Vec<
         Module::Policy => policy::validate_document(value, rel).1,
         Module::Workflow => workflow::validate_document(value, rel),
         Module::Roots => roots::validate_document(value, rel),
-        Module::Integrations => integrations::validate_document(value, rel),
         Module::Guidance => guidance::validate_document(value, rel),
         Module::ReviewPolicy => review_policy::validate_document(value, rel).1,
     }

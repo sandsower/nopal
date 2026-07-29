@@ -615,7 +615,6 @@ const ECOSYSTEM_EXECUTORS: &[&str] = &[
     "rustfmt",
     "swift",
     "swiftc",
-    "tmux",
     "uv",
     "yarn",
 ];

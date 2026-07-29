@@ -1,6 +1,6 @@
 kind: nopal.policy_decision/v1
 ok: true
-mode: rondo_afk
+mode: unattended_auto
 action: git.push
 classes[2]: git_remote,secret_bearing
 env[2]{name,known,classes}:

@@ -7,8 +7,9 @@
 //! legacy contract. Domain problems (missing run, collision, bad status)
 //! come back as `ok: false` plus diagnostics; hard IO stays `Err`.
 
+use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ledger_json::Value;
 use nopal_ledger_json as ledger_json;
@@ -30,6 +31,7 @@ pub const LEDGER_CONTINUE_KIND: &str = "nopal.run_ledger.continue/v1";
 pub const LEDGER_FINALIZE_KIND: &str = "nopal.run_ledger.finalize/v1";
 pub const LEDGER_RESUME_KIND: &str = "nopal.run_ledger.resume/v1";
 pub const LEDGER_DASHBOARD_KIND: &str = "nopal.run_ledger.dashboard/v1";
+pub const DEFAULT_STALE_AFTER_HOURS: u64 = 24;
 
 fn split(result: Result<(), StoreError>) -> io::Result<Vec<Diagnostic>> {
     match result {
@@ -1018,9 +1020,8 @@ pub struct PruneArgs {
     pub apply: bool,
 }
 
-/// One incomplete, unfinalized run older than the staleness threshold - the
-/// same population `nopal field` counts in `stale_total` (see `field::is_stale`
-/// for the shared rule). `finalized` is only ever `true` under `--apply`.
+/// One incomplete, unfinalized run older than the staleness threshold.
+/// `finalized` is only ever `true` under `--apply`.
 #[derive(Debug, Clone, Serialize)]
 pub struct PruneCandidate {
     pub run_id: String,
@@ -1045,16 +1046,107 @@ pub struct PruneReport {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// Global, state-dir-wide scan (every repo, every flow - `dir` only resolves
-/// the state dir, exactly like `field_store::field_status`; unlike every other
-/// `nopal ledger` command, pruning is not scoped to one repo, since that is
-/// where the mess accumulates). Selects incomplete, unfinalized runs whose
-/// `updated_at` is at least `stale_after_hours` old - the identical rule
-/// `nopal field` uses for `stale` (`field::is_stale`), so the two surfaces
-/// always agree on what counts as stale. Dry-run (`apply: false`) never
-/// writes; `apply: true` finalizes each selected run as `interrupted`
-/// through the existing `record_finalize` plumbing (atomic write, lock,
-/// `finalized_at`) - no new run.json fields, no new statuses.
+fn sorted_directories(path: &Path) -> Vec<PathBuf> {
+    let mut directories = fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .filter(|path| path.is_dir())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    directories.sort();
+    directories
+}
+
+fn scan_all_run_entries(
+    state_dir: &Path,
+    warnings: &mut Vec<Diagnostic>,
+) -> io::Result<Vec<Value>> {
+    let mut runs = Vec::new();
+    let runs_root = state_dir.join("runs");
+    if !runs_root.is_dir() {
+        return Ok(runs);
+    }
+    for flow_dir in sorted_directories(&runs_root) {
+        for repo_dir in sorted_directories(&flow_dir) {
+            for run_dir in sorted_directories(&repo_dir) {
+                let run_file = run_dir.join("run.json");
+                if !run_file.is_file() {
+                    continue;
+                }
+                let entry = match store::read_json(&run_file) {
+                    Ok(entry) => entry,
+                    Err(StoreError::Domain(diagnostic)) => {
+                        warnings.push(Diagnostic::warning(
+                            crate::diagnostics::Code::LedgerEntryInvalid,
+                            run_file.display().to_string(),
+                            format!("skipping unreadable run file: {}", diagnostic.message),
+                        ));
+                        continue;
+                    }
+                    Err(StoreError::Io(error)) => {
+                        warnings.push(Diagnostic::warning(
+                            crate::diagnostics::Code::LedgerEntryInvalid,
+                            run_file.display().to_string(),
+                            format!("skipping unreadable run file: {error}"),
+                        ));
+                        continue;
+                    }
+                };
+                let status = entry.get("status").and_then(Value::as_str).unwrap_or("");
+                if Status::parse(status).is_none() {
+                    warnings.push(Diagnostic::warning(
+                        crate::diagnostics::Code::LedgerStatusInvalid,
+                        run_file.display().to_string(),
+                        format!(
+                            "skipping run with unknown status {status:?} (run-ledger-v1 statuses: running, interrupted, failed, completed)"
+                        ),
+                    ));
+                    continue;
+                }
+                runs.push(entry);
+            }
+        }
+    }
+    Ok(runs)
+}
+
+fn run_age_seconds(updated_at: &str, now_iso: &str) -> Option<i64> {
+    let now = core::epoch_from_iso(now_iso)?;
+    let updated = core::epoch_from_iso(updated_at)?;
+    Some(now.saturating_sub(updated))
+}
+
+fn run_age_hours(updated_at: &str, now_iso: &str) -> Option<u64> {
+    run_age_seconds(updated_at, now_iso)
+        .map(|seconds| u64::try_from(seconds.max(0) / 3600).unwrap_or(0))
+}
+
+fn run_is_stale(
+    status: Option<Status>,
+    finalized_at: &str,
+    updated_at: &str,
+    now_iso: &str,
+    stale_after_hours: u64,
+) -> bool {
+    let Some(status) = status else {
+        return false;
+    };
+    if !finalized_at.is_empty() || !status.is_incomplete() {
+        return false;
+    }
+    let threshold = i64::try_from(stale_after_hours)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(3600);
+    run_age_seconds(updated_at, now_iso).is_some_and(|age| age >= threshold)
+}
+
+/// Global, state-dir-wide scan across every repository and flow.
+/// Pruning is intentionally not scoped to one repository because stale run
+/// evidence accumulates independently of the caller's current worktree.
+/// Dry-run never writes, while apply finalizes selected runs as interrupted
+/// through the ordinary durable ledger transaction.
 pub fn ledger_prune(
     dir: &Path,
     state_dir: Option<&Path>,
@@ -1062,12 +1154,11 @@ pub fn ledger_prune(
 ) -> io::Result<PruneReport> {
     let env = LedgerEnv::discover(dir, state_dir);
     let mut warnings = Vec::new();
-    let runs = crate::field_store::scan_all_runs(&env.state_dir, &mut warnings)?;
+    let runs = scan_all_run_entries(&env.state_dir, &mut warnings)?;
     let now_iso = store::now_iso();
 
     let mut candidates: Vec<PruneCandidate> = Vec::new();
-    for run in &runs {
-        let entry = &run.entry;
+    for entry in &runs {
         let status_text = entry
             .get("status")
             .and_then(Value::as_str)
@@ -1084,7 +1175,7 @@ pub fn ledger_prune(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
-        if !crate::field::is_stale(
+        if !run_is_stale(
             status,
             &finalized_at,
             &updated_at,
@@ -1116,7 +1207,7 @@ pub fn ledger_prune(
                 .unwrap_or("")
                 .to_owned(),
             status: status_text,
-            age_hours: crate::field::age_hours(&updated_at, &now_iso).unwrap_or(0),
+            age_hours: run_age_hours(&updated_at, &now_iso).unwrap_or(0),
             updated_at,
             run_dir,
             finalized: false,
@@ -1719,20 +1810,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(again.selected, 0);
-
-        // And it must also be gone from field's default live view.
-        let field_report = crate::field_store::field_status(
-            &repo,
-            Some(&state),
-            None,
-            false,
-            crate::field::DEFAULT_STALE_AFTER_HOURS,
-        )
-        .unwrap();
-        assert_eq!(
-            field_report.total, 0,
-            "finalized run must leave the default field view immediately"
-        );
     }
 
     #[test]

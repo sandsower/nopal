@@ -15,7 +15,6 @@ use crate::diagnostics::{self, Code, Diagnostic};
 use crate::discover;
 use crate::gates;
 use crate::guidance;
-use crate::integrations;
 use crate::policy;
 use crate::profile::{Module, Profile};
 use crate::review_policy;
@@ -125,9 +124,6 @@ pub fn validate(root: &Path) -> io::Result<Validation> {
                         Module::Roots => {
                             all_diagnostics.extend(roots::validate_document(&value, &rel));
                         }
-                        Module::Integrations => {
-                            all_diagnostics.extend(integrations::validate_document(&value, &rel));
-                        }
                         Module::Guidance => {
                             all_diagnostics.extend(guidance::validate_document(&value, &rel));
                         }
@@ -162,6 +158,31 @@ pub fn validate(root: &Path) -> io::Result<Validation> {
             required,
             state,
         });
+    }
+
+    for (name, file_name) in [
+        ("field", "field.jsonc"),
+        ("plot", "plot.jsonc"),
+        ("session", "session.jsonc"),
+        ("rondo", "rondo.jsonc"),
+        ("memento", "memento.jsonc"),
+        ("herdr", "herdr.jsonc"),
+        ("integrations", "integrations.jsonc"),
+    ] {
+        let path = root.join(".nopal").join(file_name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => all_diagnostics.push(Diagnostic::error(
+                Code::ProductSurfaceRemoved,
+                format!(".nopal/{file_name}"),
+                format!(
+                    "removed v0.2 module file is not active configuration in v0.3; {}",
+                    config::removed_module_migration(name)
+                        .unwrap_or("remove this obsolete module file")
+                ),
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
 
     diagnostics::sort(&mut all_diagnostics);
@@ -309,6 +330,32 @@ mod tests {
     }
 
     #[test]
+    fn removed_module_files_fail_with_actionable_migration_diagnostics() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".nopal")).unwrap();
+        std::fs::write(
+            temp.path().join(".nopal/nopal.jsonc"),
+            r#"{"version":"nopal.project/v1","profile":"minimal"}"#,
+        )
+        .unwrap();
+        std::fs::write(temp.path().join(".nopal/field.jsonc"), "{}").unwrap();
+        std::fs::write(temp.path().join(".nopal/integrations.jsonc"), "{}").unwrap();
+
+        let validation = validate(temp.path()).unwrap();
+        assert!(!validation.ok());
+        assert_eq!(
+            codes(&validation),
+            vec![Code::ProductSurfaceRemoved, Code::ProductSurfaceRemoved]
+        );
+        assert!(validation.diagnostics[0].message.contains("bare `nopal`"));
+        assert!(
+            validation.diagnostics[1]
+                .message
+                .contains(".beislid/workflow.md")
+        );
+    }
+
+    #[test]
     fn invalid_workflow_module_reports_lifecycle_schema_errors() {
         let v = validate(&example("workflow-invalid")).unwrap();
         assert!(!v.ok());
@@ -321,18 +368,6 @@ mod tests {
         assert!(codes.contains(&Code::DuplicateId), "{codes:?}");
         assert!(codes.contains(&Code::FieldInvalid), "{codes:?}");
         assert_eq!(module_state(&v, Module::Workflow), ModuleFileState::Ok);
-    }
-
-    #[test]
-    fn invalid_integrations_module_reports_provider_errors() {
-        let v = validate(&example("integrations-invalid")).unwrap();
-        assert!(!v.ok());
-        let codes = codes(&v);
-        assert!(
-            codes.contains(&Code::IntegrationProviderInvalid),
-            "{codes:?}"
-        );
-        assert_eq!(module_state(&v, Module::Integrations), ModuleFileState::Ok);
     }
 
     #[test]

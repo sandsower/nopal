@@ -1,31 +1,33 @@
 # Notices
 
-This project includes or adapts ideas/code from:
+Nopal release archives include third-party runtime and workflow resources.
 
-## ifiokjr/oh-pi (`@ifi/oh-pi-extensions`)
+## Pi
 
-- Repository: https://github.com/ifiokjr/oh-pi/tree/main/packages/extensions
+- Package: `@earendil-works/pi-coding-agent` version `0.80.6`
+- Repository: https://github.com/badlogic/pi-mono
 - License: MIT
 
-`extensions/usage-tracker/` vendors and adapts the usage tracker from this package, narrowed to usage and quota tracking only, with GitHub Copilot quota probing added on top.
-It was previously ported through `sandsower/pi-extensions` (MIT, archived); see that repository's `LICENSE-notes.md` for the original adaptation notes.
+The complete Pi package and dependency closure is included under `runtime/pi`.
+Package-level license files remain alongside their package bytes.
 
-## nicobailon/pi-subagents
+## Node.js
 
-- Repository: https://github.com/nicobailon/pi-subagents
+- Version: `22.22.0`
+- Website: https://nodejs.org/
+- License: MIT and bundled third-party notices
+
+The official platform executable is included under `runtime/node`.
+Its upstream license is included as `Node-LICENSE`.
+
+## Beislið
+
+- Version: `0.4.16`
+- Source commit: `d7b6262ef1079f8a148dcfa3ca689c8f9c848220`
+- Repository: https://github.com/sandsower/beislid
 - License: MIT
 
-`extensions/subagent-runner/` adapts selected runner-hardening utilities and implementation ideas from `pi-subagents` v0.23.0: child-boundary runtime behavior, Pi spawn argument construction, atomic JSON writes, and post-exit stdio cleanup.
-Agents, roles, chains, manager UI, intercom, worktrees, and upstream slash-command surfaces were not adopted.
-It was previously ported through `sandsower/pi-extensions` (MIT, archived); see that repository's `LICENSE-notes.md` for the original adaptation notes.
-
-## Rondo
-
-- Repository: https://github.com/sandsower/rondo
-- License: Apache-2.0
-
-Release archives bundle a version-pinned Rondo executable.
-The archive includes its complete license and notice as `Rondo-LICENSE` and `Rondo-NOTICE`.
+Pinned skill resources, their source provenance, and the upstream license are included under `share/nopal/resources/beislid`.
 
 ## Rust dependencies
 

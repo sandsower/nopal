@@ -1,4 +1,0 @@
-{"kind":"nopal.session.subscribe/v1","request_id":"request-missing-cursor","plot_id":"plot-fixture","session_id":"session-fixture","page_limit":256}
-{"kind":"nopal.session.subscribe/v1","request_id":"request-too-large","plot_id":"plot-fixture","session_id":"session-fixture","after_cursor":null,"page_limit":1025}
-{"kind":"nopal.session.replay_complete/v1","request_id":"request-impossible-empty","plot_id":"plot-fixture","session_id":"session-fixture","stream_id":"stream-fixture","cursor":null,"sequence":1,"event_count":0}
-{"kind":"nopal.session.feed_error/v1","request_id":"request-half-context","plot_id":"plot-fixture","session_id":null,"code":"history_gap","retryable":false,"message":"Incomplete identity must fail."}

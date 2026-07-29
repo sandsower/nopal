@@ -268,7 +268,29 @@ fn profile_required_modules(
 
     let mut modules = Vec::new();
     for item in items {
-        match item.as_str().and_then(Module::parse) {
+        let Some(name) = item.as_str() else {
+            diagnostics.push(Diagnostic::error(
+                Code::FieldInvalid,
+                path,
+                format!(
+                    "profiles.{profile_name}.required_modules contains unknown module {:?}; expected one of {}",
+                    item,
+                    Module::known_names()
+                ),
+            ));
+            continue;
+        };
+        if let Some(migration) = removed_module_migration(name) {
+            diagnostics.push(Diagnostic::error(
+                Code::ProductSurfaceRemoved,
+                path,
+                format!(
+                    "profiles.{profile_name}.required_modules still names removed v0.2 module {name:?}; {migration}"
+                ),
+            ));
+            continue;
+        }
+        match Module::parse(name) {
             Some(module) if !modules.contains(&module) => modules.push(module),
             Some(_) => {}
             None => diagnostics.push(Diagnostic::error(
@@ -283,6 +305,21 @@ fn profile_required_modules(
         }
     }
     Some(modules)
+}
+
+pub(crate) fn removed_module_migration(name: &str) -> Option<&'static str> {
+    match name {
+        "field" | "plot" | "session" => {
+            Some("remove the module and use bare `nopal` for an enforced Pi session")
+        }
+        "rondo" | "memento" | "herdr" => Some(
+            "remove the module; optional external profiles are not part of the v0.3 distribution",
+        ),
+        "integrations" => Some(
+            "keep tracker, review, and lifecycle integration meaning in `.beislid/workflow.md`",
+        ),
+        _ => None,
+    }
 }
 
 fn known_profiles() -> String {
@@ -364,6 +401,25 @@ mod tests {
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_eq!(manifest.unwrap().required_modules, vec![Module::Roots]);
+    }
+
+    #[test]
+    fn removed_required_module_has_an_actionable_migration_diagnostic() {
+        let text = r#"{
+            "version": "nopal.project/v1",
+            "profile": "custom",
+            "profiles": { "custom": { "required_modules": ["field", "integrations"] } }
+        }"#;
+        let (_, diagnostics) = parse_manifest(text, ".nopal/nopal.jsonc");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            vec![Code::ProductSurfaceRemoved, Code::ProductSurfaceRemoved]
+        );
+        assert!(diagnostics[0].message.contains("bare `nopal`"));
+        assert!(diagnostics[1].message.contains(".beislid/workflow.md"));
     }
 
     #[test]

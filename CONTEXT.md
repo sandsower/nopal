@@ -11,7 +11,7 @@ The bundled Pi adapter mediates protected tool calls and executes selected gates
 **Nopal**:
 The distribution users launch with bare `nopal`.
 It validates the effective contract, initializes enforcement, and starts Pi directly.
-_Avoid_: Field, Cockpit, dashboard, agent manager, session registry, coordination product
+_Avoid_: adding a second interaction surface, process dashboard, or agent manager
 
 **Pi**:
 The host and interaction surface for sessions, models, prompts, tools, and agent loops.
@@ -29,7 +29,7 @@ It never executes gate or protected-action commands.
 _Avoid_: duplicating decision semantics in TypeScript, skills, or host prompts
 
 **Pi enforcement adapter**:
-The bundled extension that intercepts Pi tool calls, asks Nopal Core for an enforcement plan, executes exactly the selected gates, records their outcomes, and blocks or releases the original call.
+The bundled extension that intercepts Pi tool calls, asks the Nopal CLI for a Core-authored enforcement plan, delegates selected gate execution to the confined CLI adapter, and blocks or releases the original call.
 It remains active for the complete Nopal-launched Pi session and has no disable switch.
 _Avoid_: policy caches that outlive their inputs, bypass toggles, or extension-local authority
 
@@ -50,7 +50,7 @@ _Avoid_: precedence rules where a repository allow overrides a user deny
 
 **Protected action**:
 A Pi tool call whose stable action identity or class requires deterministic mediation before execution.
-The first v0.3 walking skeleton protects Git remote writes, distinguishing normal push from force push.
+The v0.3 distribution protects every supported Pi tool call and distinguishes normal push from force push.
 _Avoid_: relying on a skill to remember to ask before invoking the tool
 
 **Gate**:
@@ -75,14 +75,14 @@ _Avoid_: a separate advisory detector whose conclusions can drift from generated
 
 **Gate receipt**:
 Durable, session-authenticated evidence that one exact gate definition passed against one effective contract and one workspace content fingerprint.
-The receipt capability is ephemeral, stored in a mode-0600 protected run file, and never enters Pi extension state, subprocess arguments, project data, or ledger events.
+The receipt capability is ephemeral, delivered through anonymous one-shot channels, and never enters gate environments, subprocess arguments, project data, or ledger events.
 A workspace, contract, or gate-definition change makes the receipt stale or rejects the in-flight result.
 _Avoid_: session-wide booleans, command-string caches, or receipts detached from repository content
 
 **Workflow Run Ledger**:
 The bounded durable record of a Nopal-launched Pi session's action decisions, gate attempts, receipts, checkpoints, interruption, and outcome.
 It is an evidence surface, not a dashboard or session-management product.
-_Avoid_: rebuilding Field state, coordination feeds, or a daemon around the ledger
+_Avoid_: rebuilding process management, coordination feeds, or a daemon around the ledger
 
 **Enforcement coverage**:
 The guarantees actually mediated by a Nopal-launched Pi session.
@@ -105,7 +105,7 @@ _Avoid_: retroactively describing external work as enforced
 - A protected action cannot run with missing, failed, stale, or unauthenticated required gate evidence.
 - Decisions, attempts, and receipts are durably recorded.
 - Enforcement has no session bypass or daemon dependency.
-- Field, Cockpit, desktop, Plot coordination, Rondo, Memento, and Herdr are outside the v0.3 product.
+- Removed management and coordination surfaces have no active runtime, alias, archive member, or configuration authority in v0.3.
 
 ## Example dialogue
 
@@ -120,5 +120,7 @@ _Avoid_: retroactively describing external work as enforced
 - The default distribution consists of Pi, Beislið, the Nopal CLI and enforcement adapter, and curated resources.
 - Bare launch is offline and deterministic.
 - Network synchronization and updates are explicit commands rather than launch side effects.
-- The active source tree removes superseded management and integration code before v0.3 ships.
+- The active source tree and release archives contain no superseded management or integration implementation.
 - Git history and a pre-reset marker preserve the former implementation without runtime compatibility aliases.
+- A plain Pi session started outside `nopal` carries no Nopal enforcement guarantee.
+- Release archives contain exact Pi and Node runtime bytes, the policy adapter, and pinned Beislið skills.

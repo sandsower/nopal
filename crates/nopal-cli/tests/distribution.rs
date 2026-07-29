@@ -450,9 +450,7 @@ fn repository_wide_typed_beislid_gate_unblocks_explicit_v1_nopal_gates() {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q"]);
-    let adapter = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("extensions/policy-gate");
+    let adapter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     nopal_core::scaffold::write_baseline(
         &repo,
         nopal_core::distribution::BuiltinDistribution {
@@ -489,9 +487,7 @@ fn selector_scoped_gate_does_not_unblock_unknown_generated_gates() {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q"]);
-    let adapter = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("extensions/policy-gate");
+    let adapter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     nopal_core::scaffold::write_baseline(
         &repo,
         nopal_core::distribution::BuiltinDistribution {
@@ -544,9 +540,7 @@ fn preflight_only_configuration_does_not_unblock_unknown_generated_gates() {
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q"]);
-    let adapter = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("extensions/policy-gate");
+    let adapter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     nopal_core::scaffold::write_baseline(
         &repo,
         nopal_core::distribution::BuiltinDistribution {
@@ -630,9 +624,7 @@ fn generated_gate_evidence_drift_blocks_launch_until_explicit_authority_exists()
     fs::create_dir_all(&repo).unwrap();
     git(&repo, &["init", "-q"]);
     fs::write(repo.join("Cargo.toml"), "[workspace]\nmembers=[]\n").unwrap();
-    let adapter = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("extensions/policy-gate");
+    let adapter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     nopal_core::scaffold::write_baseline(
         &repo,
         nopal_core::distribution::BuiltinDistribution {
@@ -764,9 +756,7 @@ fn partial_beislid_nopal_and_legacy_states_are_preserved_and_rejected() {
     let invalid = temp.path().join("invalid");
     fs::create_dir_all(&invalid).unwrap();
     git(&invalid, &["init", "-q"]);
-    let adapter = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("extensions/policy-gate");
+    let adapter = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     nopal_core::scaffold::write_baseline(
         &invalid,
         nopal_core::distribution::BuiltinDistribution {
@@ -903,7 +893,7 @@ fn workspace_update_previews_then_writes_exact_lock_and_sync_never_rewrites_it()
       "id": "nopal",
       "source": {{ "type": "builtin", "package": "nopal" }},
       "requirement": "={}",
-      "resources": [{{ "kind": "extension", "path": "index.ts" }}]
+      "resources": [{{ "kind": "extension", "path": "extensions/policy-gate/index.ts" }}]
     }},
     {{
       "id": "guidance",
@@ -991,7 +981,7 @@ fn npm_update_and_sync_verify_sri_extract_safely_and_repair_the_exact_store() {
       "id": "nopal",
       "source": {{ "type": "builtin", "package": "nopal" }},
       "requirement": "={}",
-      "resources": [{{ "kind": "extension", "path": "index.ts" }}]
+      "resources": [{{ "kind": "extension", "path": "extensions/policy-gate/index.ts" }}]
     }},
     {{
       "id": "review-guidance",

@@ -37,19 +37,17 @@ pub enum Module {
     Policy,
     Workflow,
     Roots,
-    Integrations,
     Guidance,
     ReviewPolicy,
 }
 
 impl Module {
     /// Declaration order is the canonical display/report order.
-    pub const ALL: [Module; 7] = [
+    pub const ALL: [Module; 6] = [
         Module::Gates,
         Module::Policy,
         Module::Workflow,
         Module::Roots,
-        Module::Integrations,
         Module::Guidance,
         Module::ReviewPolicy,
     ];
@@ -60,7 +58,6 @@ impl Module {
             "policy" => Some(Module::Policy),
             "workflow" => Some(Module::Workflow),
             "roots" => Some(Module::Roots),
-            "integrations" => Some(Module::Integrations),
             "guidance" => Some(Module::Guidance),
             "review_policy" => Some(Module::ReviewPolicy),
             _ => None,
@@ -81,7 +78,6 @@ impl Module {
             Module::Policy => "policy",
             Module::Workflow => "workflow",
             Module::Roots => "roots",
-            Module::Integrations => "integrations",
             Module::Guidance => "guidance",
             Module::ReviewPolicy => "review_policy",
         }
@@ -93,7 +89,6 @@ impl Module {
             Module::Policy => "policy.jsonc",
             Module::Workflow => "workflow.jsonc",
             Module::Roots => "roots.jsonc",
-            Module::Integrations => "integrations.jsonc",
             Module::Guidance => "guidance.jsonc",
             Module::ReviewPolicy => "review_policy.jsonc",
         }

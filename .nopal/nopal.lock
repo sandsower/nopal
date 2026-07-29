@@ -1,6 +1,6 @@
 {
   "version": "nopal.lock/v1",
-  "contract_digest": "sha256:8d9315c200abb3e735975c54439e1c6f983bb32349f08561a2e9bc3084d93736",
+  "contract_digest": "sha256:ab00a08429217e283f257d6670461b93e6e877495bd837c4db01712188d3f3d4",
   "packages": [
     {
       "id": "nopal",
@@ -9,13 +9,18 @@
         "package": "nopal"
       },
       "resolved": "0.2.21",
-      "artifact_integrity": "sha256:7ccef3d3cf2bf20729b4963b54f7454a19cb9e0ef6e2217f4753f55fc520b4bc",
-      "installed_tree_integrity": "sha256:7ccef3d3cf2bf20729b4963b54f7454a19cb9e0ef6e2217f4753f55fc520b4bc",
+      "artifact_integrity": "sha256:9257a89165f90cd979e6996b073532d7176437b18a8d9537e5fa7c95e8ecfdb9",
+      "installed_tree_integrity": "sha256:9257a89165f90cd979e6996b073532d7176437b18a8d9537e5fa7c95e8ecfdb9",
       "resources": [
         {
           "kind": "extension",
-          "path": "index.ts",
+          "path": "extensions/policy-gate/index.ts",
           "tree_integrity": "sha256:aca7080638a0adf4b800ec266bb6a4146be0cef2bb12a3eaff4d1be6d557d89a"
+        },
+        {
+          "kind": "skill",
+          "path": "resources/beislid/skills",
+          "tree_integrity": "sha256:ea9f637668a4b1a4e9024b3a7601b7ac67574103185ce3cab340dabf73ff9e6e"
         }
       ]
     }

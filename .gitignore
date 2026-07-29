@@ -1,4 +1,7 @@
 /target
+/_runtime/
+/dist/
+/THIRD_PARTY_LICENSES.html
 /Nopal.app/
 /Nopal-linux/
 /.nopal/*

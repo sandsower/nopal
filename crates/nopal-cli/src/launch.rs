@@ -558,7 +558,8 @@ mod tests {
     use std::fs;
 
     fn context<'a>(temp: &'a tempfile::TempDir) -> LaunchContext<'a> {
-        let adapter = temp.path().join("distribution/extensions/policy-gate");
+        let distribution = temp.path().join("distribution");
+        let adapter = distribution.join("extensions/policy-gate");
         fs::create_dir_all(&adapter).unwrap();
         fs::write(adapter.join("index.ts"), "export default 1;\n").unwrap();
         fs::write(
@@ -568,7 +569,10 @@ mod tests {
         .unwrap();
         fs::write(adapter.join("guard.ts"), "export const guard = 1;\n").unwrap();
         fs::write(adapter.join("nopal-cli.ts"), "export const cli = 1;\n").unwrap();
-        let leaked = Box::leak(Box::new(adapter));
+        let skill = distribution.join("resources/beislid/skills/kickoff/SKILL.md");
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(skill, "# Kickoff\n").unwrap();
+        let leaked = Box::leak(Box::new(distribution));
         LaunchContext {
             store_root: temp.path(),
             builtin: BuiltinDistribution {
@@ -586,7 +590,7 @@ mod tests {
         assert!(!plan.ok);
         assert_eq!(plan.scaffold, Scaffold::WouldCreate);
         assert_eq!(plan.bundle.packages.len(), 1);
-        assert_eq!(plan.bundle.resources.len(), 1);
+        assert_eq!(plan.bundle.resources.len(), 2);
         assert!(plan.pi_argv.is_empty());
         assert!(
             plan.diagnostics

@@ -1,3 +1,0 @@
-{"kind":"nopal.session.subscribe/v1","request_id":"request-resume","plot_id":"plot-fixture","session_id":"session-fixture","after_cursor":"cursor-fixture-2","page_limit":64}
-{"kind":"nopal.session.event/v2","event_id":"event-assistant","plot_id":"plot-fixture","session_id":"session-fixture","stream_id":"stream-fixture","sequence":3,"previous_cursor":"cursor-fixture-2","cursor":"cursor-fixture-3","command_id":"command-fixture","event":{"type":"assistant_message","text":"History restored."}}
-{"kind":"nopal.session.replay_complete/v1","request_id":"request-resume","plot_id":"plot-fixture","session_id":"session-fixture","stream_id":"stream-fixture","cursor":"cursor-fixture-3","sequence":3,"event_count":1}

@@ -2,14 +2,13 @@ kind: nopal.status/v1
 project: portable-missing-policy
 profile: portable
 ready: false
-modules[7]{name,required,state}:
+modules[6]{name,required,state}:
   gates,true,ok
   policy,true,missing
   workflow,false,absent
   roots,false,absent
-  integrations,false,absent
   guidance,false,absent
   review_policy,false,absent
-missing_modules[1]: policy
-diagnostics: 1
+diagnostics[1]{severity,code,path,position,message}:
+  error,module_missing,.nopal/policy.jsonc,-,"profile \"portable\" requires .nopal/policy.jsonc"
 help[1]: create .nopal/policy.jsonc

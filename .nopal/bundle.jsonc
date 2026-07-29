@@ -1,15 +1,15 @@
 {
-  // Nopal's dogfood contract permits ambient prose skills, but executable
-  // extension authority remains confined to the byte-verified Nopal adapter.
+  // Every Pi resource comes from this byte-locked distribution.
+  // Ambient packages and resources are not part of Nopal's guarantee.
   "version": "nopal.bundle/v2",
-  "inherit_ambient": ["skills"],
   "packages": [
     {
       "id": "nopal",
       "source": { "type": "builtin", "package": "nopal" },
       "requirement": "=0.2.21",
       "resources": [
-        { "kind": "extension", "path": "index.ts" }
+        { "kind": "extension", "path": "extensions/policy-gate/index.ts" },
+        { "kind": "skill", "path": "resources/beislid/skills" }
       ]
     }
   ]

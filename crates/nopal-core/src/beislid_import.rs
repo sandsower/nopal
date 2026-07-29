@@ -17,7 +17,6 @@ use crate::config;
 use crate::diagnostics::{self, Code, Diagnostic, Position, Severity};
 use crate::gates;
 use crate::guidance;
-use crate::integrations;
 use crate::policy;
 use crate::review_policy;
 use crate::toon::{self, Value as ToonValue};
@@ -26,8 +25,7 @@ use crate::workflow;
 pub const BEISLID_IMPORT_KIND: &str = "nopal.beislid_import/v1";
 
 const DEFAULT_SOURCE: &str = ".beislid/workflow.md";
-const MANAGED_OUTPUTS: [(&str, &str); 6] = [
-    ("integrations", "integrations.jsonc"),
+const MANAGED_OUTPUTS: [(&str, &str); 5] = [
     ("gates", "gates.jsonc"),
     ("policy", "policy.jsonc"),
     ("workflow", "workflow.jsonc"),
@@ -447,13 +445,11 @@ fn build_modules(
     path: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<DraftModule> {
-    let mut integrations_doc = object_with_version(integrations::INTEGRATIONS_KIND);
     let mut gates_doc = object_with_version(gates::GATES_KIND);
     let mut policy_doc = object_with_version(policy::POLICY_KIND);
     let mut workflow_doc = object_with_version(workflow::WORKFLOW_KIND);
     let mut guidance_doc = object_with_version(guidance::GUIDANCE_KIND);
     let mut review_policy_doc = object_with_version(review_policy::REVIEW_POLICY_KIND);
-    let mut has_integrations = false;
     let mut has_gates = false;
     let mut has_policy = false;
     let mut has_workflow = false;
@@ -477,35 +473,14 @@ fn build_modules(
             continue;
         }
         match block.key.as_str() {
-            "ticket_source" => {
-                has_integrations = true;
-                let value = flat_map_block(block, path, diagnostics);
-                put_nested(&mut integrations_doc, &["tracker", "ticket_source"], value);
-            }
-            "ticket_update" => {
-                has_integrations = true;
-                let value = flat_map_block(block, path, diagnostics);
-                put_nested(&mut integrations_doc, &["tracker", "ticket_update"], value);
-            }
-            "pr_review_source" => {
-                has_integrations = true;
-                let value = flat_map_block(block, path, diagnostics);
-                put_nested(&mut integrations_doc, &["pr_reviews", "source"], value);
-            }
-            "pr_review_update" => {
-                has_integrations = true;
-                let value = flat_map_block(block, path, diagnostics);
-                put_nested(&mut integrations_doc, &["pr_reviews", "update"], value);
-            }
-            "probe_cache" => {
-                has_integrations = true;
-                let value = flat_map_block(block, path, diagnostics);
-                put_nested(&mut integrations_doc, &["probe_cache"], value);
-            }
-            "model_routing" => {
-                has_integrations = true;
-                let value = yaml_like_block(block, path, diagnostics);
-                put_nested(&mut integrations_doc, &["model_routing"], value);
+            "ticket_source" | "ticket_update" | "pr_review_source" | "pr_review_update"
+            | "probe_cache" | "model_routing" | "visual_surfaces" | "workflow_signals" => {
+                unsupported_block(
+                    block,
+                    path,
+                    diagnostics,
+                    "host integration remains Beislið-owned and is not emitted as Nopal configuration",
+                );
             }
             "gates" => {
                 has_gates = true;
@@ -538,25 +513,14 @@ fn build_modules(
                     Value::Object(events),
                 );
             }
-            "plot_establishment" => {
-                has_workflow = true;
-                let value = yaml_like_block(block, path, diagnostics);
-                put_nested(&mut workflow_doc, &["establishment"], value);
-            }
-            "visual_surfaces" => {
-                has_integrations = true;
-                integrations_doc.insert(
-                    "visual_surfaces".to_owned(),
-                    yaml_like_block(block, path, diagnostics),
-                );
-            }
-            "workflow_signals" => {
-                has_integrations = true;
-                integrations_doc.insert(
-                    "workflow_signals".to_owned(),
-                    yaml_like_block(block, path, diagnostics),
-                );
-            }
+            "plot_establishment" => diagnostics.push(
+                Diagnostic::error(
+                    Code::ProductSurfaceRemoved,
+                    path,
+                    "block \"plot_establishment\" belongs to the removed v0.2 Plot/Session product; delete it and use bare `nopal` for enforced Pi sessions",
+                )
+                .with_position(block.line, 1),
+            ),
             "guidance" | "hints" => {
                 has_guidance = true;
                 guidance_doc.insert(
@@ -625,13 +589,6 @@ fn build_modules(
     }
 
     let mut modules = Vec::new();
-    if has_integrations {
-        modules.push(DraftModule {
-            name: "integrations",
-            filename: "integrations.jsonc",
-            value: Value::Object(integrations_doc),
-        });
-    }
     if has_gates {
         modules.push(DraftModule {
             name: "gates",
@@ -690,28 +647,6 @@ fn put_nested(root: &mut Map<String, Value>, path: &[&str], value: Value) {
         }
         current.insert((*last).to_owned(), value);
     }
-}
-
-fn flat_map_block(block: &Block, path: &str, diagnostics: &mut Vec<Diagnostic>) -> Value {
-    let mut obj = Map::new();
-    for (offset, raw) in block.body.lines().enumerate() {
-        let Some(line) = meaningful_line(raw) else {
-            continue;
-        };
-        if let Some((key, value)) = split_key_value(line) {
-            obj.insert(key.to_owned(), scalar(value));
-        } else {
-            diagnostics.push(
-                Diagnostic::error(
-                    Code::BeislidImportParseError,
-                    path,
-                    format!("block {:?}: expected key: value line", block.key),
-                )
-                .with_position(block.line + offset + 1, 1),
-            );
-        }
-    }
-    Value::Object(obj)
 }
 
 fn nested_yaml_block(block: &Block, path: &str, diagnostics: &mut Vec<Diagnostic>) -> Value {
@@ -1440,7 +1375,6 @@ fn validate_draft_module(
 ) {
     let path = rel_string(&output_dir.join(module.filename));
     let module_diagnostics = match module.name {
-        "integrations" => integrations::validate_document(&module.value, &path),
         "gates" => gates::validate_document(&module.value, &path).1,
         "policy" => policy::validate_document(&module.value, &path).1,
         "workflow" => workflow::validate_document(&module.value, &path),

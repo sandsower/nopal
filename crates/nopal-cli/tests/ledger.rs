@@ -800,7 +800,7 @@ fn prune_dry_run_lists_stale_runs_without_writing() {
 }
 
 #[test]
-fn prune_apply_finalizes_and_the_run_disappears_from_field() {
+fn prune_apply_finalizes_the_selected_run() {
     let (_tmp, repo, state) = setup();
     nopal_env(
         &repo,
@@ -827,16 +827,6 @@ fn prune_apply_finalizes_and_the_run_disappears_from_field() {
         serde_json::from_str(&fs::read_to_string(run_dir.join("run.json")).unwrap()).unwrap();
     assert_eq!(run["status"], "interrupted");
     assert!(run["finalized_at"].as_str().is_some());
-
-    // Gone from the default field view even though prune just bumped
-    // updated_at to "now" - closed-ness, not staleness, excludes it.
-    let field = nopal_env(
-        &repo,
-        &state,
-        &["field", "inspect", "--json"],
-        &[("NOPAL_LEDGER_TEST_EPOCH", T0_PLUS_25H)],
-    );
-    assert_eq!(json(&field)["total"], 0);
 }
 
 // ---------------------------------------------------------------------------
