@@ -14,6 +14,7 @@ Installation, intentional update, rollback, and offline launch need direct and i
 ## Decision
 
 Each supported platform receives one deterministic `tar.gz` archive containing the Nopal CLI, official Node.js `22.22.0`, exact Pi `0.80.6` and its complete dependency tree, the Nopal policy adapter, pinned Beislið skills, licenses, provenance, and installer material.
+The x86-64 GNU/Linux archive targets glibc 2.35 or newer, is built on Ubuntu 22.04, and must launch successfully on the pinned Debian 12 compatibility image before publication.
 The archive contains no former management UI, native desktop runtime, coordination protocol, compatibility executable, or unrelated Pi extension.
 
 The release workflow downloads Node from the official release archive and verifies its platform archive digest before staging the executable and license.

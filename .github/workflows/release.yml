@@ -81,7 +81,7 @@ jobs:
             node_archive: node-v22.22.0-darwin-x64.tar.gz
             node_archive_sha256: 5ea50c9d6dea3dfa3abb66b2656f7a4e1c8cef23432b558d45fb538c7b5dedce
             pi_runtime_integrity: sha256:2a49edc0cbfae11a095051da5d6d79cd994c85c555ee4f24c74ec3700ef34b4e
-          - runner: ubuntu-24.04
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             node_archive: node-v22.22.0-linux-x64.tar.gz
             node_archive_sha256: c33c39ed9c80deddde77c960d00119918b9e352426fd604ba41638d6526a4744
@@ -172,6 +172,25 @@ jobs:
           installed/bin/nopal info --json >/dev/null
           scripts/prove-packaged-launch.sh "$PWD/installed/bin/nopal"
           scripts/check-release-archive.sh "$archive"
+      - name: Prove Debian 12 Linux compatibility
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD:/workspace:ro" \
+            -e RELEASE_TAG="$RELEASE_TAG" \
+            -w /workspace \
+            debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 \
+            sh -ceu '
+              apt-get update -qq
+              DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git python3 findutils >/dev/null
+              archive=/workspace/dist/nopal-$RELEASE_TAG-x86_64-unknown-linux-gnu.tar.gz
+              root=$(tar -tzf "$archive" | head -1 | sed "s:/$::")
+              mkdir /tmp/nopal-unpacked /tmp/nopal-installed
+              tar -xzf "$archive" -C /tmp/nopal-unpacked
+              "/tmp/nopal-unpacked/$root/install" install /tmp/nopal-installed
+              git config --system url.https://github.com/.insteadOf git://github.com/
+              /workspace/scripts/prove-packaged-launch.sh /tmp/nopal-installed/bin/nopal
+            '
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: nopal-${{ matrix.target }}
