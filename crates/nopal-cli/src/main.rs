@@ -1,27 +1,22 @@
-//! `nopal` - deterministic AXI-style CLI and coordinator over nopal-core.
+//! `nopal` - deterministic enforcement and distribution CLI over nopal-core.
 //!
-//! Exit codes: 0 = success / ready enough to report, 1 = validation found
-//! errors (for policy commands: the policy module is missing or invalid;
-//! for ledger commands: a domain problem such as a missing run), 2 = usage
-//! or IO failure. Policy verdicts live in the payload, never in the exit
-//! code: nopal decides and explains, it does not gate.
+//! Exit codes: 0 = success, 1 = a valid blocking domain outcome, and 2 =
+//! malformed authority, infrastructure, or effect failure. Policy verdicts
+//! live in versioned payloads rather than being encoded as exit statuses.
 //!
-//! Cold commands (validate, gates, preflights, policy, info) never contact
-//! agents or external services. Commands that consume a project root resolve
-//! it through `discover::project_root`, which probes Git once to find the
-//! enclosing repository. Bare invocation is deliberately warm: it validates
-//! the launch and effective enforcement contracts, initializes a Workflow Run
-//! Ledger entry, and replaces itself with Pi. The hidden Field and `nopal cli`
-//! routes remain temporary implementation residue until the v0.3 removal
-//! slice; they are not public launch surfaces.
+//! Inspection commands never contact agents or external services. Commands
+//! that consume a project root resolve it through `discover::project_root`,
+//! which probes Git once to find the enclosing repository. Bare invocation is
+//! deliberately warm: it validates launch and enforcement contracts,
+//! initializes Workflow Run Ledger evidence, and replaces itself with Pi.
+//! Removed command shapes stop at migration diagnostics and never dispatch a
+//! compatibility runtime.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use nopal_core::ask::{AskState, Resolution};
-use nopal_core::ask_report as ask;
-use nopal_core::ask_store::RaiseArgs;
 use nopal_core::beislid_import::{self, ImportOptions};
 use nopal_core::discover;
 use nopal_core::enforcement;
@@ -33,12 +28,10 @@ use nopal_core::scaffold;
 use nopal_core::{gates::GateStage, policy};
 use sha2::{Digest as _, Sha256};
 
-mod coordinator;
 mod distribution_adapter;
 mod doctor;
 mod enforcement_adapter;
 mod gate_executor;
-mod herdr_bridge;
 mod info;
 mod launch;
 mod verification;
@@ -81,9 +74,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Deprecated internal spelling for the canonical bare launch
+    /// Removed internal spelling retained only as a migration diagnostic
     #[command(hide = true)]
-    Cli(CliLaunchArgs),
+    Cli(RemovedCommandArgs),
     /// Materialize and verify the exact checked-in distribution lock
     Sync,
     /// Resolve the distribution contract into an exact lock proposal
@@ -142,180 +135,55 @@ enum Cmd {
         #[command(subcommand)]
         command: LedgerCmd,
     },
-    /// Persist and resolve `ask` policy decisions cross-session (nopal.ask/v1)
-    Ask {
-        /// Ask state root; beats BEISLID_STATE_DIR and the XDG default
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
-
-        #[command(subcommand)]
-        command: AskCmd,
-    },
-    /// Legacy Plot coordination retained only until the removal slice
+    /// Removed cross-session approval surface retained only as a migration diagnostic
     #[command(hide = true)]
-    Plot {
-        #[command(subcommand)]
-        command: PlotCmd,
-    },
-    /// Legacy host bridge retained only until the removal slice
+    Ask(RemovedCommandArgs),
+    /// Removed Plot surface retained only as a migration diagnostic
     #[command(hide = true)]
-    Bridge {
-        #[command(subcommand)]
-        command: BridgeCmd,
-    },
+    Plot(RemovedCommandArgs),
+    /// Removed host bridge retained only as a migration diagnostic
+    #[command(hide = true)]
+    Bridge(RemovedCommandArgs),
     /// Review-risk seam: risk class, fast-path eligibility, and split verdict
     /// from changed files/stats/thresholds (nopal.review_risk/v1)
     ReviewRisk(ReviewRiskArgs),
-    /// Legacy management surface retained only until the removal slice
+    /// Removed v0.2 product surface retained only as a migration diagnostic
     #[command(hide = true)]
-    Field(nopal_field::cli::FieldArgs),
+    Field(RemovedCommandArgs),
     /// Show Nopal readiness and missing modules through the Nopal product surface
     Status,
     /// Machine-readable version + capability report (nopal.info/v1)
     Info,
-    /// Explain the runtime placement Nopal would use for an action
-    Placement(CoordinatorPlacementArgs),
-    /// Legacy Rondo service retained only until the removal slice
+    /// Removed placement alias retained only as a migration diagnostic
     #[command(hide = true)]
-    Rondo {
-        #[command(subcommand)]
-        command: RondoCmd,
-    },
-    /// Legacy run coordination retained only until the removal slice
+    Placement(RemovedCommandArgs),
+    /// Removed Rondo service retained only as a migration diagnostic
     #[command(hide = true)]
-    Run {
-        #[command(subcommand)]
-        command: RunCmd,
-    },
-    /// Inspect nopal.workflow/v1 handoff/babysit config
-    Workflow {
-        #[command(subcommand)]
-        command: WorkflowCmd,
-    },
-    #[command(name = "__rondo-host", hide = true)]
-    RondoHost(RondoHostArgs),
+    Rondo(RemovedCommandArgs),
+    /// Removed run coordinator retained only as a migration diagnostic
+    #[command(hide = true)]
+    Run(RemovedCommandArgs),
+    /// Removed workflow-report surface retained only as a migration diagnostic
+    #[command(hide = true)]
+    Workflow(RemovedCommandArgs),
 }
 
 #[derive(clap::Args)]
-struct RondoHostArgs {
-    #[arg(long)]
-    state_root: PathBuf,
-    #[arg(long)]
-    rondo_runtime: PathBuf,
+#[command(trailing_var_arg = true)]
+struct RemovedCommandArgs {
+    /// Legacy arguments are accepted only so the removed route can explain migration.
+    #[arg(allow_hyphen_values = true)]
+    _legacy_args: Vec<OsString>,
 }
 
-#[derive(clap::Args)]
-struct CliLaunchArgs {
-    /// Print the nopal.launch/v1 plan without exec-ing Pi
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Layer the pinned bundle on top of ambient Pi resources
-    #[arg(long)]
-    with_ambient: bool,
-
-    /// Print the nopal.launch/v1 stderr summary before exec-ing Pi
-    #[arg(long)]
-    verbose: bool,
-}
-
-#[derive(clap::Args)]
-struct CoordinatorPlacementArgs {
-    /// Nopal policy mode to evaluate
-    #[arg(long, value_parser = parse_mode, default_value = "nopal_tui")]
-    mode: policy::Mode,
-
-    /// Stable action id
-    #[arg(long, default_value = "run.start")]
-    action: String,
-
-    /// Nopal action classes declared by the caller
-    #[arg(long = "class", value_parser = parse_class)]
-    classes: Vec<policy::ActionClass>,
-}
-
-#[derive(Subcommand)]
-enum RondoCmd {
-    /// Start the verified user-scoped Rondo Core
-    Start(RondoPlacementArgs),
-    /// Check verified user-scoped Rondo Core health
-    Health,
-    /// Restart the verified Core when it has no active runs
-    Restart(RondoPlacementArgs),
-    /// Stop the verified Core when it has no active runs
-    Stop,
-}
-
-#[derive(Subcommand)]
-enum BridgeCmd {
-    /// Push live Nopal run/gate/ask state into herdr's native sidebar
-    Herdr(HerdrBridgeArgs),
-}
-
-#[derive(clap::Args)]
-struct HerdrBridgeArgs {
-    /// Herdr Unix socket; beats HERDR_SOCKET_PATH and the default config path
-    #[arg(long)]
-    socket: Option<PathBuf>,
-
-    /// State root to scan; beats BEISLID_STATE_DIR and the XDG default
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
-
-    /// Seconds between feed polls in daemon mode
-    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..))]
-    interval: u64,
-
-    /// Poll once and exit; a missing herdr socket is a successful no-op
-    #[arg(long)]
-    once: bool,
-}
-
-#[derive(clap::Args)]
-struct RondoPlacementArgs {
-    /// Optional stricter placement request; Nopal's run-start placement still wins if stronger
-    #[arg(long, value_parser = parse_placement)]
-    placement: Option<policy::Placement>,
-}
-
-#[derive(Subcommand)]
-enum RunCmd {
-    /// Preview run start coordination without submitting AFK work
-    Start {
-        /// Keep run-start side-effect-free; this command never submits work
-        #[arg(long, default_value_t = true)]
-        dry_run: bool,
-    },
-    /// Submit one approved execution manifest to the configured Rondo Core
-    Submit {
-        /// Approved per-slice manifest inside the discovered repository
-        #[arg(long)]
-        manifest: PathBuf,
-        /// Established Plot identity; defaults to the current tmux pane's @nopal_plot tag
-        #[arg(long)]
-        plot_id: Option<String>,
-        /// Plot state root; defaults to NOPAL_STATE_DIR and then the user state directory
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
-    },
-    /// Fetch one bounded status and event page from Rondo Core
-    Observe {
-        /// Opaque repository identifier returned by submission
-        #[arg(long)]
-        repo_id: String,
-        /// Plot identifier returned by submission
-        #[arg(long)]
-        plot_id: String,
-        /// Opaque Rondo run identifier returned by submission
-        #[arg(long)]
-        run_id: String,
-        /// Plot state root; defaults to NOPAL_STATE_DIR and then the user state directory
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
-        /// Opaque event cursor returned by an earlier submission or observation
-        #[arg(long)]
-        cursor: Option<String>,
-    },
+#[derive(Debug, serde::Serialize)]
+struct MigrationReport {
+    kind: &'static str,
+    ok: bool,
+    code: &'static str,
+    surface: &'static str,
+    removed_in: &'static str,
+    migration: &'static str,
 }
 
 #[derive(Subcommand)]
@@ -505,8 +373,8 @@ enum LedgerCmd {
     /// List (or finalize) stale, unfinalized runs across the whole state dir
     Prune {
         /// Hours an incomplete, unfinalized run's updated_at may age before
-        /// it is selected; matches `nopal field inspect --stale-after`
-        #[arg(long, default_value_t = nopal_core::field::DEFAULT_STALE_AFTER_HOURS)]
+        /// it is selected
+        #[arg(long, default_value_t = ledger::DEFAULT_STALE_AFTER_HOURS)]
         stale_after: u64,
 
         /// Finalize each selected run as `interrupted` instead of only
@@ -517,140 +385,9 @@ enum LedgerCmd {
 }
 
 #[derive(Subcommand)]
-enum AskCmd {
-    /// Persist a new pending ask with the context needed to decide it
-    Raise {
-        /// Session or run raising the ask (who is blocked)
-        #[arg(long)]
-        session: String,
-        /// Backing run id; when set, ask lifecycle events land in that ledger
-        #[arg(long)]
-        run_id: Option<String>,
-        /// Ledger flow of the backing run (disambiguates the run)
-        #[arg(long)]
-        flow: Option<String>,
-        /// Policy mode that produced the ask
-        #[arg(long)]
-        mode: String,
-        /// Stable action id the ask is gating
-        #[arg(long)]
-        action: String,
-        /// Policy rule id that set the ask (evidence pointer)
-        #[arg(long)]
-        rule: Option<String>,
-        /// Declared action class (repeatable)
-        #[arg(long = "class", value_name = "CLASS")]
-        classes: Vec<String>,
-        /// Human-readable reason/context (redacted like ledger events)
-        #[arg(long)]
-        reason: String,
-        /// Evidence pointer (path/url/run ref), redacted
-        #[arg(long)]
-        evidence: Option<String>,
-        /// Seconds until the ask expires to deny; 0 disables auto-expiry
-        #[arg(long, default_value_t = nopal_core::ask::DEFAULT_TTL_SECONDS)]
-        ttl_seconds: i64,
-    },
-    /// List this repo's asks (pending only by default)
-    List {
-        /// Filter to one state
-        #[arg(long, value_parser = parse_ask_state)]
-        state: Option<AskState>,
-        /// Show asks in every state
-        #[arg(long, conflicts_with = "state")]
-        all: bool,
-    },
-    /// Show one ask in full
-    Show {
-        #[arg(long)]
-        id: String,
-    },
-    /// Resolve a pending ask (approve or deny); expiry/double-resolve fail closed
-    Resolve {
-        #[arg(long)]
-        id: String,
-        /// approve unblocks the caller; deny fails it closed
-        #[arg(long, value_parser = parse_resolution)]
-        decision: Resolution,
-        /// Who resolved it (recorded, redacted)
-        #[arg(long)]
-        by: String,
-        /// Optional note (redacted)
-        #[arg(long)]
-        note: Option<String>,
-    },
-    /// Poll until an ask resolves; exit 0 approved, 3 denied/expired, 4 pending
-    Await {
-        #[arg(long)]
-        id: String,
-        /// Max seconds to wait; 0 checks once and returns
-        #[arg(long, default_value_t = 0)]
-        timeout_seconds: u64,
-        /// Poll interval in milliseconds
-        #[arg(long, default_value_t = 500)]
-        poll_ms: u64,
-    },
-}
-
-#[derive(Subcommand)]
 enum PreflightsCmd {
     /// List declared preflights with their stages and commands
     List,
-}
-
-#[derive(Subcommand)]
-enum WorkflowCmd {
-    /// Show the effective handoff/babysit config, defaults applied
-    Show,
-}
-
-#[derive(Subcommand)]
-enum PlotCmd {
-    /// Freeze the primary Workflow and bind one Session to one Workspace
-    Establish(PlotEstablishArgs),
-}
-
-#[derive(clap::Args)]
-struct PlotEstablishArgs {
-    /// Plot state root; beats BEISLID_STATE_DIR and the XDG default
-    #[arg(long)]
-    state_dir: Option<PathBuf>,
-
-    /// Plot identity; defaults to the selected Plot for --field-session
-    #[arg(long)]
-    plot_id: Option<String>,
-
-    /// Field session used when resolving the selected Plot
-    #[arg(long, default_value = "nopal")]
-    field_session: String,
-
-    /// Configured establishment event that opened this boundary
-    #[arg(long)]
-    event: String,
-
-    /// Workspace whose repository/configuration Nopal snapshots
-    #[arg(long, default_value = ".")]
-    workspace: PathBuf,
-
-    /// Owning tmux session; defaults to the session containing TMUX_PANE
-    #[arg(long)]
-    host_session: Option<String>,
-
-    /// Owning tmux pane; defaults to TMUX_PANE
-    #[arg(long)]
-    host_pane: Option<String>,
-
-    /// Structured Session protocol Unix socket address
-    #[arg(long)]
-    protocol_address: Option<String>,
-
-    /// Structured Session endpoint capability kind; defaults to the current durable capability
-    #[arg(long, requires = "protocol_address")]
-    protocol_kind: Option<String>,
-
-    /// Structured Session protocol readiness state; defaults to ready when an address is supplied
-    #[arg(long, requires = "protocol_address")]
-    protocol_state: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -955,23 +692,6 @@ fn parse_tool_outcome(s: &str) -> Result<enforcement::ToolOutcome, String> {
     })
 }
 
-fn parse_placement(s: &str) -> Result<policy::Placement, String> {
-    policy::Placement::parse(s).ok_or_else(|| {
-        "unknown placement; expected one of \"shared_user_runtime\", \"dedicated_repo_runtime\", \"dedicated_run_runtime\", \"blocked\"".to_owned()
-    })
-}
-
-fn parse_ask_state(s: &str) -> Result<AskState, String> {
-    AskState::parse(s).ok_or_else(|| {
-        format!("unknown ask state {s:?}; expected pending, approved, denied, or expired")
-    })
-}
-
-fn parse_resolution(s: &str) -> Result<Resolution, String> {
-    Resolution::parse(s)
-        .ok_or_else(|| format!("unknown decision {s:?}; expected \"approve\" or \"deny\""))
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
@@ -985,18 +705,15 @@ fn main() -> ExitCode {
 
 fn run(cli: &Cli) -> std::io::Result<ExitCode> {
     // Resolved once, centrally, and lazily: every subcommand below that
-    // means "project root" reads from `root`, never the raw `cli.dir`
-    // Lazy because discovery spawns a `git rev-parse` subprocess;
-    // arms that never touch the root (bare invocation, field, info) must
-    // not pay for - or be observable through - a git probe they don't use.
+    // means "project root" reads from `root`, never the raw `cli.dir`.
+    // Discovery spawns a `git rev-parse` subprocess, so migration and info
+    // routes that never touch the root must not pay for or expose that probe.
     // `exec_pi` is the one deliberate exception to root-consumption - see
     // its doc comment.
     let root = std::cell::LazyCell::new(|| discover::project_root(&cli.dir));
     match &cli.command {
         None => dispatch_launch(cli, &root, cli.dry_run, cli.with_ambient, cli.verbose),
-        Some(Cmd::Cli(args)) => {
-            dispatch_launch(cli, &root, args.dry_run, args.with_ambient, args.verbose)
-        }
+        Some(Cmd::Cli(_)) => removed_surface(cli, "cli"),
         Some(Cmd::Sync) => run_distribution_sync(cli, &root),
         Some(Cmd::Update { write }) => run_distribution_update(cli, &root, *write),
         Some(Cmd::Doctor) => {
@@ -1061,39 +778,10 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
         Some(Cmd::Ledger { state_dir, command }) => {
             run_ledger_cmd(cli, &root, state_dir.as_deref(), command)
         }
-        Some(Cmd::Ask { state_dir, command }) => {
-            run_ask_cmd(cli, &root, state_dir.as_deref(), command)
-        }
-        Some(Cmd::Plot { command }) => run_plot_cmd(cli, command),
-        Some(Cmd::Field(args))
-            if matches!(args.command, Some(nopal_field::cli::FieldCmd::Inspect(_))) =>
-        {
-            let Some(nopal_field::cli::FieldCmd::Inspect(inspect)) = &args.command else {
-                unreachable!()
-            };
-            let report = nopal_core::field_store::field_status(
-                &root,
-                inspect.state_dir.as_deref(),
-                inspect.rondo_events.as_deref(),
-                inspect.all,
-                inspect.stale_after,
-            )?;
-            print_report_and_exit(
-                report.ok,
-                cli.json,
-                || serde_json::to_string_pretty(&report),
-                || nopal_core::field::report_toon(&report),
-            )
-        }
-        Some(Cmd::Bridge {
-            command: BridgeCmd::Herdr(args),
-        }) => herdr_bridge::run(&herdr_bridge::Options {
-            dir: cli.dir.clone(),
-            socket: args.socket.clone(),
-            state_dir: args.state_dir.clone(),
-            interval: std::time::Duration::from_secs(args.interval),
-            once: args.once,
-        }),
+        Some(Cmd::Ask(_)) => removed_surface(cli, "ask"),
+        Some(Cmd::Plot(_)) => removed_surface(cli, "plot"),
+        Some(Cmd::Field(_)) => removed_surface(cli, "field"),
+        Some(Cmd::Bridge(_)) => removed_surface(cli, "bridge"),
         Some(Cmd::ReviewRisk(args)) => {
             let req = nopal_core::review_policy::ReviewRiskRequest {
                 changed_files: &args.changed_files,
@@ -1113,20 +801,13 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
                 || nopal_core::review_policy::review_risk_toon(&report),
             )
         }
-        Some(Cmd::Field(args)) => {
-            if args.command.is_none()
-                || matches!(args.command, Some(nopal_field::cli::FieldCmd::Legacy))
-            {
-                use std::io::IsTerminal;
-                if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                    warn_for_interactive_rondo(&root);
-                }
-            }
-            nopal_field::cli::run(args)
-        }
         Some(Cmd::Status) => {
-            let report = coordinator::status(&root)?;
-            print_report(cli.json, &report, coordinator::status_toon)?;
+            let report = nopal_core::status::status(&root)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", nopal_core::status::status_toon(&report));
+            }
             Ok(ExitCode::SUCCESS)
         }
         Some(Cmd::Info) => {
@@ -1139,105 +820,10 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
                 || info::info_toon(&report),
             )
         }
-        Some(Cmd::Placement(args)) => {
-            let classes = if args.classes.is_empty() {
-                vec![policy::ActionClass::WorkspaceWrite]
-            } else {
-                args.classes.clone()
-            };
-            let report = coordinator::placement(&root, args.mode, &args.action, &classes)?;
-            let ok = report.ok;
-            print_report(cli.json, &report, coordinator::placement_toon)?;
-            Ok(if ok {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(1)
-            })
-        }
-        Some(Cmd::Rondo { command }) => {
-            let report = match command {
-                RondoCmd::Start(args) => coordinator::rondo_start(&root, args.placement)?,
-                RondoCmd::Health => coordinator::rondo_health(&root)?,
-                RondoCmd::Restart(args) => coordinator::rondo_restart(&root, args.placement)?,
-                RondoCmd::Stop => coordinator::rondo_stop(&root)?,
-            };
-            print_report(cli.json, &report, coordinator::rondo_service_toon)?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Some(Cmd::RondoHost(args)) => {
-            nopal_rondo_lifecycle::run_host(&nopal_rondo_lifecycle::HostOptions::new(
-                nopal_rondo_lifecycle::StatePaths::new(args.state_root.clone()),
-                args.rondo_runtime.clone(),
-            ))?;
-            Ok(ExitCode::SUCCESS)
-        }
-        Some(Cmd::Run { command }) => match command {
-            RunCmd::Start { dry_run } => {
-                if !dry_run {
-                    eprintln!(
-                        "nopal: `run start` is a dry-run preview; use `nopal run submit --manifest <path>` to submit approved work"
-                    );
-                    return Ok(ExitCode::from(2));
-                }
-                let report = coordinator::run_start_dry_run(&root)?;
-                print_report(cli.json, &report, coordinator::run_start_dry_run_toon)?;
-                Ok(ExitCode::SUCCESS)
-            }
-            RunCmd::Submit {
-                manifest,
-                plot_id,
-                state_dir,
-            } => {
-                let plot_id = match resolve_run_plot_id(plot_id.as_deref()) {
-                    Ok(plot_id) => plot_id,
-                    Err(message) => {
-                        eprintln!("nopal: {message}");
-                        return Ok(ExitCode::from(2));
-                    }
-                };
-                let report =
-                    coordinator::run_submit(&root, manifest, &plot_id, state_dir.as_deref());
-                print_report_and_exit(
-                    report.ok,
-                    cli.json,
-                    || serde_json::to_string_pretty(&report),
-                    || coordinator::run_submit_toon(&report),
-                )
-            }
-            RunCmd::Observe {
-                repo_id,
-                plot_id,
-                run_id,
-                state_dir,
-                cursor,
-            } => {
-                let report = coordinator::run_observe(
-                    &root,
-                    repo_id,
-                    plot_id,
-                    run_id,
-                    cursor.as_deref(),
-                    state_dir.as_deref(),
-                );
-                print_report_and_exit(
-                    report.ok,
-                    cli.json,
-                    || serde_json::to_string_pretty(&report),
-                    || coordinator::run_observation_toon(&report),
-                )
-            }
-        },
-        Some(Cmd::Workflow {
-            command: WorkflowCmd::Show,
-        }) => {
-            let report = nopal_core::workflow_report::workflow_show(&root)?;
-            print_report_and_exit(
-                report.ok,
-                cli.json,
-                || serde_json::to_string_pretty(&report),
-                || nopal_core::workflow_report::workflow_show_toon(&report),
-            )
-        }
+        Some(Cmd::Placement(_)) => removed_surface(cli, "placement"),
+        Some(Cmd::Rondo(_)) => removed_surface(cli, "rondo"),
+        Some(Cmd::Run(_)) => removed_surface(cli, "run"),
+        Some(Cmd::Workflow(_)) => removed_surface(cli, "workflow"),
         Some(Cmd::Enforcement { command }) => {
             let args = match command.as_ref() {
                 EnforcementCmd::PrepareRuntime(args) => args,
@@ -1526,116 +1112,6 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
             )
         }
     }
-}
-
-fn run_plot_cmd(cli: &Cli, command: &PlotCmd) -> std::io::Result<ExitCode> {
-    match command {
-        PlotCmd::Establish(args) => {
-            let tmux =
-                resolve_tmux_identity(args.host_session.as_deref(), args.host_pane.as_deref());
-            let (host_session, host_pane, tagged_plot_id) = match tmux {
-                Ok(identity) => identity,
-                Err(message) => {
-                    let report = nopal_core::plot_report::failure(
-                        nopal_core::diagnostics::Code::PlotSnapshotInvalid,
-                        "tmux",
-                        message,
-                    );
-                    return print_report_and_exit(
-                        false,
-                        cli.json,
-                        || serde_json::to_string_pretty(&report),
-                        || nopal_core::plot_report::establishment_toon(&report),
-                    );
-                }
-            };
-            let protocol = args.protocol_address.as_ref().map(|address| {
-                nopal_core::plot::SessionProtocolEndpoint::unix_with_kind(
-                    args.protocol_kind
-                        .as_deref()
-                        .unwrap_or(nopal_core::plot::SESSION_PROTOCOL_KIND),
-                    address,
-                    args.protocol_state.as_deref().unwrap_or("ready"),
-                )
-            });
-            let report = nopal_core::plot_report::establish_with_protocol(
-                args.state_dir.as_deref(),
-                args.plot_id.as_deref().or(tagged_plot_id.as_deref()),
-                &args.field_session,
-                &args.event,
-                &args.workspace,
-                &host_session,
-                host_pane.as_deref(),
-                protocol,
-            );
-            print_report_and_exit(
-                report.ok,
-                cli.json,
-                || serde_json::to_string_pretty(&report),
-                || nopal_core::plot_report::establishment_toon(&report),
-            )
-        }
-    }
-}
-
-fn resolve_tmux_identity(
-    host_session: Option<&str>,
-    host_pane: Option<&str>,
-) -> Result<(String, Option<String>, Option<String>), String> {
-    if let Some(host_session) = host_session {
-        return Ok((host_session.to_owned(), host_pane.map(str::to_owned), None));
-    }
-    let pane = host_pane
-        .map(str::to_owned)
-        .or_else(|| std::env::var("TMUX_PANE").ok())
-        .ok_or_else(|| "--host-session is required outside a tmux pane".to_owned())?;
-    let output = std::process::Command::new("tmux")
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            &pane,
-            "#{session_name}|#{pane_id}|#{@nopal_plot}",
-        ])
-        .output()
-        .map_err(|error| format!("failed to resolve tmux Session: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "failed to resolve tmux Session for pane {pane}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    parse_tmux_plot_identity(String::from_utf8_lossy(&output.stdout).trim(), &pane)
-}
-
-fn resolve_run_plot_id(explicit_plot_id: Option<&str>) -> Result<String, String> {
-    if let Some(plot_id) = explicit_plot_id {
-        return Ok(plot_id.to_owned());
-    }
-    let (_session, _pane, tagged_plot_id) = resolve_tmux_identity(None, None)?;
-    tagged_plot_id.ok_or_else(|| {
-        "--plot-id is required when the current tmux pane has no @nopal_plot tag".to_owned()
-    })
-}
-
-fn parse_tmux_plot_identity(
-    value: &str,
-    expected_pane: &str,
-) -> Result<(String, Option<String>, Option<String>), String> {
-    let mut fields = value.splitn(3, '|');
-    let session = fields.next().unwrap_or_default();
-    let pane = fields.next().unwrap_or_default();
-    let plot_id = fields.next().unwrap_or_default();
-    if session.is_empty() || pane != expected_pane {
-        return Err(format!(
-            "tmux returned mismatched identity for pane {expected_pane}"
-        ));
-    }
-    Ok((
-        session.to_owned(),
-        Some(pane.to_owned()),
-        (!plot_id.is_empty()).then(|| plot_id.to_owned()),
-    ))
 }
 
 fn run_export_cmd(cli: &Cli, root: &Path, command: &ExportCmd) -> std::io::Result<ExitCode> {
@@ -2128,111 +1604,6 @@ fn run_ledger_cmd(
     }
 }
 
-fn run_ask_cmd(
-    cli: &Cli,
-    root: &Path,
-    state_dir: Option<&std::path::Path>,
-    command: &AskCmd,
-) -> std::io::Result<ExitCode> {
-    match command {
-        AskCmd::Raise {
-            session,
-            run_id,
-            flow,
-            mode,
-            action,
-            rule,
-            classes,
-            reason,
-            evidence,
-            ttl_seconds,
-        } => {
-            let report = ask::ask_raise(
-                root,
-                state_dir,
-                &RaiseArgs {
-                    session_id: session,
-                    run_id: run_id.as_deref(),
-                    flow: flow.as_deref(),
-                    mode,
-                    action,
-                    rule: rule.as_deref(),
-                    classes,
-                    reason,
-                    evidence: evidence.as_deref(),
-                    ttl_seconds: *ttl_seconds,
-                },
-            )?;
-            print_report_and_exit(
-                report.ok,
-                cli.json,
-                || serde_json::to_string_pretty(&report),
-                || ask::raise_toon(&report),
-            )
-        }
-        AskCmd::List { state, all } => {
-            let filter = if *all {
-                None
-            } else {
-                state.or(Some(AskState::Pending))
-            };
-            let report = ask::ask_list(root, state_dir, filter)?;
-            print_report_and_exit(
-                report.ok,
-                cli.json,
-                || serde_json::to_string_pretty(&report),
-                || ask::list_toon(&report),
-            )
-        }
-        AskCmd::Show { id } => {
-            let report = ask::ask_show(root, state_dir, id)?;
-            print_report_and_exit(
-                report.ok,
-                cli.json,
-                || serde_json::to_string_pretty(&report),
-                || ask::show_toon(&report),
-            )
-        }
-        AskCmd::Resolve {
-            id,
-            decision,
-            by,
-            note,
-        } => {
-            let report = ask::ask_resolve(root, state_dir, id, *decision, by, note.as_deref())?;
-            print_report_and_exit(
-                report.ok,
-                cli.json,
-                || serde_json::to_string_pretty(&report),
-                || ask::resolve_toon(&report),
-            )
-        }
-        AskCmd::Await {
-            id,
-            timeout_seconds,
-            poll_ms,
-        } => {
-            let report = ask::ask_await(
-                root,
-                state_dir,
-                &ask::AwaitArgs {
-                    ask_id: id,
-                    timeout_seconds: *timeout_seconds,
-                    poll_ms: *poll_ms,
-                },
-            )?;
-            // await encodes the outcome in the exit code so a blocked caller
-            // can fail closed without parsing the payload.
-            if cli.json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                print!("{}", ask::await_toon(&report));
-            }
-            Ok(ExitCode::from(ask::await_exit_code(&report)))
-        }
-    }
-}
-
 /// Resolve user-level Nopal policy and enforcement state without granting it
 /// project-package authority. The checked-in distribution contract is the
 /// only source for project resources; this directory remains relevant to the
@@ -2272,62 +1643,73 @@ fn resolve_data_dir() -> std::io::Result<PathBuf> {
         })
 }
 
-/// Resolve the built-in adapter package from an explicit distribution root,
-/// the packaged executable layout, or the source checkout used for local
-/// builds. Every candidate is still byte-verified before Pi launch, so this
-/// locator cannot turn an environment path into executable authority.
-fn resolve_builtin_adapter_root() -> std::io::Result<PathBuf> {
+/// Resolve the complete built-in Nopal package from an explicit distribution
+/// root, the release-relative layout, or the source checkout used for local
+/// builds. The lock binds the adapter and Beislið skill trees beneath this
+/// root, so an arbitrary candidate cannot become trusted by path alone.
+fn resolve_builtin_distribution_root() -> std::io::Result<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(root) = std::env::var_os("NOPAL_DISTRIBUTION_ROOT") {
         let root = PathBuf::from(root);
         candidates.push(root.clone());
-        candidates.push(root.join("extensions/policy-gate"));
+        candidates.push(root.join("share/nopal"));
     }
     if let Ok(executable) = std::env::current_exe() {
-        candidates.extend(packaged_adapter_candidates(&executable));
+        candidates.extend(packaged_distribution_candidates(&executable));
     }
-    candidates.push(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("extensions/policy-gate"),
-    );
-    resolve_builtin_adapter_root_from(candidates)
+    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    resolve_builtin_distribution_root_from(candidates)
 }
 
-/// Keep executable-relative layouts explicit so app packaging can test the
-/// lookup contract without depending on a source checkout. Linux places the
-/// adapter beside the executables, while a macOS app keeps non-binary
-/// resources under `Contents/Resources`.
-fn packaged_adapter_candidates(executable: &Path) -> Vec<PathBuf> {
-    let Some(parent) = executable.parent() else {
-        return Vec::new();
-    };
-    let mut candidates = vec![parent.join("extensions/policy-gate")];
-    if let Some(contents) = parent.parent() {
-        candidates.push(contents.join("Resources/extensions/policy-gate"));
-    }
-    candidates
+fn packaged_distribution_candidates(executable: &Path) -> Vec<PathBuf> {
+    executable_parents(executable)
+        .into_iter()
+        .map(|parent| parent.join("share/nopal"))
+        .collect()
 }
 
-fn resolve_builtin_adapter_root_from(
+/// An installed launcher is a stable symlink into an immutable release.
+/// Check both the invocation parent and the held canonical target parent so
+/// release-relative resources work without trusting ambient `PATH`.
+fn executable_parents(executable: &Path) -> Vec<PathBuf> {
+    let mut parents = Vec::new();
+    if let Some(parent) = executable.parent() {
+        parents.push(parent.to_owned());
+    }
+    if let Ok(canonical) = executable.canonicalize()
+        && let Some(parent) = canonical.parent()
+        && !parents.iter().any(|candidate| candidate == parent)
+    {
+        parents.push(parent.to_owned());
+    }
+    parents
+}
+
+fn resolve_builtin_distribution_root_from(
     candidates: impl IntoIterator<Item = PathBuf>,
 ) -> std::io::Result<PathBuf> {
     for candidate in candidates {
-        if ["index.ts", "classifier.ts", "guard.ts", "nopal-cli.ts"]
+        let adapter = candidate.join("extensions/policy-gate");
+        let adapter_complete = ["index.ts", "classifier.ts", "guard.ts", "nopal-cli.ts"]
             .iter()
-            .all(|name| candidate.join(name).is_file())
-        {
+            .all(|name| adapter.join(name).is_file());
+        let beislid_complete = candidate.join("resources/beislid/LICENSE").is_file()
+            && candidate
+                .join("resources/beislid/provenance.json")
+                .is_file()
+            && candidate.join("resources/beislid/skills").is_dir();
+        if adapter_complete && beislid_complete {
             return candidate.canonicalize();
         }
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        "cannot locate the complete built-in Nopal enforcement adapter package",
+        "cannot locate the complete built-in Nopal adapter and Beislið skill package",
     ))
 }
 
 fn run_distribution_update(cli: &Cli, root: &Path, write: bool) -> std::io::Result<ExitCode> {
-    let builtin_root = resolve_builtin_adapter_root()?;
+    let builtin_root = resolve_builtin_distribution_root()?;
     let store_root = resolve_data_dir()?.join("packages");
     let report = distribution_adapter::update(
         root,
@@ -2348,7 +1730,7 @@ fn run_distribution_update(cli: &Cli, root: &Path, write: bool) -> std::io::Resu
 }
 
 fn run_distribution_sync(cli: &Cli, root: &Path) -> std::io::Result<ExitCode> {
-    let builtin_root = resolve_builtin_adapter_root()?;
+    let builtin_root = resolve_builtin_distribution_root()?;
     let store_root = resolve_data_dir()?.join("packages");
     let report = distribution_adapter::sync(
         nopal_core::distribution::DistributionContext {
@@ -2398,7 +1780,7 @@ fn dispatch_launch(
         ));
     }
     let store_root = resolve_data_dir()?.join("packages");
-    let builtin_root = resolve_builtin_adapter_root()?;
+    let builtin_root = resolve_builtin_distribution_root()?;
     let builtin = nopal_core::distribution::BuiltinDistribution {
         version: env!("CARGO_PKG_VERSION"),
         root: &builtin_root,
@@ -2680,12 +2062,6 @@ fn verify_enforcement_adapter(index_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn warn_for_interactive_rondo(root: &Path) {
-    if let Some(warning) = coordinator::ensure_interactive_rondo(root) {
-        eprintln!("{warning}");
-    }
-}
-
 /// The always-on created-notice, shared by the success path and the
 /// scaffolded-then-failed re-plan path so a write is never silent.
 fn scaffold_notice(scaffolded: &scaffold::Scaffolded) -> String {
@@ -2939,17 +2315,32 @@ const TRUSTED_PI_DIST_INTEGRITY: &str =
     "sha256:e17228fa4d155a734026dc737eb71a790356e639ae29bca9c0a2b6105260d279";
 // Generated from the exact npm 0.80.6 artifact with SRI
 // sha512-vcfD6tOk402isLl3Cm/qbn2O10TvgroMp1+/fEGM24ZdvETFCdOYv5VZ7m59EI5fPsjfSJh+CpQ5bhBrhfOg7g==
-// after production global installs on darwin-arm64, darwin-x64, and
-// linux-x64. All three exact npm closures produce the same tree digest. The
-// tree hash includes dependency manifests, bytes, symlink targets, and
-// executable modes.
-#[cfg(any(
-    all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "macos", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "x86_64")
-))]
+// by the npm client shipped in official Node 22.22.0. Optional native
+// dependencies make the complete tree platform-specific. Each tree hash
+// includes dependency manifests, bytes, symlink targets, and executable modes.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const TRUSTED_PI_RUNTIME_INTEGRITY: &str =
-    "sha256:e47df297fcc10d940dcab967cc8a32910c17e0e77e3130b801dfbea3ba5ba279";
+    "sha256:1849e5f3271e6386319323a9e0dbf0f171c6d22558c5e9c05717a20b116915e8";
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+const TRUSTED_PI_RUNTIME_INTEGRITY: &str =
+    "sha256:2a49edc0cbfae11a095051da5d6d79cd994c85c555ee4f24c74ec3700ef34b4e";
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const TRUSTED_PI_RUNTIME_INTEGRITY: &str =
+    "sha256:7496869e98bed7cdfa6f12130e4d0bb05c2fc3e7494cb8cb3be5dc81fdff063e";
+
+fn packaged_pi_binary(executable: &Path) -> Option<PathBuf> {
+    executable_parents(executable)
+        .into_iter()
+        .map(|parent| parent.join("runtime/pi/dist/cli.js"))
+        .find(|candidate| candidate.is_file())
+}
+
+fn packaged_node_binary(executable: &Path) -> Option<PathBuf> {
+    executable_parents(executable)
+        .into_iter()
+        .map(|parent| parent.join("runtime/node"))
+        .find(|candidate| candidate.is_file())
+}
 
 fn resolve_pi_binary() -> std::io::Result<PathBuf> {
     let configured = if cfg!(debug_assertions) {
@@ -2960,6 +2351,11 @@ fn resolve_pi_binary() -> std::io::Result<PathBuf> {
     let uses_test_override = configured.is_some();
     let candidate = if let Some(path) = configured {
         path
+    } else if let Some(path) = std::env::current_exe()
+        .ok()
+        .and_then(|executable| packaged_pi_binary(&executable))
+    {
+        path
     } else {
         let path = std::env::var_os("PATH").ok_or_else(|| {
             std::io::Error::other("cannot resolve trusted Pi binary without PATH")
@@ -2967,7 +2363,11 @@ fn resolve_pi_binary() -> std::io::Result<PathBuf> {
         std::env::split_paths(&path)
             .map(|directory| directory.join("pi"))
             .find(|candidate| candidate.is_file())
-            .ok_or_else(|| std::io::Error::other("cannot resolve installed Pi binary on PATH"))?
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "cannot resolve packaged Pi runtime or an exact installed Pi binary on PATH",
+                )
+            })?
     };
     let canonical = candidate.canonicalize().map_err(|error| {
         std::io::Error::new(
@@ -3027,13 +2427,21 @@ fn resolve_pi_node() -> std::io::Result<Option<PathBuf>> {
         all(target_os = "linux", target_arch = "x86_64")
     ))]
     {
-        let path = std::env::var_os("PATH")
-            .and_then(|path| {
-                std::env::split_paths(&path)
-                    .map(|directory| directory.join("node"))
-                    .find(|candidate| candidate.is_file())
+        let path = std::env::current_exe()
+            .ok()
+            .and_then(|executable| packaged_node_binary(&executable))
+            .or_else(|| {
+                std::env::var_os("PATH").and_then(|path| {
+                    std::env::split_paths(&path)
+                        .map(|directory| directory.join("node"))
+                        .find(|candidate| candidate.is_file())
+                })
             })
-            .ok_or_else(|| std::io::Error::other("cannot resolve locked Node runtime"))?
+            .ok_or_else(|| {
+                std::io::Error::other(
+                    "cannot resolve packaged Node runtime or an exact installed Node on PATH",
+                )
+            })?
             .canonicalize()?;
         validate_executable_identity_against(&path, TRUSTED_NODE_INTEGRITY)?;
         Ok(Some(path))
@@ -3730,6 +3138,36 @@ fn exec_pi(
     ))
 }
 
+fn removed_surface(cli: &Cli, surface: &'static str) -> std::io::Result<ExitCode> {
+    let migration = match surface {
+        "field" => {
+            "Field, tmux seats, and desktop Sessions were removed in v0.3; use bare `nopal` to launch the enforced Pi distribution"
+        }
+        _ => {
+            "this agent-management surface was removed in v0.3; use bare `nopal` and the documented deterministic enforcement commands"
+        }
+    };
+    let report = MigrationReport {
+        kind: "nopal.migration/v1",
+        ok: false,
+        code: "product_surface_removed",
+        surface,
+        removed_in: "0.3.0",
+        migration,
+    };
+    print_report_and_exit(
+        false,
+        cli.json,
+        || serde_json::to_string_pretty(&report),
+        || {
+            format!(
+                "kind: {}\nok: false\ncode: {}\nsurface: {}\nremoved_in: {}\nmigration: {:?}\n",
+                report.kind, report.code, report.surface, report.removed_in, report.migration
+            )
+        },
+    )
+}
+
 fn print_report_and_exit(
     ok: bool,
     json: bool,
@@ -3753,28 +3191,16 @@ fn exit_for(ok: bool) -> ExitCode {
     }
 }
 
-fn print_report<T, F>(json: bool, report: &T, render_toon: F) -> std::io::Result<()>
-where
-    T: serde::Serialize,
-    F: Fn(&T) -> String,
-{
-    if json {
-        println!("{}", serde_json::to_string_pretty(report)?);
-    } else {
-        print!("{}", render_toon(report));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use super::{
-        copy_pi_runtime_tree, hash_pi_runtime_tree, packaged_adapter_candidates,
-        parse_tmux_plot_identity, prepare_pi_runtime_dir_from, resolve_builtin_adapter_root_from,
-        validate_executable_identity_against, validate_pi_package_identity_against,
-        validate_project_pi_settings, verify_enforcement_adapter,
+        copy_pi_runtime_tree, hash_pi_runtime_tree, packaged_distribution_candidates,
+        packaged_node_binary, packaged_pi_binary, prepare_pi_runtime_dir_from,
+        resolve_builtin_distribution_root_from, validate_executable_identity_against,
+        validate_pi_package_identity_against, validate_project_pi_settings,
+        verify_enforcement_adapter,
     };
 
     #[test]
@@ -3791,48 +3217,89 @@ mod tests {
     }
 
     #[test]
-    fn source_free_apps_resolve_the_exact_packaged_adapter() {
+    fn source_free_archive_resolves_the_complete_builtin_distribution() {
         let temp = tempfile::tempdir().unwrap();
-        for (executable, adapter) in [
+        let executable = temp.path().join("nopal-v0.3.0/nopal");
+        let distribution = temp.path().join("nopal-v0.3.0/share/nopal");
+        let adapter = distribution.join("extensions/policy-gate");
+        let beislid = distribution.join("resources/beislid");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::create_dir_all(&adapter).unwrap();
+        fs::create_dir_all(beislid.join("skills/kickoff")).unwrap();
+        fs::write(&executable, b"standalone nopal binary\n").unwrap();
+        fs::write(beislid.join("LICENSE"), "MIT\n").unwrap();
+        fs::write(beislid.join("provenance.json"), "{}\n").unwrap();
+        fs::write(beislid.join("skills/kickoff/SKILL.md"), "# Kickoff\n").unwrap();
+        for (name, bytes) in [
             (
-                temp.path().join("Nopal-linux/nopal"),
-                temp.path().join("Nopal-linux/extensions/policy-gate"),
+                "index.ts",
+                include_bytes!("../../../extensions/policy-gate/index.ts").as_slice(),
             ),
             (
-                temp.path().join("Nopal.app/Contents/MacOS/nopal"),
-                temp.path()
-                    .join("Nopal.app/Contents/Resources/extensions/policy-gate"),
+                "classifier.ts",
+                include_bytes!("../../../extensions/policy-gate/classifier.ts").as_slice(),
+            ),
+            (
+                "guard.ts",
+                include_bytes!("../../../extensions/policy-gate/guard.ts").as_slice(),
+            ),
+            (
+                "nopal-cli.ts",
+                include_bytes!("../../../extensions/policy-gate/nopal-cli.ts").as_slice(),
             ),
         ] {
-            fs::create_dir_all(executable.parent().unwrap()).unwrap();
-            fs::create_dir_all(&adapter).unwrap();
-            fs::write(&executable, b"standalone nopal binary\n").unwrap();
-            for (name, bytes) in [
-                (
-                    "index.ts",
-                    include_bytes!("../../../extensions/policy-gate/index.ts").as_slice(),
-                ),
-                (
-                    "classifier.ts",
-                    include_bytes!("../../../extensions/policy-gate/classifier.ts").as_slice(),
-                ),
-                (
-                    "guard.ts",
-                    include_bytes!("../../../extensions/policy-gate/guard.ts").as_slice(),
-                ),
-                (
-                    "nopal-cli.ts",
-                    include_bytes!("../../../extensions/policy-gate/nopal-cli.ts").as_slice(),
-                ),
-            ] {
-                fs::write(adapter.join(name), bytes).unwrap();
-            }
+            fs::write(adapter.join(name), bytes).unwrap();
+        }
 
-            let resolved =
-                resolve_builtin_adapter_root_from(packaged_adapter_candidates(&executable))
+        let resolved =
+            resolve_builtin_distribution_root_from(packaged_distribution_candidates(&executable))
+                .unwrap();
+        assert_eq!(resolved, distribution.canonicalize().unwrap());
+        verify_enforcement_adapter(&resolved.join("extensions/policy-gate/index.ts")).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            fs::create_dir(temp.path().join("bin")).unwrap();
+            let launcher = temp.path().join("bin/nopal");
+            symlink("../nopal-v0.3.0/nopal", &launcher).unwrap();
+            let linked =
+                resolve_builtin_distribution_root_from(packaged_distribution_candidates(&launcher))
                     .unwrap();
-            assert_eq!(resolved, adapter.canonicalize().unwrap());
-            verify_enforcement_adapter(&resolved.join("index.ts")).unwrap();
+            assert_eq!(linked, distribution.canonicalize().unwrap());
+        }
+    }
+
+    #[test]
+    fn release_relative_runtime_candidates_do_not_depend_on_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("nopal-v0.3.0/nopal");
+        let pi = temp.path().join("nopal-v0.3.0/runtime/pi/dist/cli.js");
+        let node = temp.path().join("nopal-v0.3.0/runtime/node");
+        fs::create_dir_all(pi.parent().unwrap()).unwrap();
+        fs::write(&executable, "nopal\n").unwrap();
+        fs::write(&pi, "pi\n").unwrap();
+        fs::write(&node, "node\n").unwrap();
+
+        assert_eq!(packaged_pi_binary(&executable), Some(pi.clone()));
+        assert_eq!(packaged_node_binary(&executable), Some(node.clone()));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            fs::create_dir(temp.path().join("bin")).unwrap();
+            let launcher = temp.path().join("bin/nopal");
+            symlink("../nopal-v0.3.0/nopal", &launcher).unwrap();
+            assert_eq!(
+                packaged_pi_binary(&launcher),
+                Some(pi.canonicalize().unwrap())
+            );
+            assert_eq!(
+                packaged_node_binary(&launcher),
+                Some(node.canonicalize().unwrap())
+            );
         }
     }
 
@@ -4062,18 +3529,5 @@ mod tests {
                 .to_string()
                 .contains("no exact version identity")
         );
-    }
-
-    #[test]
-    fn tmux_identity_prefers_the_explicit_plot_tag_and_verifies_the_pane() {
-        assert_eq!(
-            parse_tmux_plot_identity("nopal-work|%4|plot-1", "%4"),
-            Ok((
-                "nopal-work".to_owned(),
-                Some("%4".to_owned()),
-                Some("plot-1".to_owned())
-            ))
-        );
-        assert!(parse_tmux_plot_identity("nopal-work|%9|plot-1", "%4").is_err());
     }
 }

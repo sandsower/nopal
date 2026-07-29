@@ -11,12 +11,8 @@ Explain behavior and invariants directly instead of using issue or pull request 
 
 ## Development setup
 
-Install the Rust toolchain pinned by the workflows, Node.js 24 or newer, and tmux.
-Install JavaScript dependencies from the lockfile:
-
-```sh
-npm ci --no-audit
-```
+Install the Rust toolchain pinned by the workflows and Node.js 24 or newer.
+The adapter tests use only Node's built-in test runner and require no installed JavaScript dependencies.
 
 Build and test the Rust workspace:
 
@@ -31,10 +27,10 @@ Run the extension, public-tree, and release-contract checks:
 ```sh
 npm test
 scripts/check-public-tree.sh
+scripts/check-active-tree-identity.sh
 sh scripts/test-release-contracts.sh
+git diff --check
 ```
-
-Unix-domain socket tests need permission to create sockets in the system temporary directory.
 
 ## Pull requests
 

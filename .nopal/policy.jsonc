@@ -95,13 +95,6 @@
         },
         {
           "actions": [
-            "memento.capture"
-          ],
-          "decision": "allow",
-          "id": "action-mementowildcardcapture"
-        },
-        {
-          "actions": [
             "retro.run"
           ],
           "decision": "allow",

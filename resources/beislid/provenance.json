@@ -1,0 +1,9 @@
+{
+  "kind": "nopal.beislid_provenance/v1",
+  "repository": "https://github.com/sandsower/beislid",
+  "commit": "d7b6262ef1079f8a148dcfa3ca689c8f9c848220",
+  "version": "0.4.16",
+  "skills_tree": "git-sha1:d99efdb5a004c41673fa12627901d51f76b9a64c",
+  "materialization": "dereferenced-regular-files-v1",
+  "materialized_integrity": "sha256:3bf4fc7e423a541377e6de06b024db949adc457f08b1313c265ab5aa41bfb73a"
+}

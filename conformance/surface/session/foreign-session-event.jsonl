@@ -1,1 +1,0 @@
-{"kind":"nopal.session.event/v1","event_id":"event-foreign","plot_id":"plot-fixture","session_id":"session-foreign","event":{"type":"assistant_message","text":"This belongs elsewhere."}}

@@ -1,1 +1,0 @@
-{"kind":"nopal.session.command/v1","command_id":"command-fixture","plot_id":"plot-fixture","session_id":"session-fixture","command":{"type":"prompt","text":"Exercise the structured round trip","future_prompt_fact":true},"future_command_fact":{"version":2}}

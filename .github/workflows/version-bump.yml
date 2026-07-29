@@ -1,7 +1,8 @@
 name: version-bump
 
-# Every non-release merge to main prepares the next patch version in a
-# protected pull request.
+# Every non-release merge to main prepares the next release version in a
+# protected pull request. The final v0.2 line advances intentionally to v0.3.0;
+# subsequent versions use ordinary patch increments.
 # The pull request is refreshed from the latest main, receives an explicit CI
 # dispatch, and auto-merges only after the required check succeeds.
 # The resulting squash merge is then tagged and passed to release.yml.
@@ -143,7 +144,7 @@ jobs:
             --state open \
             --json number \
             --jq '.[0].number // empty')
-          body='Automated patch-version update. CI is dispatched explicitly because events created with GITHUB_TOKEN do not recursively start pull-request workflows.'
+          body='Automated release-version update. The final v0.2 line advances to v0.3.0; later versions use patch increments. CI is dispatched explicitly because events created with GITHUB_TOKEN do not recursively start pull-request workflows.'
           if [ -z "$pr_number" ]; then
             pr_url=$(gh pr create \
               --base main \

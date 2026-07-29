@@ -3,6 +3,6 @@ project: -
 profile: -
 ready: false
 modules[0]{name,required,state}:
-missing_modules[0]:
-diagnostics: 1
+diagnostics[1]{severity,code,path,position,message}:
+  error,manifest_missing,.nopal/nopal.jsonc,-,no .nopal/nopal.jsonc found; run `nopal validate` for setup guidance
 help[1]: "create .nopal/nopal.jsonc with \"version\": \"nopal.project/v1\" and a built-in or manifest-defined profile"

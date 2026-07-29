@@ -1,8 +1,0 @@
-{
-  "schema": "nopal.rondo_runtime_provenance/v1",
-  "runtime_version": "0.1.0",
-  "source_repository": "https://github.com/sandsower/rondo",
-  "source_commit": "9e8e325cff50e780c1d3de166c8f4894fb562c8b",
-  "artifact_format": "escript",
-  "erlang_major": 28
-}

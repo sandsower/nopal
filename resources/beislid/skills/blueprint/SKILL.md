@@ -1,0 +1,93 @@
+---
+name: blueprint
+description: "Trigger immediately when the user says any of: 'design this', 'plan the implementation', 'plan this out', 'how should we build', 'implementation plan', 'before I write code', 'design the feature', 'figure out how to build'. Also use for implementation design once desired behavior is known: before creating features, building components, adding functionality, or modifying behavior. Do not skip this skill and start coding directly — if a trigger phrase appears, route here even if auto mode is active. Do not use for open-ended product brainstorming or vague requirements; use spec first. No code until design is approved."
+---
+
+# Blueprint
+
+No code until the implementation design is approved. `blueprint` turns a clear ticket/spec/phase into an implementation approach. It does not decide what product should exist; `spec` does that.
+
+Use this when:
+- Desired behavior is known
+- You need to choose an implementation approach
+- You need to identify files/modules/data flow/tests
+- A `spec`, approved Work Contract, or `break-spec` phase is ready for implementation design
+
+Do not use this when:
+- The problem, user/workflow, or success criteria are unclear — route to `spec`
+- `scope_classification.kind` is `multi_slice`, `project`, or `unknown` without an approved selected phase/slice — route to `break-spec` or `spec` refinement as appropriate
+
+<HARD-GATE>
+Do NOT write any implementation code, scaffold, or take implementation actions until you have presented an implementation design and the user has approved it. This is non-negotiable.
+</HARD-GATE>
+
+If the repo declares custom lifecycle hooks, read `../lifecycle-hooks.md` and honor any phase-boundary hooks before and after blueprint.
+
+When `beislid:agent_isolation` is configured, design discussion remains read-only, but before the first repo artifact write load `../implement/workspace-placement-protocol.md` plus the current host adapter and run `ensure_orchestrator_workspace`.
+Require a clean source and acknowledged destination for a requested top-level transition; stop with `manual-transition-required` before lifecycle writes when the host cannot prove it.
+
+## Process
+
+1. **Load context** — if the handoff includes an explicit Work Contract, spec/PRD, or phase artifact path, read it as your primary input. Otherwise, if the matching `spec_approved` or `break_spec_approved` latest pointer entry for the current ticket/branch resolves to a readable artifact, read that artifact as your primary input; if not, use the workflow-configured artifact path template when present, then if a handoff artifact exists in `plans/` (Work Contract, spec, PRD, phase structure), read it as your primary input. Otherwise, check relevant files, docs, recent commits. Optional visual routing: only when repo-level `beislid:visual_surfaces` config exists and the effective `blueprint` mode is active, load `visual-surface-protocol.md`; it mirrors canonical `.beislid/visual-surface-protocol.md` for copied installs.
+2. **Requirements check** — if product behavior or acceptance criteria are unclear, stop and route to `spec` with the missing questions. When a Work Contract is present, proceed only when `Status` is `approved`; route `draft` or `needs-human-decision` back to `spec`. Treat unknowns as blocking when they affect implementation approach or acceptance criteria. Verify `scope_classification` has the seven #56 keys (`kind`, `confidence`, `rationale`, `recommended_route`, `requires_human_approval`, `requires_split`, `split_reason`), `proof_requirements` is a list (possibly empty), and reserved slots still match defaults (`slice_plan: null`, `children: []`) unless later tickets explicitly populated them. Broad/project work should not jump directly to scaffolding by default. Do not patch over vague requirements with implementation guesses.
+3. **Scope check** — use `scope_classification` when present. `atomic` and `single_pr` may proceed. `multi_slice` must route to `break-spec` unless a selected phase/slice is already provided. `project` must route to spec refinement/project boundary approval first in P0, then slice planning; do not scaffold by default. `unknown` or low-confidence high-consequence classifications route back to `spec` for refinement.
+4. **Ask implementation questions one at a time** — prefer multiple choice. Focus on architecture, data flow, boundaries, edge cases, and tests.
+5. **Propose 2–3 implementation approaches** — include trade-offs and your recommendation. Lead with the recommended option and say why.
+6. **Present the design** — scale to complexity. A few sentences for simple changes, detailed sections for complex ones. Get approval section by section, but keep progress prose context-only and ask the blocking question only once in the final response. Offer the stress-test option only as a final-response action when appropriate; choosing it invokes `poke-holes`. Optional Lavish design surface: if Step 1 found active `beislid:visual_surfaces` routing, apply `visual-surface-protocol.md` at this approval/choice/revision boundary when a visual plan, comparison, architecture/data-flow diagram, option table, or risk/test matrix materially improves understanding. Keep small/linear designs Markdown-first, but for large changes comparable to work that benefits from `walk-the-diff`, lean toward suggesting or prompting for the surface rather than skipping it. Respect `suggest`/`prompt`/`auto` exactly; absent config or `off` must not mention or invoke Lavish. Use the protocol's `plan`, `comparison`, `diagram`, and `input` guidance with a typed `BEISLID_VISUAL_FEEDBACK_V1` gate for `workflow: blueprint`, action `approve_revise_or_choose_blueprint`, and decisions `approve`, `revise`, or `choose` (`choose` requires `selected_option`). Copy accepted visual approvals, revisions, or choices into the canonical Markdown/chat design record before proceeding; visual controls never bypass explicit blueprint approval before `implement`.
+7. **Run `blueprint_approved` lifecycle actions** - after the design is approved and any configured orchestrator placement gate passes, execute configured artifact and CLI lifecycle actions for the approved design. Do not auto-write design files or run ad-hoc side effects outside this lifecycle behavior in configured repos.
+8. **Transition** — normally invoke `implement` to create the implementation plan and include any lifecycle status/path. If invoked by `kickoff`, return the approved design plus lifecycle status/path to `kickoff` instead; kickoff must record discoveries and update the ticket first.
+
+## Scaling to Complexity
+
+- **Small change** (config, rename, simple fix): 1–2 questions, 1 paragraph design, lifecycle actions only when configured or explicitly useful in standalone mode.
+- **Medium feature** (new component, API endpoint): architecture + data flow + testing approach.
+- **Large feature** (new subsystem, multi-file): route to `break-spec` before implementation design.
+
+## In Existing Codebases
+
+- Explore current structure before proposing changes. Follow existing patterns.
+- If existing code has problems that affect the work, include targeted improvements in the design.
+- Don't propose unrelated refactoring.
+
+## Principles
+
+- **Implementation design, not product shaping** — route vague product questions to `spec`.
+- **One question at a time** — don't overwhelm.
+- **YAGNI ruthlessly** — remove unnecessary features from designs.
+- **Explore alternatives** — always propose 2–3 approaches before settling.
+- **Incremental validation** — present design, get approval before moving on.
+
+## Lifecycle actions
+
+If inside a git repo with `.beislid/workflow.md`, read only the `beislid:lifecycle_actions` block and execute supported `events.blueprint_approved.actions[]` entries in order after the user approves the implementation design. If no workflow exists, preserve standalone usefulness by offering a local design artifact for larger/spec-originated work after explicit approval. If a workflow exists but no `blueprint_approved` action is configured, do not write a design file or run a side effect automatically; workflow config controls lifecycle actions.
+
+Supported P0 action shapes:
+
+```yaml
+- name: write-design-artifact
+  type: artifact
+  approval: prompt # optional; prompt when omitted, auto creates missing target
+  on_failure: prompt # optional; prompt when omitted, or continue | abort
+  path: 'plans/{feature}-design.md' # optional default
+- name: run-approved-design-hook
+  type: cli
+  command: 'planning-hook {event} {ticket_id} {artifact_path}'
+  approval: prompt # required for cli
+  classes: [git-remote] # optional action-policy classes
+```
+
+Execute `type: artifact` and `type: cli` under `blueprint_approved`; skip other providers as reserved. Multiple actions are allowed and run in order. Before each supported action, evaluate action policy with action id `lifecycle.blueprint_approved.<name>`: artifact actions use class `workspace-write`; CLI actions use configured `classes` or the conservative default `[workspace-write, git-remote]`. A policy denial records `denied` and skips that action; a policy `ask` boundary must be handled before running.
+
+For artifact actions, `approval: prompt` asks write/skip and shows action name, resolved path, and parent directory creation. `approval: auto` writes automatically only when the target does not exist. Existing targets always prompt: overwrite / choose another path / skip. Default path: `plans/{feature}-design.md`. Supported artifact placeholders are `{feature}`, `{kind}` (`design`), and `{ticket_id}` when ticket context is known. Derive `{feature}` from the approved design title, then spec artifact title, then ticket title, then branch name; ask for a filename stem if none is available. Slug values by lowercasing, replacing non-alphanumeric runs with `-`, collapsing repeats, stripping edge `-`, and keeping names readable (about 60 chars). If `{ticket_id}` is used without ticket context, ask for another path or skip. Paths must be relative, stay inside the repo root (or cwd for standalone fallback), contain no `..`, and end in `.md`. Create parent directories only as part of an approved or auto write.
+
+Artifact content must be the approved design as primary content, using the Blueprint artifact shape from `artifact-templates.md` when a durable file or report is written. It may add a clearly labeled `## Artifact Context` section with known source event, ticket, branch, spec artifact path, and related lifecycle status. Do not add unapproved design decisions. Treat written design artifacts as checkpoint-compatible state seeds for fresh-context handoff into `implement`. After the artifact is written, update `.beislid/checkpoints/latest.json` with a `latest.blueprint_approved` entry containing `event`, `path`, `ticket`, `branch`, `source_skill`, and `written_at` when available; pointer write failures are non-blocking and should be reported.
+
+For CLI actions, `approval` is required. `approval: prompt` asks run/skip and shows action name, command summary, placeholders used, and action-policy classes. `approval: auto` runs once configured after policy allows it. Supported CLI placeholders are `{ticket_id}`, `{id}` (alias), `{branch}`, `{event}` (`blueprint_approved`), `{feature}`, `{kind}` (`design`), and `{artifact_path}` (latest written/auto-written artifact path for this event, or empty). Pass placeholder values through argv construction when available or shell-quote them before execution; never splice raw branch/ticket text into a shell and never expose the approved design body as a command-line placeholder.
+
+`on_failure` may be `prompt`, `continue`, or `abort`; omitted means `prompt`. On failed actions, `prompt` asks retry / skip or explicitly override / abort, `continue` warns and transitions without that side effect, and `abort` stops the transition.
+
+Record lifecycle results as `written`, `auto-written`, `ran`, `skipped`, `denied`, `reserved`, `not configured`, or `failed`, with paths/action names when available. Pass written artifact paths in handoff context so `implement` can read custom paths in the same session.
+
+## Terminal State
+
+The only normal next step after design approval and lifecycle handling is `implement`. Do not invoke unrelated implementation skills. If `kickoff` invoked this skill, return control to kickoff with the approved design and lifecycle status/path.

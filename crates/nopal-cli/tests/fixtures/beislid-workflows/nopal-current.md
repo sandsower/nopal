@@ -59,7 +59,7 @@ modes:
       pr.review.rerequest: allow
       ticket.comment: allow
       ticket.issue: allow
-      memento.capture: allow
+      evidence.capture: allow
       retro.run: allow
 ```
 

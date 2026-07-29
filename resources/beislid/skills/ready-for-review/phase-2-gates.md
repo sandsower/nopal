@@ -1,0 +1,108 @@
+# ready-for-review phase 2 gates v1
+
+Loaded after Phase 1. If unreadable, hard-fail; do not reconstruct from memory.
+
+## Inputs / outputs
+
+Inputs: base/branch/ticket/PR, merge/diff state, gate model, configured gates, optional triggers, notes/warnings.
+
+Outputs: gate envelopes, clean-eval proof + surface, logs/artifacts, skips, decisions, warnings, resume route.
+
+Print entry/exit. Emit workflow-signal `verify`. Verbose emits aux/probe/gate summaries.
+
+## 2a. Merge base if stale
+
+If `needs_merge`, policy-check `git.merge` (`workspace-write`, `git-local`) and merge only on `allow`/approved `ask`:
+
+```bash
+git merge origin/<base>
+```
+
+If conflicts occur, emit `blocked`, stop, and ask. After resolution, continue Phase 2 and run gates that apply to touched files.
+
+## 2b. Run scoped or top-level gates
+
+Run applicable checks in order and fail fast; fast-path may parallelize safe gates after probing.
+
+Selection:
+
+- `gate_sets`: run Phase 1 selected gates with set defaults.
+- `scopes`: run scope `setup` before pre-pr gates (`pushd <cwd>`, `popd`). `setup` blocks gates.
+- top-level `gates`: run pre-pr gates from repo root.
+- none: `no gates configured — skipping`.
+
+Flat `name`+`command` = pre-pr sensor. Execute legacy + rich gates where stage is absent/`pre-pr`, kind is absent/`sensor`, command exists, execution is absent/`computational`. Other stages → `skipped-by-stage`; non-computational/non-sensor pre-pr → `skipped-by-execution`. Rich `output`/`failure` as prompt context.
+
+Probe each selected gate once, plus `required_tools[]` via `command -v`. On failure, use the Phase 2b prompt.
+
+Execution:
+
+1. Before batching, gates with `evidence_reuse.mode: exact` follow [the exact gate proof protocol](gate-proof-protocol.md); unreadable protocol means warn and run normally.
+2. Fast path batches only gates still needing execution with `parallel_safe: true`, no `autofix`, and `mutates` not true; record `parallel_unavailable` when concurrency is unsupported.
+3. Run other gates once in configured order; normal mode treats every non-reused gate as non-batched.
+4. Capture duration, parse the shared Gate result envelope, and store raw logs or a safe summary.
+5. On non-environment failure with auto autofix approval, policy-check, record the diff, and commit unless denied.
+6. Otherwise policy-check autofix, show the diff, and ask once in the final blocking response.
+7. For errors, environment failures, or no autofix, emit `waiting` and follow configured failure approval.
+8. Re-run after fixes and record decisions to proceed without passing.
+
+Probe/cache rule: first use of a configured gate, ticket source, formatter, domain/memory hook, or PR-provider capability updates run-memory probe state. Plain git checks are not probe-cache entries.
+
+Track envelopes, skips/reasons, proof status, gate model, duration, autofix, probes, metadata, exceptions. Exit only after proof is satisfied or handled by `failure_policy`.
+
+## 2c. Translation sync
+
+If Phase 1 did not trigger `translation_sync`, print the not-triggered skip line from `ready-for-review-templates.md` and skip.
+
+If `translation_sync.skill` is not configured, print the disabled inline note from `ready-for-review-templates.md` and skip.
+
+Otherwise probe `translation_sync.skill`, invoke the configured skill, and policy-check any translation edits before committing. Carry AI-generated user-facing-content warnings to Phase 4.
+
+## 2d. Browser compatibility check
+
+If Phase 1 did not trigger `browser_compat`, print the not-triggered skip line from `ready-for-review-templates.md` and skip.
+
+If `browser_compat.skill` is not configured, print the disabled inline note from `ready-for-review-templates.md` and skip.
+
+Otherwise probe `browser_compat.skill` and invoke the configured skill with the diff. Browser compatibility is advisory and does not block PR handoff by itself.
+
+## Clean evaluator
+
+If `clean_eval` is absent or `mode: off`, print the clean-evaluator skip line from `ready-for-review-templates.md` and continue.
+
+If `clean_eval.mode: require`, honor `surface` (auto/worktree/container): reuse matching surface, or create from branch+base, apply patch, run selected pre-pr gates, store artifacts under `artifact_root` or run-ledger tree, classify failures as `patch-regression` or `environment_failure`. On failure: `blocked` for patch regressions, `waiting`/`blocked` for environment. If `approval_gates.clean_eval_failure` is `auto`, record to transcript/ledger with `auto-skip`, continue (patch regressions still block). Else stop unless user accepts retry/skip.
+
+## Phase 2b: Guided walkthrough
+
+Run this conditional subsection after quality gates and before Phase 3 review, including on the existing-PR fast path.
+
+Count the diff size:
+
+```bash
+git diff <base>...HEAD --shortstat
+```
+
+Use `guided_walkthrough.threshold_files` / `threshold_lines` when configured; defaults are 5 files and 200 lines. If files or lines changed meets/exceeds threshold, print the Phase 2b entry one-liner and offer:
+
+> This touches N files across [areas]. Want to do a guided walkthrough before code review?
+
+Options: `Skip — go straight to review` (recommended for most cases) or `Yes, walk me through it`. Below threshold, skip silently.
+
+If the user skips, print the skipped line. If accepted, invoke `walk-the-diff`; when it wraps, fix surfaced issues, re-run applicable gates, then print done with issue count.
+
+Resume behavior:
+
+- Normal new-PR path: continue to Phase 3.
+- Existing-PR fast path: skip Phase 3. Push, then if AgenticReviewer is required policy-check the label add (`gh pr edit <pr> --add-label <label>` or provider equivalent; stop/ask when none); if no label or add fails, stop/ask before `description_keyword`. Report URL after opt-in succeeds or is explicitly skipped.
+
+If the user explicitly asks for a durable visual proof/review artifact, suggest `show-me` and wait for direct request. Do not auto-run `show-me`.
+
+## Phase-local tripwires
+
+- Run only applicable gates: `gate_sets` selection when configured, otherwise touched scopes when scoped, otherwise top-level gates only when scopes are absent.
+- Fast-path parallelism requires `parallel_safe: true`; absence of `autofix` alone is not enough, and `mutates: true` gates are never parallel candidates.
+- Exact evidence reuse is opt-in and fail-closed; every missing, stale, malformed, dirty, mutating, or ambiguous proof result runs the gate normally.
+- Reused computational gate evidence never replaces inferential review or the required clean evaluator.
+- Only configured `autofix` commands may run after policy; other failures need user direction.
+- Clean evaluator is policy-driven: `mode: off` skips it; `mode: require` must run a clean surface and classify failures instead of silently falling back to the working tree.
+- Walkthrough is optional and `show-me` requires an explicit user request; neither is an automatic blocker.

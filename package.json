@@ -2,31 +2,13 @@
   "name": "nopal",
   "private": true,
   "type": "module",
-  "description": "Nopal Pi extension surface (loaded via .nopal/bundle.jsonc, no build step)",
+  "description": "Nopal continuous enforcement adapter for the pinned Pi distribution",
   "scripts": {
     "test": "node --test \"extensions/**/*.test.ts\""
   },
   "pi": {
     "extensions": [
-      "extensions/nopal",
-      "extensions/policy-gate",
-      "extensions/show-me",
-      "extensions/usage-tracker",
-      "extensions/task-state",
-      "extensions/subagent-runner",
-      "extensions/mcp-bridge"
+      "extensions/policy-gate"
     ]
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
-  },
-  "devDependencies": {
-    "ajv": "^8.20.0"
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.6",
-    "@earendil-works/pi-ai": "^0.80.6",
-    "@earendil-works/pi-tui": "^0.80.6",
-    "typebox": "*"
   }
 }

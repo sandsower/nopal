@@ -77,10 +77,23 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
     let home = temp.path().join("home");
     let agent = temp.path().join("agent");
     let bin = temp.path().join("bin");
-    let adapter = temp.path().join("distribution/extensions/policy-gate");
+    let distribution = temp.path().join("distribution");
+    let adapter = distribution.join("extensions/policy-gate");
+    let beislid = distribution.join("resources/beislid");
     for directory in [&repo, &state, &home, &agent, &bin, &adapter] {
         fs::create_dir_all(directory).unwrap();
     }
+    fs::create_dir_all(beislid.join("skills")).unwrap();
+    fs::copy(
+        source_root.join("resources/beislid/LICENSE"),
+        beislid.join("LICENSE"),
+    )
+    .unwrap();
+    fs::copy(
+        source_root.join("resources/beislid/provenance.json"),
+        beislid.join("provenance.json"),
+    )
+    .unwrap();
     for file in ["index.ts", "classifier.ts", "guard.ts", "nopal-cli.ts"] {
         fs::copy(enforcement_source.join(file), adapter.join(file)).unwrap();
     }
@@ -236,8 +249,8 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
             "source": {{ "type": "builtin", "package": "nopal" }},
             "requirement": "={}",
             "resources": [
-              {{ "kind": "extension", "path": "index.ts" }},
-              {{ "kind": "extension", "path": "deterministic-enforcement-provider.mjs" }}
+              {{ "kind": "extension", "path": "extensions/policy-gate/index.ts" }},
+              {{ "kind": "extension", "path": "extensions/policy-gate/deterministic-enforcement-provider.mjs" }}
             ]
           }}]
         }}"#,
@@ -249,7 +262,7 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
         &bundle,
         &nopal_core::distribution::BuiltinDistribution {
             version: env!("CARGO_PKG_VERSION"),
-            root: &adapter,
+            root: &distribution,
         },
     )
     .unwrap();

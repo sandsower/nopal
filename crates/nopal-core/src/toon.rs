@@ -397,7 +397,7 @@ mod tests {
     fn json_conversion_preserves_nested_objects_arrays_numbers_and_nulls() {
         let json = serde_json::json!({
             "event": {"type": "run.completed", "attempt": 2},
-            "items": [null, true, 1.5, {"uri": "rondo-run://run/artifacts/report.json"}]
+            "items": [null, true, 1.5, {"uri": "nopal-run://run/artifacts/report.json"}]
         });
 
         let value = from_json(&json);
@@ -410,7 +410,7 @@ mod tests {
         assert!(!rendered.contains("<non-scalar>"));
         assert!(rendered.contains("type: run.completed"));
         assert!(rendered.contains("- null"));
-        assert!(rendered.contains("uri: \"rondo-run://run/artifacts/report.json\""));
+        assert!(rendered.contains("uri: \"nopal-run://run/artifacts/report.json\""));
     }
 
     #[test]

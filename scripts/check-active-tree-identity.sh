@@ -3,88 +3,93 @@ set -euo pipefail
 
 root=$(git rev-parse --show-toplevel)
 cd "$root"
+failed=0
 
-forbidden_patterns=('crust')
-found=0
-
-filter_matches() {
-  local input=$1
-  local excluded=$2
-  local output status
-
-  [[ -n "$input" ]] || return 0
-  if output=$(grep -v -F -- "$excluded" <<<"$input"); then
-    printf '%s\n' "$output"
-    return 0
-  else
-    status=$?
-    if (( status == 1 )); then
-      return 0
-    fi
-    printf 'identity exclusion filter failed for pattern %s\n' "$excluded" >&2
-    return "$status"
-  fi
+fail() {
+  printf 'active-tree: %s\n' "$*" >&2
+  failed=1
 }
 
-while IFS= read -r -d '' path; do
-  case "$path" in
-    plans/*|docs/adr/*|.git/*|node_modules|node_modules/*|target/*|output/*|scripts/check-active-tree-identity.sh)
-      continue
-      ;;
-  esac
+for path in \
+  crates/nopal-feed-client \
+  crates/nopal-rondo-client \
+  crates/nopal-rondo-lifecycle \
+  crates/nopal-native-lifecycle \
+  crates/nopal-field-presentation \
+  crates/nopal-field \
+  crates/nopal-desktop-spike \
+  extensions/nopal \
+  extensions/show-me \
+  extensions/usage-tracker \
+  extensions/task-state \
+  extensions/subagent-runner \
+  extensions/mcp-bridge \
+  contracts \
+  conformance \
+  native \
+  scripts/install-macos-app.sh \
+  .nopal/integrations.jsonc \
+  .nopal/theme.json \
+  .pi/settings.json \
+  Makefile; do
+  [[ ! -e "$path" && ! -L "$path" ]] || fail "removed product path remains active: $path"
+done
 
-  # Deleted paths remain in the index until staging and are not active files.
-  [[ -e "$path" ]] || continue
+python3 - "$root/Cargo.toml" <<'PY' || failed=1
+import sys,tomllib
+members=tomllib.load(open(sys.argv[1],"rb"))["workspace"]["members"]
+expected=["crates/nopal-ledger-json","crates/nopal-core","crates/nopal-cli"]
+if members != expected:
+    raise SystemExit(f"active-tree: workspace members are {members!r}, expected {expected!r}")
+PY
 
-  for pattern in "${forbidden_patterns[@]}"; do
-    if grep -q -i -E -- "$pattern" <<<"$path"; then
-      printf '%s: path matches active identity pattern %s\n' "$path" "$pattern"
-      found=1
-    else
-      status=$?
-      if (( status != 1 )); then
-        printf 'identity path scan failed for %s\n' "$path" >&2
-        exit "$status"
-      fi
-    fi
+extension_dirs=$(find extensions -mindepth 1 -maxdepth 1 -type d -print | LC_ALL=C sort)
+if [[ "$extension_dirs" != "extensions/policy-gate" ]]; then
+  fail "release-owned extension set is not exactly extensions/policy-gate: $extension_dirs"
+fi
 
-    if matches=$(grep -n -H -I -i -E -- "$pattern" "$path"); then
-      :
-    else
-      status=$?
-      if (( status != 1 )); then
-        printf 'identity content scan failed for %s\n' "$path" >&2
-        exit "$status"
-      fi
-      matches=
-    fi
-    case "$path" in
-      crates/nopal-core/src/discover.rs)
-        if matches=$(filter_matches "$matches" '.crust'); then
-          :
-        else
-          status=$?
-          exit "$status"
-        fi
-        ;;
-      crates/nopal-cli/tests/coordinator.rs)
-        if matches=$(filter_matches "$matches" 'CRUST_CONFIG_DIR'); then
-          :
-        else
-          status=$?
-          exit "$status"
-        fi
-        ;;
-    esac
-    if [[ -n "$matches" ]]; then
-      printf '%s\n' "$matches"
-      found=1
-    fi
-  done
-done < <(git ls-files --cached --others --exclude-standard -z | LC_ALL=C sort -z)
+if rg -n -i \
+  'nopal[-_](field|rondo|desktop|native|feed)|extensions/(nopal|show-me|usage-tracker|task-state|subagent-runner|mcp-bridge)|crates/nopal-(field|rondo|desktop|native|feed)' \
+  --glob '!target/**' \
+  --glob '!scripts/check-active-tree-identity.sh' \
+  --glob '!scripts/check-release-archive.sh' \
+  --glob '!scripts/test-release-contracts.sh' \
+  .; then
+  fail "active source references a removed implementation package"
+fi
 
-if (( found != 0 )); then
-  printf 'active-tree identity check failed\n' >&2
+if rg -n -i \
+  'temporary migration residue|remain(s)? only until|bundle(s|d)? a version-pinned rondo|install .*tmux|high-quality coordination surface' \
+  README.md CONTEXT.md CONTRIBUTING.md SECURITY.md NOTICE.md .nopal .beislid .github package.json Cargo.toml crates extensions scripts \
+  --glob '!scripts/check-active-tree-identity.sh'; then
+  fail "active product language still describes the superseded product or transition state"
+fi
+
+for required in \
+  extensions/policy-gate/index.ts \
+  resources/beislid/provenance.json \
+  resources/beislid/LICENSE \
+  resources/beislid/skills/kickoff/SKILL.md \
+  scripts/install-release.sh \
+  scripts/package-release.sh \
+  scripts/check-release-archive.sh; do
+  [[ -f "$required" ]] || fail "required v0.3 distribution member is missing from source: $required"
+done
+
+if ! rg -q 'plain Pi session.*no Nopal enforcement guarantee' README.md; then
+  fail "README does not state the plain Pi assurance boundary"
+fi
+if ! rg -q 'rollback' README.md || ! rg -q 'offline' README.md; then
+  fail "README does not document rollback and offline launch"
+fi
+if ! rg -q 'nopal\.migration/v1' crates/nopal-cli/src/main.rs; then
+  fail "removed command migration diagnostics are absent"
+fi
+if ! rg -q 'product_surface_removed' crates/nopal-core/src/diagnostics.rs; then
+  fail "removed configuration migration diagnostics are absent"
+fi
+
+if (( failed != 0 )); then
   exit 1
 fi
 

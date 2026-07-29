@@ -16,6 +16,7 @@ Older releases may receive a fix when the affected code is still supported and a
 
 ## Scope
 
-Nopal coordinates local processes, repositories, agent sessions, and optional external integrations.
-Reports involving command execution, credential exposure, unsafe file handling, privilege boundaries, dependency compromise, or cross-session data isolation are especially valuable.
-Vulnerabilities in bundled third-party software may also be reported here when they affect Nopal users.
+Nopal launches an exact Pi distribution, mediates protected Pi tool calls, executes confined verification gates, and records local enforcement evidence.
+Reports involving authorization bypass, command execution, credential exposure, unsafe file handling, runtime substitution, dependency compromise, or ledger integrity are especially valuable.
+Vulnerabilities in bundled Pi, Node, or other third-party software may also be reported here when they affect Nopal users.
+A plain Pi session started outside `nopal` is outside the Nopal enforcement boundary.

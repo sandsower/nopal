@@ -8,24 +8,14 @@ targets = [
 all-features = false
 
 [advisories]
-ignore = [
-  { id = "RUSTSEC-2026-0194", reason = "quick-xml is used only by wayland-scanner at build time over trusted protocol XML; remove when wayland-scanner supports quick-xml 0.41 or newer" },
-  { id = "RUSTSEC-2026-0195", reason = "quick-xml is used only by wayland-scanner at build time over trusted protocol XML; remove when wayland-scanner supports quick-xml 0.41 or newer" },
-]
 
 [licenses]
 allow = [
   "0BSD",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
-  "BSD-2-Clause",
-  "BSD-3-Clause",
   "BSL-1.0",
-  "CC0-1.0",
-  "ISC",
   "MIT",
-  "OFL-1.1",
-  "Ubuntu-font-1.0",
   "Unicode-3.0",
   "Unlicense",
   "Zlib",

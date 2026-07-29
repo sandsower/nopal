@@ -1,0 +1,68 @@
+# ready-for-review phase 3 review v1
+
+Phase 3 is reached only on the normal new-PR path. Existing-PR fast path skips this phase by contract. If this file cannot be read at Phase 3 entry, hard-fail instead of continuing from memory.
+
+## Entry / inputs
+
+Print Phase 3 entry; emit workflow-signal `review`. In verbose mode, emit aux-load and phase-entry transcript stamps.
+
+Inputs: `base`, full diff against `base`, ticket/spec/design context, Phase 2 gate results and warnings, fast-path state, changed-file/scope mapping for gate reruns, and accumulated user decisions.
+
+## Long-running review policy
+
+Apply this policy to `review`, final checks, and fast-path combined review:
+
+- Announce the review start and that progress will be reported every 60s.
+- Poll/report every 60s while the host supports it.
+- At 5 minutes, emit workflow-signal `waiting`, then ask: continue waiting, cancel-and-salvage, or abort ready-for-review.
+- Never silently skip review coverage; fast-path combined review must be explicit.
+- Cancellation is not a pass.
+
+If cancel-and-salvage: extract partial output. Carry usable findings; mark incomplete observations. If `approval_gates.reduced_review_coverage` is `auto`, record `auto-accepted` in transcript/ledger, continue. Else ask reduced-coverage acceptance only in the final blocking response; record in transcript, exit summary, memory, PR notes.
+
+## 3a. Normal review loop
+
+If `fast_path_eligible=true`, skip this subsection and go directly to 3b combined review. Otherwise invoke `review` with the full diff against `base`, ticket/spec/design context, verification already run, and relevant Phase 2 gate results or warnings.
+
+Handle findings by severity:
+
+- Critical findings must be addressed before PR handoff; emit `blocked` before unresolved Criticals.
+- Important findings must be addressed before PR handoff unless the user explicitly accepts the risk.
+- Minor findings are optional.
+
+Push back on incorrect findings with code or test evidence. If evidence does not disprove the finding, treat it by severity.
+
+When valid findings require fixes:
+
+1. Policy-check orchestrator-owned writes (`workspace-write` plus known non-read class); fix only on `allow`/approved `ask`.
+2. Track findings addressed and risks the user explicitly accepted.
+3. If the fix touched functional code, rerun the Phase 2 gates that apply to changed files before continuing. Naming-only, comment-only, or documentation-only fixes do not require rerun unless they affect configured gates.
+
+If rerun gates fail, use Phase 2 failure handling before resuming Phase 3.
+
+If review/fixes expand into a new subsystem or second scope, warn that the PR is expanding and ask whether to keep it here or split it into a follow-up ticket.
+
+The normal review loop converges only when no blocking review findings remain, when remaining Important items are explicitly accepted risks, or when the user explicitly accepts reduced coverage after cancel-and-salvage.
+
+## 3b. Final whole-diff review
+
+Read optional `beislid:fresh_eyes`. Absent/`enabled: true` uses built-in; `enabled: false` is explicit policy. `type: command`: `probe(fresh_eyes.command)`, policy-check classes (`read` unless metadata mutates), then run from repo root with full diff/ticket/spec/design/gate context. Do not rewrite env vars, args, or output paths for ledger storage; record/copy artifacts separately. Treat nonzero/unclear output as blocking unless evidence disproves it.
+
+If `fast_path_eligible=true`, use one combined review: primary review plus the final check. Label built-in mode `combined review`; label custom mode `combined review + fresh_eyes.command`.
+
+Otherwise, after normal review converges, run the selected final check unless disabled. Handle findings with the same severity and long-running policies. If fixes touch functional code, rerun applicable Phase 2 gates before exiting Phase 3.
+
+## Exit / outputs
+
+Phase 3 exits when: no blocking findings remain; remaining Important items are accepted risks; or cancelled/incomplete coverage has explicit reduced-coverage acceptance (or `approval_gates.reduced_review_coverage` is `auto` and recorded).
+
+Print the Phase 3 exit one-liner from `ready-for-review-templates.md`, filling `<N>` with findings addressed across review/final-check or combined review. In verbose mode, append the Phase 3 exit check and transcript boundary.
+
+Outputs to Phase 4: clean-eval proof status, review/fresh-eyes proof status, review mode, final-check mode (`built-in`, `command`, or `disabled-by-workflow`), findings count, accepted/reduced-coverage notes, no unaccepted blockers, and applicable gate rerun confirmation.
+
+## Phase-local tripwires
+
+- Do not skip policy at covered write/custom commands.
+- Do not skip final whole-diff check unless `fresh_eyes.enabled: false`.
+- Do not proceed with Critical findings; Important findings require fixes or explicit user risk acceptance.
+- Cancelled/incomplete review requires explicit reduced-coverage acceptance before Phase 4.

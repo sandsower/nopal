@@ -14,7 +14,7 @@ release_workspace_version() {
   printf '%s\n' "$release_version"
 }
 
-release_next_patch_version() {
+release_next_version() {
   release_current_version=$1
   if ! printf '%s\n' "$release_current_version" \
     | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
@@ -26,6 +26,10 @@ release_next_patch_version() {
   release_remainder=${release_current_version#*.}
   release_minor=${release_remainder%%.*}
   release_patch=${release_remainder#*.}
+  if [ "$release_major.$release_minor" = "0.2" ]; then
+    printf '0.3.0\n'
+    return
+  fi
   release_patch=$((release_patch + 1))
   printf '%s.%s.%s\n' "$release_major" "$release_minor" "$release_patch"
 }
@@ -61,7 +65,7 @@ release_bump_project_versions() {
   release_manifest=$1
   release_bundle=$2
   release_current=$(release_workspace_version "$release_manifest") || return
-  release_next=$(release_next_patch_version "$release_current") || return
+  release_next=$(release_next_version "$release_current") || return
   release_manifest_tmp="$release_manifest.release-bump.$$"
   release_bundle_tmp="$release_bundle.release-bump.$$"
 
