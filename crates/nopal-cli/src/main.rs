@@ -2985,6 +2985,7 @@ fn configure_pi_environment(command: &mut std::process::Command, runtime_home: &
     let trusted_path = "/usr/bin:/bin";
     command
         .env("PATH", trusted_path)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("TMPDIR", "/tmp")
         .env("HOME", runtime_home)
         .env("CURL_HOME", runtime_home)
@@ -3216,12 +3217,24 @@ mod tests {
     use std::fs;
 
     use super::{
-        copy_pi_runtime_tree, hash_pi_runtime_tree, packaged_distribution_candidates,
-        packaged_node_binary, packaged_pi_binary, prepare_pi_runtime_dir_from,
-        resolve_builtin_distribution_root_from, validate_executable_identity_against,
-        validate_pi_package_identity_against, validate_project_pi_settings,
-        verify_enforcement_adapter,
+        configure_pi_environment, copy_pi_runtime_tree, hash_pi_runtime_tree,
+        packaged_distribution_candidates, packaged_node_binary, packaged_pi_binary,
+        prepare_pi_runtime_dir_from, resolve_builtin_distribution_root_from,
+        validate_executable_identity_against, validate_pi_package_identity_against,
+        validate_project_pi_settings, verify_enforcement_adapter,
     };
+
+    #[test]
+    fn pi_runtime_ignores_system_git_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = std::process::Command::new("unused-test-program");
+        configure_pi_environment(&mut command, temp.path());
+        let clean_system_config = command
+            .get_envs()
+            .find(|(name, _)| *name == "GIT_CONFIG_NOSYSTEM")
+            .and_then(|(_, value)| value);
+        assert_eq!(clean_system_config, Some(std::ffi::OsStr::new("1")));
+    }
 
     #[test]
     #[cfg(any(

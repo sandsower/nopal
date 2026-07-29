@@ -429,6 +429,7 @@ fn execute_with_timeout(
             .env("HOME", &runtime.home_dir)
             .env("CARGO_HOME", runtime.home_dir.join("cargo"))
             .env("CARGO_NET_OFFLINE", "true")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("LANG", "C.UTF-8")
             .env("LC_ALL", "C.UTF-8")
             .env("RUSTUP_HOME", runtime.home_dir.join("rustup"))
@@ -886,7 +887,7 @@ mod tests {
         let run = tempfile::tempdir().unwrap();
         let selected = gate(
             "environment",
-            "test -z \"${NOPAL_ENFORCEMENT_CAPABILITY_FD:-}\" && printf clean",
+            "test -z \"${NOPAL_ENFORCEMENT_CAPABILITY_FD:-}\" && test \"$GIT_CONFIG_NOSYSTEM\" = 1 && printf clean",
         );
         let runtime = prepare(root.path(), run.path(), std::slice::from_ref(&selected)).unwrap();
         assert!(runtime.tmp_dir.as_os_str().as_encoded_bytes().len() < 80);
@@ -1027,6 +1028,7 @@ mod tests {
             .env("HOME", &runtime.home_dir)
             .env("CARGO_HOME", runtime.home_dir.join("cargo"))
             .env("CARGO_NET_OFFLINE", "true")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("RUSTUP_HOME", runtime.home_dir.join("rustup"))
             .env("npm_config_cache", runtime.home_dir.join("npm-cache"))
             .env("TMPDIR", &runtime.tmp_dir)
