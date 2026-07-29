@@ -247,13 +247,10 @@ fn reject_git_code_carriers(root: &Path) -> io::Result<()> {
         if std::env::var_os(name).is_none() {
             return false;
         }
-        let debug_clean_system_config = cfg!(debug_assertions)
-            && **name == "GIT_CONFIG_NOSYSTEM"
+        let clean_system_config = **name == "GIT_CONFIG_NOSYSTEM"
             && std::env::var_os("GIT_CONFIG_NOSYSTEM").as_deref()
-                == Some(std::ffi::OsStr::new("1"))
-            && std::env::var_os("NOPAL_TEST_CLEAN_GIT_CONFIG").as_deref()
                 == Some(std::ffi::OsStr::new("1"));
-        !debug_clean_system_config
+        !clean_system_config
     }) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -629,16 +626,29 @@ fn command_output_bounded(command: &mut Command) -> io::Result<BoundedOutput> {
     })
 }
 
-fn git_optional(root: &Path, args: &[&str]) -> io::Result<Option<Vec<u8>>> {
+fn configure_git_command(command: &mut Command, root: &Path) {
+    // System Git configuration belongs to the host image rather than the
+    // audited user/worktree contract. Ignoring it both prevents hidden code
+    // carriers and keeps every subsequent Git observation on this same seam.
+    command.current_dir(root).env("GIT_CONFIG_NOSYSTEM", "1");
+}
+
+fn git_command(root: &Path) -> io::Result<Command> {
     let mut command = Command::new(git_executable()?);
-    command.args(args).current_dir(root);
+    configure_git_command(&mut command, root);
+    Ok(command)
+}
+
+fn git_optional(root: &Path, args: &[&str]) -> io::Result<Option<Vec<u8>>> {
+    let mut command = git_command(root)?;
+    command.args(args);
     let output = command_output_bounded(&mut command)?;
     Ok(output.status.success().then_some(output.stdout))
 }
 
 fn git(root: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
-    let mut command = Command::new(git_executable()?);
-    command.args(args).current_dir(root);
+    let mut command = git_command(root)?;
+    command.args(args);
     let output = command_output_bounded(&mut command)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
@@ -868,7 +878,7 @@ mod tests {
     use sha2::Sha256;
 
     use super::{
-        WORKSPACE_FILE_BYTE_LIMIT, command_output_bounded, hash_file_frame,
+        WORKSPACE_FILE_BYTE_LIMIT, command_output_bounded, configure_git_command, hash_file_frame,
         is_trusted_system_executable_path,
     };
 
@@ -882,6 +892,17 @@ mod tests {
         assert!(!is_trusted_system_executable_path(Path::new(
             "/opt/homebrew/bin/git"
         )));
+    }
+
+    #[test]
+    fn audited_git_commands_ignore_ambient_system_configuration() {
+        let mut command = Command::new("unused-test-program");
+        configure_git_command(&mut command, Path::new("."));
+        let clean_system_config = command
+            .get_envs()
+            .find(|(name, _)| *name == "GIT_CONFIG_NOSYSTEM")
+            .and_then(|(_, value)| value);
+        assert_eq!(clean_system_config, Some(std::ffi::OsStr::new("1")));
     }
 
     #[test]

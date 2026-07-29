@@ -8,6 +8,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 const RUN_ENV: &str = "NOPAL_RUN_REAL_PI_ENFORCEMENT_E2E";
+const SYSTEM_GIT_REWRITE_ENV: &str = "NOPAL_TEST_SYSTEM_GIT_REWRITE";
+
+struct SystemGitRewriteGuard {
+    git: PathBuf,
+    key: String,
+}
+
+impl Drop for SystemGitRewriteGuard {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.git)
+            .args(["config", "--system", "--unset-all", &self.key])
+            .output();
+    }
+}
 
 fn command(dir: &Path, program: &Path, args: &[&str]) {
     let output = Command::new(program)
@@ -73,6 +87,7 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
     let temp = tempfile::tempdir().unwrap();
     let repo = temp.path().join("repo");
     let remote = temp.path().join("remote.git");
+    let rewritten_remote = temp.path().join("system-rewritten-remote.git");
     let state = temp.path().join("state");
     let home = temp.path().join("home");
     let agent = temp.path().join("agent");
@@ -175,6 +190,31 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
         &git,
         &["push", "origin", "HEAD:refs/heads/protected-delete-proof"],
     );
+    let system_git_rewrite = if std::env::var(SYSTEM_GIT_REWRITE_ENV).as_deref() == Ok("1") {
+        command(
+            temp.path(),
+            &git,
+            &["init", "--bare", rewritten_remote.to_str().unwrap()],
+        );
+        let key = format!("url.{}.insteadOf", rewritten_remote.display());
+        command(
+            temp.path(),
+            &git,
+            &[
+                "config",
+                "--system",
+                "--add",
+                &key,
+                remote.to_str().unwrap(),
+            ],
+        );
+        Some(SystemGitRewriteGuard {
+            git: git.clone(),
+            key,
+        })
+    } else {
+        None
+    };
 
     write(
         &repo.join(".nopal/nopal.jsonc"),
@@ -209,10 +249,18 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
     );
     let gate_count = temp.path().join("gate-count");
     let gate_script = repo.join("gate-proof.sh");
+    let capability_probe = if system_git_rewrite.is_some() {
+        // Linux procfs can expose blocking inherited pipes while this separate
+        // proof exercises system Git isolation. The default run still owns the
+        // capability-leak assertion.
+        ""
+    } else {
+        "for fd in /dev/fd/[3-9]* /proc/$PPID/fd/*; do [ -r \"$fd\" ] || continue; value=$(dd if=\"$fd\" bs=64 count=1 2>/dev/null); case \"$value\" in ????????????????????????????????????????????????????????????????) exit 91;; esac; done\n"
+    };
     write(
         &gate_script,
         &format!(
-            "#!/bin/sh\nfor fd in /dev/fd/[3-9]* /proc/$PPID/fd/*; do [ -r \"$fd\" ] || continue; value=$(dd if=\"$fd\" bs=64 count=1 2>/dev/null); case \"$value\" in ????????????????????????????????????????????????????????????????) exit 91;; esac; done\ncount=$(cat {:?} 2>/dev/null || echo 0)\necho $((count + 1)) > {:?}\n",
+            "#!/bin/sh\n{capability_probe}count=$(cat {:?} 2>/dev/null || echo 0)\necho $((count + 1)) > {:?}\n",
             gate_count, gate_count
         ),
     );
@@ -424,6 +472,22 @@ fn real_bare_nopal_enforces_allowed_denied_and_stale_pushes() {
         local_head.stdout, remote_head.stdout,
         "compound authorization must block the whole shell envelope before its normal-push prefix executes"
     );
+    if system_git_rewrite.is_some() {
+        let rewritten_head = Command::new(&git)
+            .args([
+                "--git-dir",
+                rewritten_remote.to_str().unwrap(),
+                "show-ref",
+                "--verify",
+                "refs/heads/main",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !rewritten_head.status.success(),
+            "the protected Pi Git execution honored unaudited system target rewriting"
+        );
+    }
     assert!(
         !fs::read_to_string(repo.join("source.txt"))
             .unwrap()
