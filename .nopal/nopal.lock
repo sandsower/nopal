@@ -1,6 +1,6 @@
 {
   "version": "nopal.lock/v1",
-  "contract_digest": "sha256:999706e85d54e710be6615b669a522bba9717b68223ef637e55240f7e34512a8",
+  "contract_digest": "sha256:8d9315c200abb3e735975c54439e1c6f983bb32349f08561a2e9bc3084d93736",
   "packages": [
     {
       "id": "nopal",
@@ -8,7 +8,7 @@
         "type": "builtin",
         "package": "nopal"
       },
-      "resolved": "0.2.20",
+      "resolved": "0.2.21",
       "artifact_integrity": "sha256:7ccef3d3cf2bf20729b4963b54f7454a19cb9e0ef6e2217f4753f55fc520b4bc",
       "installed_tree_integrity": "sha256:7ccef3d3cf2bf20729b4963b54f7454a19cb9e0ef6e2217f4753f55fc520b4bc",
       "resources": [
