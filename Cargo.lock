@@ -2616,7 +2616,7 @@ dependencies = [
 
 [[package]]
 name = "nopal-cli"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "base64",
  "clap",
@@ -2641,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "nopal-core"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "base64",
  "cap-fs-ext",
@@ -2664,7 +2664,7 @@ dependencies = [
 
 [[package]]
 name = "nopal-desktop-spike"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "alacritty_terminal",
  "async-channel",
@@ -2686,7 +2686,7 @@ dependencies = [
 
 [[package]]
 name = "nopal-feed-client"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "serde",
  "serde_json",
@@ -2694,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "nopal-field"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "alacritty_terminal",
  "base64",
@@ -2710,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "nopal-field-presentation"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "nopal-feed-client",
  "nopal-native-lifecycle",
@@ -2721,7 +2721,7 @@ dependencies = [
 
 [[package]]
 name = "nopal-ledger-json"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "serde",
  "serde_json",
@@ -2729,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "nopal-native-lifecycle"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "fs2",
  "getrandom 0.3.4",
@@ -2743,7 +2743,7 @@ dependencies = [
 
 [[package]]
 name = "nopal-rondo-client"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "serde",
  "serde_json",
@@ -2753,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "nopal-rondo-lifecycle"
-version = "0.2.19"
+version = "0.2.20"
 dependencies = [
  "fs2",
  "getrandom 0.3.4",

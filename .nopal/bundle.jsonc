@@ -7,7 +7,7 @@
     {
       "id": "nopal",
       "source": { "type": "builtin", "package": "nopal" },
-      "requirement": "=0.2.19",
+      "requirement": "=0.2.20",
       "resources": [
         { "kind": "extension", "path": "index.ts" }
       ]
