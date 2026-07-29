@@ -96,6 +96,32 @@ export NOPAL_RELEASE_THIRD_PARTY_LICENSES="$fake_licenses"
 export NOPAL_RELEASE_TEST_NODE_SHA256="$node_sha"
 export NOPAL_RELEASE_TEST_PI_INTEGRITY="$pi_integrity"
 
+runtime_mismatch_tree="$tmp/runtime-mismatch-tree"
+mkdir "$runtime_mismatch_tree"
+printf 'native closure\n' > "$runtime_mismatch_tree/member"
+wrong_runtime_integrity=sha256:0000000000000000000000000000000000000000000000000000000000000000
+if "$repo_root/scripts/verify-runtime-integrity.sh" \
+  "test runtime" "$runtime_mismatch_tree" "$wrong_runtime_integrity" \
+  >"$tmp/runtime-mismatch.out" 2>"$tmp/runtime-mismatch.err"; then
+  fail "runtime verifier accepted an incorrect complete-tree identity"
+fi
+actual_runtime_integrity=$(python3 "$repo_root/scripts/hash-runtime-tree.py" \
+  "$runtime_mismatch_tree")
+grep -q "test runtime has integrity $actual_runtime_integrity" \
+  "$tmp/runtime-mismatch.err" \
+  || fail "runtime verifier did not report actual complete-tree identity"
+grep -q "expected $wrong_runtime_integrity" "$tmp/runtime-mismatch.err" \
+  || fail "runtime verifier did not report expected complete-tree identity"
+
+linux_pi_integrity=sha256:1b7f4f85e0f36eafd10f3db15a6d4ba58087cf10e96ec3cee2e0d5bd00c5e2c1
+for release_contract in \
+  "$repo_root/crates/nopal-cli/src/main.rs" \
+  "$repo_root/scripts/package-release.sh" \
+  "$repo_root/.github/workflows/release.yml"; do
+  grep -q "$linux_pi_integrity" "$release_contract" \
+    || fail "Linux Pi closure identity is not pinned in $release_contract"
+done
+
 source_fixture="$tmp/source-fixture"
 mkdir "$source_fixture"
 git -c init.templateDir= -c init.defaultBranch=main -C "$source_fixture" init -q

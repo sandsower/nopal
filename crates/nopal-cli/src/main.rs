@@ -2333,7 +2333,7 @@ const TRUSTED_PI_RUNTIME_INTEGRITY: &str =
     "sha256:2a49edc0cbfae11a095051da5d6d79cd994c85c555ee4f24c74ec3700ef34b4e";
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const TRUSTED_PI_RUNTIME_INTEGRITY: &str =
-    "sha256:7496869e98bed7cdfa6f12130e4d0bb05c2fc3e7494cb8cb3be5dc81fdff063e";
+    "sha256:1b7f4f85e0f36eafd10f3db15a6d4ba58087cf10e96ec3cee2e0d5bd00c5e2c1";
 
 fn packaged_pi_binary(executable: &Path) -> Option<PathBuf> {
     executable_parents(executable)

@@ -41,7 +41,7 @@ case "$target" in
     ;;
   x86_64-unknown-linux-gnu)
     expected_node_sha=1bec56ef7cfa9a76f3e0b7c0a87f220eb73f23102b9c0b4c7529a3f7c3ce7c31
-    expected_pi_integrity=sha256:7496869e98bed7cdfa6f12130e4d0bb05c2fc3e7494cb8cb3be5dc81fdff063e
+    expected_pi_integrity=sha256:1b7f4f85e0f36eafd10f3db15a6d4ba58087cf10e96ec3cee2e0d5bd00c5e2c1
     ;;
   test-release-target)
     expected_node_sha=${NOPAL_RELEASE_TEST_NODE_SHA256:?test target requires NOPAL_RELEASE_TEST_NODE_SHA256}
@@ -139,11 +139,8 @@ if [ "$node_sha" != "$expected_node_sha" ]; then
   echo "release Node executable has SHA-256 $node_sha, expected $expected_node_sha" >&2
   exit 1
 fi
-pi_integrity=$(python3 "$repo_root/scripts/hash-runtime-tree.py" "$pi_root")
-if [ "$pi_integrity" != "$expected_pi_integrity" ]; then
-  echo "release Pi runtime has integrity $pi_integrity, expected $expected_pi_integrity" >&2
-  exit 1
-fi
+pi_integrity=$("$repo_root/scripts/verify-runtime-integrity.sh" \
+  "release Pi runtime" "$pi_root" "$expected_pi_integrity")
 
 mkdir -p "$output_dir"
 stem="nopal-$tag-$target"
