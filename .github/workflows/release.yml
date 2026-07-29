@@ -64,6 +64,9 @@ jobs:
     needs: licenses
     permissions:
       contents: read
+    # npm selects transitive native optional packages from the host OS, so each
+    # complete Pi closure identity is measured on its target platform rather
+    # than inferred from a cross-platform installation.
     strategy:
       fail-fast: false
       matrix:
@@ -82,7 +85,7 @@ jobs:
             target: x86_64-unknown-linux-gnu
             node_archive: node-v22.22.0-linux-x64.tar.gz
             node_archive_sha256: c33c39ed9c80deddde77c960d00119918b9e352426fd604ba41638d6526a4744
-            pi_runtime_integrity: sha256:7496869e98bed7cdfa6f12130e4d0bb05c2fc3e7494cb8cb3be5dc81fdff063e
+            pi_runtime_integrity: sha256:1b7f4f85e0f36eafd10f3db15a6d4ba58087cf10e96ec3cee2e0d5bd00c5e2c1
     runs-on: ${{ matrix.runner }}
     env:
       RELEASE_TAG: ${{ inputs.tag }}
@@ -139,7 +142,11 @@ jobs:
             --update-notifier=false \
             @earendil-works/pi-coding-agent@0.80.6
           mv _runtime/pi-prefix/lib/node_modules/@earendil-works/pi-coding-agent _runtime/pi
-          test "$(python3 scripts/hash-runtime-tree.py _runtime/pi)" = "$PI_RUNTIME_INTEGRITY"
+          scripts/verify-runtime-integrity.sh \
+            "staged Pi ${{ matrix.target }} runtime" \
+            _runtime/pi \
+            "$PI_RUNTIME_INTEGRITY" \
+            >/dev/null
       - name: Build release binary
         env:
           NOPAL_BUILD_COMMIT: ${{ steps.source.outputs.commit }}
