@@ -4,7 +4,10 @@ Nopal is an opinionated Pi distribution with deterministic workflow, gate, and a
 Its canonical domain is [nopal.sh](https://nopal.sh), and its source repository is [`sandsower/nopal`](https://github.com/sandsower/nopal).
 
 Pi owns interaction, models, tools, and sessions.
+Pi owns its built-in prompts, themes, and host defaults.
 Beislið owns prose-first workflow meaning and the curated skills shipped by Nopal.
+Nopal owns deterministic project defaults but does not replace Pi's interaction resources.
+Nopal does not ship a parallel prompt or theme layer.
 Nopal Core owns deterministic compilation, policy composition, gate selection, receipt validation, and Workflow Run Ledger evidence.
 The Nopal CLI owns confined process execution, durable effects, runtime integrity, and the handoff to Pi.
 
@@ -15,7 +18,9 @@ Running `pi` directly starts a plain Pi session and carries no Nopal enforcement
 Nopal never falls back to an unenforced Pi session when initialization fails.
 
 Nopal v0.3 is a clean break from the earlier agent-management product.
-The former management UI, desktop runtime, coordination protocols, and compatibility commands are absent from the active product and release archives.
+`v0.2.16` is the final release before transformation work began.
+Versions `v0.2.17` through `v0.2.21` are transitional releases that still contain management-era architecture, and `v0.2.21` is the final v0.2 release.
+The former management UI, desktop runtime, coordination protocols, and compatibility commands are absent from the active v0.3 product and release archives.
 Git history and the final v0.2 release marker preserve that implementation.
 Detectable old commands and project modules stop with `nopal.migration/v1` diagnostics that explain the supported v0.3 replacement without executing an alias.
 
@@ -29,8 +34,8 @@ Download the archive for Apple Silicon macOS, Intel macOS, or x86-64 Linux with 
 Then install it under an absolute prefix:
 
 ```sh
-tar -xzf nopal-v0.3.0-<target>.tar.gz
-cd nopal-v0.3.0-<target>
+tar -xzf nopal-v<version>-<target>.tar.gz
+cd nopal-v<version>-<target>
 ./install install "$HOME/.local"
 export PATH="$HOME/.local/bin:$PATH"
 ```

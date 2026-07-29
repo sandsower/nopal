@@ -48,7 +48,10 @@ Gate recording rejects results when the contract, workspace, or gate definition 
 A relevant workspace or contract change makes the receipt stale.
 Decisions, gate attempts, and receipts are recorded in the Workflow Run Ledger.
 
-The v0.3 distribution includes Pi, Beislið, the Nopal CLI and enforcement adapter, and curated resources.
+The v0.3 distribution includes exact Pi, pinned Beislið skills, the Nopal CLI and enforcement adapter, and deterministic project defaults.
+Pi owns its built-in prompts, themes, and host defaults.
+Beislið owns the curated prose skills.
+Nopal does not ship a parallel prompt or theme layer because doing so would duplicate Pi's interaction surface.
 Rondo, Memento, Herdr, and agent-management integrations are not part of the active product contract.
 Optional integration profiles may be designed later without restoring those dependencies to the default distribution.
 
@@ -59,7 +62,9 @@ Actions outside Nopal-launched Pi sessions receive no Nopal enforcement claim.
 A missing extension, invalid effective contract, unavailable ledger, or failed Core round trip stops launch or blocks the protected action rather than falling back to plain Pi.
 
 The current agent-management implementation is removed from active `main` before v0.3 ships.
-Git history and a pre-reset marker preserve the former product without compatibility runtime aliases.
+`v0.2.16` is the final pre-transformation release.
+Versions `v0.2.17` through `v0.2.21` are transitional releases that retain management-era architecture, and `v0.2.21` is the final v0.2 release.
+Git history and those immutable release tags preserve the former product without compatibility runtime aliases.
 The smaller product leaves Pi free to evolve its own interaction surfaces while Nopal concentrates on deterministic process enforcement and evidence.
 
 ## Rejected alternatives

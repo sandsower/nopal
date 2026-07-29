@@ -77,6 +77,15 @@ done
 if ! grep -Eq 'plain Pi session.*no Nopal enforcement guarantee' README.md; then
   fail "README does not state the plain Pi assurance boundary"
 fi
+if ! grep -Fq '`v0.2.16` is the final pre-transformation release.' CONTEXT.md \
+  || ! grep -Fq '`v0.2.21` is the final v0.2 release containing the management architecture.' CONTEXT.md \
+  || ! grep -Fq 'Versions `v0.2.17` through `v0.2.21` are transitional releases' README.md; then
+  fail "public documentation does not match the published v0.2 transition history"
+fi
+if ! grep -Fq 'Pi owns its built-in prompts, themes, and host defaults.' README.md \
+  || ! grep -Fq 'Nopal does not ship a parallel prompt or theme layer.' README.md; then
+  fail "public documentation does not preserve Pi and Nopal resource ownership"
+fi
 if ! grep -q 'rollback' README.md || ! grep -q 'offline' README.md; then
   fail "README does not document rollback and offline launch"
 fi

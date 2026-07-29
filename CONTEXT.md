@@ -1,8 +1,9 @@
 # Nopal
 
 Nopal is an opinionated Pi distribution with deterministic workflow, gate, and action-policy enforcement.
-Pi owns interaction and sessions.
+Pi owns interaction, sessions, and its built-in prompts, themes, and host defaults.
 Beislið owns prose-first workflow meaning and skills.
+Nopal owns deterministic project defaults and does not ship a parallel prompt or theme layer.
 Nopal Core compiles typed authority, decides what is permitted and required, and records evidence.
 The bundled Pi adapter mediates protected tool calls and executes selected gates.
 
@@ -14,9 +15,9 @@ It validates the effective contract, initializes enforcement, and starts Pi dire
 _Avoid_: adding a second interaction surface, process dashboard, or agent manager
 
 **Pi**:
-The host and interaction surface for sessions, models, prompts, tools, and agent loops.
-Nopal extends Pi rather than wrapping it in another management UI.
-_Avoid_: reimplementing Pi sessions or treating Nopal as the conversation owner
+The host and interaction surface for sessions, models, prompts, themes, defaults, tools, and agent loops.
+Nopal extends Pi rather than wrapping it in another management UI or prompt and theme layer.
+_Avoid_: reimplementing Pi sessions, prompts, themes, or treating Nopal as the conversation owner
 
 **Beislið**:
 The prose-first workflow and skill layer.
@@ -116,8 +117,11 @@ _Avoid_: retroactively describing external work as enforced
 ## Resolved product decisions
 
 - Nopal v0.3 is a clean break from the v0.2 agent-management product.
-- `v0.2.16` is the final agent-management release.
-- The default distribution consists of Pi, Beislið, the Nopal CLI and enforcement adapter, and curated resources.
+- `v0.2.16` is the final pre-transformation release.
+- Versions `v0.2.17` through `v0.2.21` are transitional releases that still contain management-era architecture.
+- `v0.2.21` is the final v0.2 release containing the management architecture.
+- The default distribution consists of pinned Pi and its host-owned interaction resources, pinned Beislið skills, the Nopal CLI and enforcement adapter, and deterministic project defaults.
+- Nopal ships no parallel prompt or theme layer.
 - Bare launch is offline and deterministic.
 - Network synchronization and updates are explicit commands rather than launch side effects.
 - The active source tree and release archives contain no superseded management or integration implementation.
