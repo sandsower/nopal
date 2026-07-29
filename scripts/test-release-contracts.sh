@@ -49,6 +49,13 @@ grep -Fq 'node-v22.22.0' "$workflow" \
   || fail "release workflow does not fetch official Node 22.22.0"
 grep -Fq 'scripts/package-release.sh' "$workflow" \
   || fail "release workflow does not use the deterministic packager"
+[ "$(grep -Fc 'ref: ${{ inputs.commit }}' "$workflow")" -eq 3 ] \
+  || fail "every release job must check out the immutable input commit"
+[ "$(grep -Fc 'git rev-parse "$RELEASE_TAG^{commit}"' "$workflow")" -eq 3 ] \
+  || fail "every release job must bind the tag to the immutable input commit"
+if grep -q '^  push:' "$workflow" || grep -Fq 'ref: ${{ env.RELEASE_TAG }}' "$workflow"; then
+  fail "release workflow permits mutable tag-triggered script execution"
+fi
 
 fake_binary="$tmp/nopal"
 fake_node="$tmp/node"
@@ -88,6 +95,57 @@ export NOPAL_RELEASE_PI_ROOT="$fake_pi"
 export NOPAL_RELEASE_THIRD_PARTY_LICENSES="$fake_licenses"
 export NOPAL_RELEASE_TEST_NODE_SHA256="$node_sha"
 export NOPAL_RELEASE_TEST_PI_INTEGRITY="$pi_integrity"
+
+source_fixture="$tmp/source-fixture"
+mkdir "$source_fixture"
+git -c init.templateDir= -c init.defaultBranch=main -C "$source_fixture" init -q
+git -C "$source_fixture" config user.name "Release Contract"
+git -C "$source_fixture" config user.email "release-contract@nopal.invalid"
+printf '[workspace]\n\n[workspace.package]\nversion = "%s"\n' "$version" \
+  > "$source_fixture/Cargo.toml"
+printf 'committed\n' > "$source_fixture/tracked.txt"
+git -C "$source_fixture" add Cargo.toml tracked.txt
+git -C "$source_fixture" commit -q -m source
+git -C "$source_fixture" tag "$tag"
+printf 'dirty\n' > "$source_fixture/tracked.txt"
+if NOPAL_RELEASE_SOURCE_ROOT="$source_fixture" sh "$repo_root/scripts/package-release.sh" \
+  aarch64-apple-darwin "$tag" "$tmp/dirty-output" \
+  >"$tmp/dirty-source.out" 2>"$tmp/dirty-source.err"; then
+  fail "production packaging accepted a dirty tagged source tree"
+fi
+grep -q 'release source must be a clean tagged worktree' "$tmp/dirty-source.err" \
+  || fail "dirty release source rejection was not explained"
+git -C "$source_fixture" checkout -q -- tracked.txt
+printf 'next commit\n' > "$source_fixture/tracked.txt"
+git -C "$source_fixture" add tracked.txt
+git -C "$source_fixture" commit -q -m next
+if NOPAL_RELEASE_SOURCE_ROOT="$source_fixture" sh "$repo_root/scripts/package-release.sh" \
+  aarch64-apple-darwin "$tag" "$tmp/mismatched-tag-output" \
+  >"$tmp/mismatched-tag.out" 2>"$tmp/mismatched-tag.err"; then
+  fail "production packaging accepted a tag that did not name source HEAD"
+fi
+grep -q 'expected source HEAD' "$tmp/mismatched-tag.err" \
+  || fail "tag/source mismatch rejection was not explained"
+
+for parent in mode-a mode-b; do
+  mkdir -p "$tmp/$parent/root/nested"
+  printf 'regular\n' > "$tmp/$parent/root/nested/regular"
+  printf '#!/bin/sh\nexit 0\n' > "$tmp/$parent/root/executable"
+  chmod 0755 "$tmp/$parent/root/executable"
+  ln -s nested/regular "$tmp/$parent/root/link"
+done
+chmod 0700 "$tmp/mode-a/root" "$tmp/mode-a/root/nested"
+chmod 0600 "$tmp/mode-a/root/nested/regular"
+chmod 4711 "$tmp/mode-a/root/executable"
+chmod 0755 "$tmp/mode-b/root" "$tmp/mode-b/root/nested"
+chmod 0644 "$tmp/mode-b/root/nested/regular"
+chmod 0755 "$tmp/mode-b/root/executable"
+python3 "$repo_root/scripts/create-release-archive.py" \
+  "$tmp/mode-a/root" "$tmp/mode-a.tar.gz" >/dev/null
+python3 "$repo_root/scripts/create-release-archive.py" \
+  "$tmp/mode-b/root" "$tmp/mode-b.tar.gz" >/dev/null
+cmp "$tmp/mode-a.tar.gz" "$tmp/mode-b.tar.gz" \
+  || fail "identity-equivalent input permissions changed archive bytes"
 
 target=test-release-target
 stem="nopal-$tag-$target"
@@ -177,6 +235,31 @@ fi
   || fail "failed install changed the current release"
 [ ! -e "$blocked_prefix/lib/nopal/9.9.9-$target" ] \
   || fail "failed install copied release bytes before launcher preflight"
+
+conflict_prefix="$tmp/conflict-prefix"
+"$root/install" install "$conflict_prefix" >/dev/null
+conflict_release="$conflict_prefix/lib/nopal/$version-$target"
+printf 'tampered Pi bytes\n' > "$conflict_release/runtime/pi/dist/cli.js"
+if "$root/install" install "$conflict_prefix" >"$tmp/reinstall.out" 2>"$tmp/reinstall.err"; then
+  fail "reinstallation accepted conflicting Pi runtime bytes"
+fi
+grep -q 'installed release identity conflicts' "$tmp/reinstall.err" \
+  || fail "full-tree reinstall conflict was not explained"
+
+for privileged_mode in 4755 2755 1755; do
+  mode_prefix="$tmp/mode-prefix-$privileged_mode"
+  "$root/install" install "$mode_prefix" >/dev/null
+  mode_release="$mode_prefix/lib/nopal/$version-$target"
+  chmod "$privileged_mode" "$mode_release/nopal"
+  if "$root/install" install "$mode_prefix" \
+    >"$tmp/mode-reinstall-$privileged_mode.out" \
+    2>"$tmp/mode-reinstall-$privileged_mode.err"; then
+    fail "reinstallation accepted privileged mode $privileged_mode"
+  fi
+  grep -q 'installed release identity conflicts' \
+    "$tmp/mode-reinstall-$privileged_mode.err" \
+    || fail "privileged mode $privileged_mode conflict was not explained"
+done
 
 saved="$tmp/saved.tar.gz"
 cp "$archive" "$saved"

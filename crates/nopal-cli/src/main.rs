@@ -1649,7 +1649,12 @@ fn resolve_data_dir() -> std::io::Result<PathBuf> {
 /// root, so an arbitrary candidate cannot become trusted by path alone.
 fn resolve_builtin_distribution_root() -> std::io::Result<PathBuf> {
     let mut candidates = Vec::new();
-    if let Some(root) = std::env::var_os("NOPAL_DISTRIBUTION_ROOT") {
+    // Production authority must come from the immutable installed release.
+    // The override exists only for debug proofs that construct adversarial
+    // distributions without mutating packaged bytes.
+    if cfg!(debug_assertions)
+        && let Some(root) = std::env::var_os("NOPAL_DISTRIBUTION_ROOT")
+    {
         let root = PathBuf::from(root);
         candidates.push(root.clone());
         candidates.push(root.join("share/nopal"));
@@ -1657,7 +1662,9 @@ fn resolve_builtin_distribution_root() -> std::io::Result<PathBuf> {
     if let Ok(executable) = std::env::current_exe() {
         candidates.extend(packaged_distribution_candidates(&executable));
     }
-    candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    if cfg!(debug_assertions) {
+        candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    }
     resolve_builtin_distribution_root_from(candidates)
 }
 
@@ -2356,7 +2363,7 @@ fn resolve_pi_binary() -> std::io::Result<PathBuf> {
         .and_then(|executable| packaged_pi_binary(&executable))
     {
         path
-    } else {
+    } else if cfg!(debug_assertions) {
         let path = std::env::var_os("PATH").ok_or_else(|| {
             std::io::Error::other("cannot resolve trusted Pi binary without PATH")
         })?;
@@ -2368,6 +2375,11 @@ fn resolve_pi_binary() -> std::io::Result<PathBuf> {
                     "cannot resolve packaged Pi runtime or an exact installed Pi binary on PATH",
                 )
             })?
+    } else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "the installed Nopal release has no packaged Pi runtime",
+        ));
     };
     let canonical = candidate.canonicalize().map_err(|error| {
         std::io::Error::new(
@@ -2427,22 +2439,30 @@ fn resolve_pi_node() -> std::io::Result<Option<PathBuf>> {
         all(target_os = "linux", target_arch = "x86_64")
     ))]
     {
-        let path = std::env::current_exe()
+        let packaged = std::env::current_exe()
             .ok()
-            .and_then(|executable| packaged_node_binary(&executable))
-            .or_else(|| {
-                std::env::var_os("PATH").and_then(|path| {
+            .and_then(|executable| packaged_node_binary(&executable));
+        let candidate = if let Some(packaged) = packaged {
+            packaged
+        } else if cfg!(debug_assertions) {
+            std::env::var_os("PATH")
+                .and_then(|path| {
                     std::env::split_paths(&path)
                         .map(|directory| directory.join("node"))
                         .find(|candidate| candidate.is_file())
                 })
-            })
-            .ok_or_else(|| {
-                std::io::Error::other(
-                    "cannot resolve packaged Node runtime or an exact installed Node on PATH",
-                )
-            })?
-            .canonicalize()?;
+                .ok_or_else(|| {
+                    std::io::Error::other(
+                        "cannot resolve packaged Node runtime or an exact installed Node on PATH",
+                    )
+                })?
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "the installed Nopal release has no packaged Node runtime",
+            ));
+        };
+        let path = candidate.canonicalize()?;
         validate_executable_identity_against(&path, TRUSTED_NODE_INTEGRITY)?;
         Ok(Some(path))
     }

@@ -18,8 +18,11 @@ if [[ -n "$unexpected_beislid" ]]; then
   failed=1
 fi
 
+# Pinned Beislið resources are byte-for-byte vendored upstream material with
+# separately verified provenance, so their upstream examples are not Nopal-authored shorthand.
 if git grep -nE '(OLI|RON|BEI|MEM)-[0-9]+' -- \
-  ':(exclude)scripts/check-public-tree.sh'; then
+  ':(exclude)scripts/check-public-tree.sh' \
+  ':(exclude)resources/beislid/**'; then
   echo "public-tree: tracked files must explain behavior without private ticket shorthand" >&2
   failed=1
 fi

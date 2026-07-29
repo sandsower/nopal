@@ -1,9 +1,6 @@
 name: release
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_call:
     inputs:
       tag:
@@ -19,7 +16,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -29,12 +26,18 @@ jobs:
     permissions:
       contents: read
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      EXPECTED_COMMIT: ${{ inputs.commit }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Verify immutable tagged source
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$EXPECTED_COMMIT"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: "1.95.0"
@@ -82,20 +85,21 @@ jobs:
             pi_runtime_integrity: sha256:7496869e98bed7cdfa6f12130e4d0bb05c2fc3e7494cb8cb3be5dc81fdff063e
     runs-on: ${{ matrix.runner }}
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      EXPECTED_COMMIT: ${{ inputs.commit }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Resolve tagged commit
         id: source
-        env:
-          EXPECTED_COMMIT: ${{ inputs.commit }}
         run: |
           commit=$(git rev-parse HEAD)
-          if [ -n "$EXPECTED_COMMIT" ] && [ "$commit" != "$EXPECTED_COMMIT" ]; then
-            echo "tag $RELEASE_TAG resolved to $commit, expected $EXPECTED_COMMIT" >&2
+          tagged_commit=$(git rev-parse "$RELEASE_TAG^{commit}")
+          if [ "$commit" != "$EXPECTED_COMMIT" ] || [ "$tagged_commit" != "$EXPECTED_COMMIT" ]; then
+            echo "release source resolved to $commit and tag to $tagged_commit, expected $EXPECTED_COMMIT" >&2
             exit 1
           fi
           echo "commit=$commit" >> "$GITHUB_OUTPUT"
@@ -155,9 +159,9 @@ jobs:
           root=$(tar -tzf "$archive" | head -1 | sed 's:/$::')
           mkdir unpacked installed
           tar -xzf "$archive" -C unpacked
-          unpacked/$root/nopal info --json > /tmp/nopal-info.json
+          "unpacked/$root/nopal" info --json > /tmp/nopal-info.json
           jq -e '.kind == "nopal.info/v1" and .ok == true' /tmp/nopal-info.json >/dev/null
-          unpacked/$root/install install "$PWD/installed"
+          "unpacked/$root/install" install "$PWD/installed"
           installed/bin/nopal info --json >/dev/null
           scripts/prove-packaged-launch.sh "$PWD/installed/bin/nopal"
           scripts/check-release-archive.sh "$archive"
@@ -174,12 +178,18 @@ jobs:
     permissions:
       contents: write
     env:
-      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      EXPECTED_COMMIT: ${{ inputs.commit }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ env.RELEASE_TAG }}
+          ref: ${{ inputs.commit }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Verify immutable tagged source before publication
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"
+          test "$(git rev-parse "$RELEASE_TAG^{commit}")" = "$EXPECTED_COMMIT"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: nopal-*

@@ -105,8 +105,41 @@ destination="$releases/$identity"
 mkdir -p "$releases" "$bin_dir"
 preflight_launcher
 if [ -e "$destination" ]; then
-  if [ ! -d "$destination" ] || ! cmp -s "$source_root/distribution.json" "$destination/distribution.json" \
-    || ! cmp -s "$source_root/nopal" "$destination/nopal"; then
+  if [ ! -d "$destination" ] || ! "$runtime_node" -e '
+const fs = require("node:fs");
+const path = require("node:path");
+function kind(stat) {
+  if (stat.isSymbolicLink()) return "link";
+  if (stat.isDirectory()) return "directory";
+  if (stat.isFile()) return "file";
+  return "unsupported";
+}
+function compare(left, right, relative = ".") {
+  const a = fs.lstatSync(left);
+  const b = fs.lstatSync(right);
+  const aKind = kind(a);
+  const bKind = kind(b);
+  if (aKind !== bKind || aKind === "unsupported") throw new Error(`${relative}: entry kind differs`);
+  if ((a.mode & 0o7777) !== (b.mode & 0o7777)) throw new Error(`${relative}: entry mode differs`);
+  if (aKind === "link") {
+    if (fs.readlinkSync(left) !== fs.readlinkSync(right)) throw new Error(`${relative}: link target differs`);
+    return;
+  }
+  if (aKind === "file") {
+    if (a.size !== b.size || !fs.readFileSync(left).equals(fs.readFileSync(right))) {
+      throw new Error(`${relative}: file bytes differ`);
+    }
+    return;
+  }
+  const aNames = fs.readdirSync(left).sort();
+  const bNames = fs.readdirSync(right).sort();
+  if (aNames.length !== bNames.length || aNames.some((name, index) => name !== bNames[index])) {
+    throw new Error(`${relative}: directory members differ`);
+  }
+  for (const name of aNames) compare(path.join(left, name), path.join(right, name), path.join(relative, name));
+}
+compare(process.argv[1], process.argv[2]);
+' "$source_root" "$destination"; then
     echo "installed release identity conflicts with different bytes: $destination" >&2
     exit 1
   fi

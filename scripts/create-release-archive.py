@@ -37,16 +37,19 @@ def normalized_info(path: Path, arcname: str) -> tarfile.TarInfo:
     info.uname = "root"
     info.gname = "root"
     info.mtime = FIXED_MTIME
-    info.mode = stat.S_IMODE(metadata.st_mode)
+    source_mode = stat.S_IMODE(metadata.st_mode)
     info.pax_headers = {}
     if path.is_symlink():
         info.type = tarfile.SYMTYPE
+        info.mode = 0o777
         info.linkname = os.readlink(path)
     elif path.is_dir():
         info.type = tarfile.DIRTYPE
+        info.mode = 0o755
         info.size = 0
     elif path.is_file():
         info.type = tarfile.REGTYPE
+        info.mode = 0o755 if source_mode & 0o111 else 0o644
         info.size = metadata.st_size
     else:
         raise ValueError(f"unsupported release entry: {path}")

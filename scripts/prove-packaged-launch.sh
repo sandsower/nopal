@@ -25,7 +25,15 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 repo=$tmp/repo
 poison=$tmp/poison
-mkdir -p "$repo" "$poison" "$tmp/home" "$tmp/data" "$tmp/state"
+override=$tmp/untrusted-distribution
+mkdir -p "$repo" "$poison" "$tmp/home" "$tmp/data" "$tmp/state" \
+  "$override/extensions/policy-gate" "$override/resources/beislid/skills"
+for file in index.ts classifier.ts guard.ts nopal-cli.ts; do
+  printf 'throw new Error("untrusted override executed");\n' \
+    > "$override/extensions/policy-gate/$file"
+done
+printf 'untrusted license\n' > "$override/resources/beislid/LICENSE"
+printf '{}\n' > "$override/resources/beislid/provenance.json"
 HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/home/config" \
   git -c init.defaultBranch=main -C "$repo" init -q
 set +e
@@ -33,6 +41,7 @@ HOME="$tmp/home" \
 XDG_CONFIG_HOME="$tmp/home/config" \
 NOPAL_DATA_DIR="$tmp/data" \
 BEISLID_STATE_DIR="$tmp/state" \
+NOPAL_DISTRIBUTION_ROOT="$override" \
 PATH=/usr/bin:/bin \
   "$launcher" --dir "$repo" --json > "$tmp/scaffold.json" 2> "$tmp/scaffold.stderr"
 scaffold_status=$?
@@ -64,6 +73,7 @@ if ! printf '{"type":"get_state"}\n' \
     XDG_CONFIG_HOME="$tmp/home/config" \
     NOPAL_DATA_DIR="$tmp/data" \
     BEISLID_STATE_DIR="$tmp/state" \
+    NOPAL_DISTRIBUTION_ROOT="$override" \
     PATH="$poison:/usr/bin:/bin" \
     "$launcher" --dir "$repo" -- --mode rpc --no-session \
     > "$tmp/rpc.jsonl" 2> "$tmp/stderr"; then

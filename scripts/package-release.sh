@@ -61,6 +61,17 @@ for executable in "$binary" "$node_binary"; do
 done
 version=$(release_workspace_version "$source_root/Cargo.toml")
 source_commit=$(git -C "$source_root" rev-parse HEAD)
+if [ "$target" != test-release-target ]; then
+  tagged_commit=$(git -C "$source_root" rev-parse "$tag^{commit}")
+  if [ "$tagged_commit" != "$source_commit" ]; then
+    echo "release tag $tag resolves to $tagged_commit, expected source HEAD $source_commit" >&2
+    exit 1
+  fi
+  if [ -n "$(git -C "$source_root" status --porcelain --untracked-files=all)" ]; then
+    echo "release source must be a clean tagged worktree" >&2
+    exit 1
+  fi
+fi
 python3 - "$binary" "$version" "$source_commit" <<'PY'
 import json,subprocess,sys
 binary,version,commit=sys.argv[1:]
