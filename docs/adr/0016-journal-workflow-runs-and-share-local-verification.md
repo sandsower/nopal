@@ -5,7 +5,7 @@
 
 ## Context
 
-Nopal already produced generic Workflow Run Ledger projections and exact OLI-72 enforcement evidence.
+Nopal already produced generic Workflow Run Ledger projections and exact continuous-enforcement evidence.
 Those paths were independently orchestrated across Core, the CLI, and the Pi adapter.
 A logical transition could require several filesystem writes, so a process failure could leave `run.json`, JSONL events, transcripts, checkpoints, and immutable enforcement artifacts at different boundaries.
 The existing resume query selected the latest matching run but did not identify the exact journal revision or state whether protected proof survived a restart.
