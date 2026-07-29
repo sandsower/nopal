@@ -6,7 +6,7 @@
     {
       "id": "nopal",
       "source": { "type": "builtin", "package": "nopal" },
-      "requirement": "=0.3.1",
+      "requirement": "=0.3.2",
       "resources": [
         { "kind": "extension", "path": "extensions/policy-gate/index.ts" },
         { "kind": "skill", "path": "resources/beislid/skills" }
