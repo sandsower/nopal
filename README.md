@@ -25,7 +25,7 @@ A v0.3 release archive is self-contained for its target platform.
 It contains the Nopal CLI, official Node.js `22.22.0`, exact Pi `0.80.6` with its runtime closure, the Nopal policy adapter, pinned Beislið skills, licenses, provenance, and the installer.
 It does not depend on a system Pi, Node, or Beislið installation.
 
-Download the archive for Apple Silicon macOS, Intel macOS, or x86-64 Linux and verify it against `SHA256SUMS` from the same GitHub release.
+Download the archive for Apple Silicon macOS, Intel macOS, or x86-64 Linux with glibc 2.35 or newer and verify it against `SHA256SUMS` from the same GitHub release.
 Then install it under an absolute prefix:
 
 ```sh

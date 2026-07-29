@@ -122,6 +122,24 @@ for release_contract in \
     || fail "Linux Pi closure identity is not pinned in $release_contract"
 done
 
+python3 - "$repo_root/.github/workflows/release.yml" "$repo_root/README.md" <<'PY'
+import pathlib,sys
+workflow=pathlib.Path(sys.argv[1]).read_text()
+readme=pathlib.Path(sys.argv[2]).read_text()
+linux_entry="""- runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu"""
+if linux_entry not in workflow:
+    raise SystemExit("Linux release is not built on the documented glibc baseline")
+if "Prove Debian 12 Linux compatibility" not in workflow:
+    raise SystemExit("release workflow does not prove the documented Linux baseline")
+if "debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818" not in workflow:
+    raise SystemExit("Debian compatibility image is not pinned by digest")
+if '-v "$PWD:/workspace:ro"' not in workflow:
+    raise SystemExit("network-active compatibility proof can modify release inputs")
+if "glibc 2.35 or newer" not in readme:
+    raise SystemExit("README does not state the x86-64 Linux glibc baseline")
+PY
+
 source_fixture="$tmp/source-fixture"
 mkdir "$source_fixture"
 git -c init.templateDir= -c init.defaultBranch=main -C "$source_fixture" init -q
