@@ -48,20 +48,18 @@ if [[ "$extension_dirs" != "extensions/policy-gate" ]]; then
   fail "release-owned extension set is not exactly extensions/policy-gate: $extension_dirs"
 fi
 
-if rg -n -i \
-  'nopal[-_](field|rondo|desktop|native|feed)|extensions/(nopal|show-me|usage-tracker|task-state|subagent-runner|mcp-bridge)|crates/nopal-(field|rondo|desktop|native|feed)' \
-  --glob '!target/**' \
-  --glob '!scripts/check-active-tree-identity.sh' \
-  --glob '!scripts/check-release-archive.sh' \
-  --glob '!scripts/test-release-contracts.sh' \
-  .; then
+if git grep -n -i -E \
+  'nopal[-_](field|rondo|desktop|native|feed)|extensions/(nopal|show-me|usage-tracker|task-state|subagent-runner|mcp-bridge)|crates/nopal-(field|rondo|desktop|native|feed)' -- \
+  ':(exclude)scripts/check-active-tree-identity.sh' \
+  ':(exclude)scripts/check-release-archive.sh' \
+  ':(exclude)scripts/test-release-contracts.sh'; then
   fail "active source references a removed implementation package"
 fi
 
-if rg -n -i \
-  'temporary migration residue|remain(s)? only until|bundle(s|d)? a version-pinned rondo|install .*tmux|high-quality coordination surface' \
+if git grep -n -i -E \
+  'temporary migration residue|remain(s)? only until|bundle(s|d)? a version-pinned rondo|install .*tmux|high-quality coordination surface' -- \
   README.md CONTEXT.md CONTRIBUTING.md SECURITY.md NOTICE.md .nopal .beislid .github package.json Cargo.toml crates extensions scripts \
-  --glob '!scripts/check-active-tree-identity.sh'; then
+  ':(exclude)scripts/check-active-tree-identity.sh'; then
   fail "active product language still describes the superseded product or transition state"
 fi
 
@@ -76,16 +74,16 @@ for required in \
   [[ -f "$required" ]] || fail "required v0.3 distribution member is missing from source: $required"
 done
 
-if ! rg -q 'plain Pi session.*no Nopal enforcement guarantee' README.md; then
+if ! grep -Eq 'plain Pi session.*no Nopal enforcement guarantee' README.md; then
   fail "README does not state the plain Pi assurance boundary"
 fi
-if ! rg -q 'rollback' README.md || ! rg -q 'offline' README.md; then
+if ! grep -q 'rollback' README.md || ! grep -q 'offline' README.md; then
   fail "README does not document rollback and offline launch"
 fi
-if ! rg -q 'nopal\.migration/v1' crates/nopal-cli/src/main.rs; then
+if ! grep -Eq 'nopal\.migration/v1' crates/nopal-cli/src/main.rs; then
   fail "removed command migration diagnostics are absent"
 fi
-if ! rg -q 'product_surface_removed' crates/nopal-core/src/diagnostics.rs; then
+if ! grep -q 'product_surface_removed' crates/nopal-core/src/diagnostics.rs; then
   fail "removed configuration migration diagnostics are absent"
 fi
 
