@@ -8,8 +8,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use nopal_core::gates::Run;
 use nopal_core::selection::SelectedGate;
@@ -20,12 +25,21 @@ use sha2::{Digest, Sha256};
 pub struct GateRuntime {
     pub bin_dir: PathBuf,
     pub home_dir: PathBuf,
+    pub tmp_dir: PathBuf,
+    tmp_device: u64,
+    tmp_inode: u64,
+    /// Stable executable closure bound into Core plans and receipts.
     pub digest: String,
+    /// Full run-private manifest identity, including the scratch inode.
+    pub runtime_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Manifest {
     version: String,
+    tmp_dir: PathBuf,
+    tmp_device: u64,
+    tmp_inode: u64,
     entries: Vec<ExecutorEntry>,
 }
 
@@ -37,6 +51,16 @@ struct ExecutorEntry {
 }
 
 const MANIFEST_RELATIVE: &str = "artifacts/gate-runtime/manifest.json";
+const GATE_OUTPUT_LIMIT: usize = 1024 * 1024;
+const GATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateExecution {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub killed: bool,
+}
 
 pub fn prepare(
     root: &Path,
@@ -56,9 +80,14 @@ pub fn prepare(
         let bin_dir = runtime_dir.join("bin");
         let home_dir = runtime_dir.join("home");
         fs::create_dir_all(&bin_dir)?;
-        for relative in ["cargo", "npm-cache", "tmp"] {
+        for relative in ["cargo", "npm-cache"] {
             fs::create_dir_all(home_dir.join(relative))?;
         }
+        let tmp_guard = tempfile::Builder::new()
+            .prefix("nopal-gate-")
+            .tempdir_in("/tmp")?;
+        let tmp_dir = tmp_guard.path().to_path_buf();
+        fs::set_permissions(&tmp_dir, fs::Permissions::from_mode(0o700))?;
         link_read_cache(
             "CARGO_HOME",
             "registry",
@@ -105,8 +134,13 @@ pub fn prepare(
         }
 
         validate_selected_gate_entrypoints(root, selected_gates, &available)?;
+        use std::os::unix::fs::MetadataExt as _;
+        let tmp_metadata = fs::symlink_metadata(&tmp_dir)?;
         let mut manifest = Manifest {
             version: "nopal.gate-executors/v1".to_owned(),
+            tmp_dir: tmp_dir.clone(),
+            tmp_device: tmp_metadata.dev(),
+            tmp_inode: tmp_metadata.ino(),
             entries: Vec::with_capacity(executors.len()),
         };
         for (name, canonical_path) in executors {
@@ -118,26 +152,37 @@ pub fn prepare(
                 canonical_path,
             });
         }
-        let digest = manifest_digest(&manifest)?;
+        let digest = executor_digest(&manifest)?;
+        let runtime_digest = runtime_manifest_digest(&manifest)?;
         let manifest_path = run_dir.join(MANIFEST_RELATIVE);
         let mut bytes = serde_json::to_vec_pretty(&manifest).map_err(io::Error::other)?;
         bytes.push(b'\n');
         fs::write(&manifest_path, bytes)?;
         fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o400))?;
         fs::set_permissions(&bin_dir, fs::Permissions::from_mode(0o500))?;
-        validate(run_dir, &digest)?;
+        validate(run_dir, &digest, &runtime_digest)?;
+        let kept_tmp_dir = tmp_guard.keep();
+        debug_assert_eq!(kept_tmp_dir, tmp_dir);
         Ok(GateRuntime {
             bin_dir,
             home_dir,
+            tmp_dir,
+            tmp_device: manifest.tmp_device,
+            tmp_inode: manifest.tmp_inode,
             digest,
+            runtime_digest,
         })
     }
 }
 
-pub fn validate(run_dir: &Path, expected_digest: &str) -> io::Result<()> {
+pub fn validate(
+    run_dir: &Path,
+    expected_digest: &str,
+    expected_runtime_digest: &str,
+) -> io::Result<()> {
     #[cfg(not(unix))]
     {
-        let _ = (run_dir, expected_digest);
+        let _ = (run_dir, expected_digest, expected_runtime_digest);
         return Err(io::Error::other("gate executor snapshots require unix"));
     }
     #[cfg(unix)]
@@ -151,7 +196,15 @@ pub fn validate(run_dir: &Path, expected_digest: &str) -> io::Result<()> {
                 "gate executor manifest has an unsupported version",
             ));
         }
-        let observed_digest = manifest_digest(&manifest)?;
+        validate_tmp_dir(&manifest.tmp_dir, manifest.tmp_device, manifest.tmp_inode)?;
+        let observed_runtime_digest = runtime_manifest_digest(&manifest)?;
+        if observed_runtime_digest != expected_runtime_digest {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "gate runtime manifest does not match the launch binding",
+            ));
+        }
+        let observed_digest = executor_digest(&manifest)?;
         if observed_digest != expected_digest {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -187,6 +240,329 @@ pub fn validate(run_dir: &Path, expected_digest: &str) -> io::Result<()> {
         }
         Ok(())
     }
+}
+
+pub fn load(
+    run_dir: &Path,
+    expected_digest: &str,
+    expected_runtime_digest: &str,
+) -> io::Result<GateRuntime> {
+    validate(run_dir, expected_digest, expected_runtime_digest)?;
+    let manifest_path = run_dir.join(MANIFEST_RELATIVE);
+    let manifest: Manifest = serde_json::from_slice(&fs::read(manifest_path)?)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    Ok(GateRuntime {
+        bin_dir: run_dir.join("artifacts/gate-runtime/bin"),
+        home_dir: run_dir.join("artifacts/gate-runtime/home"),
+        tmp_dir: manifest.tmp_dir,
+        tmp_device: manifest.tmp_device,
+        tmp_inode: manifest.tmp_inode,
+        digest: expected_digest.to_owned(),
+        runtime_digest: expected_runtime_digest.to_owned(),
+    })
+}
+
+#[cfg(unix)]
+fn validate_tmp_dir(path: &Path, expected_device: u64, expected_inode: u64) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if path.parent() != Some(Path::new("/tmp")) || !name.starts_with("nopal-gate-") {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "gate temporary directory is outside the short run-private namespace",
+        ));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    // SAFETY: geteuid has no pointer arguments or memory-safety preconditions.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !metadata.file_type().is_dir()
+        || metadata.mode() & 0o077 != 0
+        || metadata.uid() != effective_uid
+        || metadata.dev() != expected_device
+        || metadata.ino() != expected_inode
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "gate temporary directory identity or permissions changed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_tmp_dir(_path: &Path, _expected_device: u64, _expected_inode: u64) -> io::Result<()> {
+    Err(io::Error::other("gate temporary directories require unix"))
+}
+
+pub fn cleanup(runtime: &GateRuntime) -> io::Result<()> {
+    validate_tmp_dir(&runtime.tmp_dir, runtime.tmp_device, runtime.tmp_inode)?;
+    remove_private_tree(&runtime.tmp_dir)
+}
+
+#[cfg(unix)]
+fn remove_private_tree(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return fs::remove_file(path);
+    }
+    if !metadata.file_type().is_dir() {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).ok();
+        return fs::remove_file(path);
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    for entry in fs::read_dir(path)? {
+        remove_private_tree(&entry?.path())?;
+    }
+    fs::remove_dir(path)
+}
+
+#[cfg(not(unix))]
+fn remove_private_tree(_path: &Path) -> io::Result<()> {
+    Err(io::Error::other("gate temporary cleanup requires unix"))
+}
+
+pub fn execute(
+    root: &Path,
+    run_dir: &Path,
+    runtime: &GateRuntime,
+    gate: &SelectedGate,
+) -> io::Result<GateExecution> {
+    execute_with_timeout(root, run_dir, runtime, gate, GATE_TIMEOUT)
+}
+
+fn execute_with_timeout(
+    root: &Path,
+    run_dir: &Path,
+    runtime: &GateRuntime,
+    gate: &SelectedGate,
+    timeout: Duration,
+) -> io::Result<GateExecution> {
+    #[cfg(not(unix))]
+    {
+        let _ = (root, run_dir, runtime, gate, timeout);
+        return Err(io::Error::other("gate execution requires unix"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        let expected_bin = run_dir.join("artifacts/gate-runtime/bin");
+        let expected_home = run_dir.join("artifacts/gate-runtime/home");
+        if runtime.bin_dir != expected_bin || runtime.home_dir != expected_home {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "gate runtime paths do not belong to this run",
+            ));
+        }
+        validate(run_dir, &runtime.digest, &runtime.runtime_digest)?;
+
+        let canonical_root = root.canonicalize()?;
+        let cwd = root
+            .join(gate.cwd.as_deref().unwrap_or("."))
+            .canonicalize()?;
+        if !cwd.starts_with(&canonical_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "gate {:?} working directory escapes the repository",
+                    gate.id
+                ),
+            ));
+        }
+
+        let mut command = match &gate.run {
+            Run::Command(source) => {
+                if source.trim().is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("gate {:?} command is empty", gate.id),
+                    ));
+                }
+                let mut command = Command::new("/bin/bash");
+                command.args(["--noprofile", "--norc", "-c", source]);
+                command
+            }
+            Run::Argv(argv) => {
+                let (executable, args) = argv.split_first().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("gate {:?} argv is empty", gate.id),
+                    )
+                })?;
+                validate_gate_executable_shape(root, gate, executable)?;
+                let executable = if executable.contains('/') {
+                    gate_script_path(root, gate, executable)?
+                } else {
+                    let alias = runtime.bin_dir.join(executable);
+                    if alias.exists() {
+                        alias
+                    } else {
+                        system_executable(executable).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::NotFound,
+                                format!(
+                                    "gate {:?} executor {executable:?} is absent from the locked runtime",
+                                    gate.id
+                                ),
+                            )
+                        })?
+                    }
+                };
+                let mut command = Command::new(executable);
+                command.args(args);
+                command
+            }
+        };
+        command
+            .current_dir(cwd)
+            .env_clear()
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", runtime.bin_dir.display()),
+            )
+            .env("HOME", &runtime.home_dir)
+            .env("CARGO_HOME", runtime.home_dir.join("cargo"))
+            .env("CARGO_NET_OFFLINE", "true")
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8")
+            .env("RUSTUP_HOME", runtime.home_dir.join("rustup"))
+            .env("TMPDIR", &runtime.tmp_dir)
+            .env("npm_config_cache", runtime.home_dir.join("npm-cache"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+
+        let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("gate stdout pipe is unavailable"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("gate stderr pipe is unavailable"))?;
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let exceeded = Arc::new(AtomicBool::new(false));
+        let stdout_bytes = Arc::new(Mutex::new(Vec::new()));
+        let stderr_bytes = Arc::new(Mutex::new(Vec::new()));
+        let stdout_thread = collect_output(
+            stdout,
+            Arc::clone(&bytes),
+            Arc::clone(&exceeded),
+            Arc::clone(&stdout_bytes),
+        );
+        let stderr_thread = collect_output(
+            stderr,
+            Arc::clone(&bytes),
+            Arc::clone(&exceeded),
+            Arc::clone(&stderr_bytes),
+        );
+
+        let started = Instant::now();
+        let mut status = None;
+        let mut killed = false;
+        let mut timed_out = false;
+        loop {
+            if exceeded.load(Ordering::Acquire) {
+                kill_process_group(&mut child);
+                killed = true;
+                break;
+            }
+            if started.elapsed() >= timeout {
+                kill_process_group(&mut child);
+                killed = true;
+                timed_out = true;
+                break;
+            }
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            // A direct shell may exit while a background descendant keeps its
+            // output pipe open. The process group remains supervised until
+            // both collectors reach EOF, so descendants cannot outlive the
+            // gate timeout by retaining stdout or stderr.
+            if status.is_some() && stdout_thread.is_finished() && stderr_thread.is_finished() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if status.is_none() {
+            status = Some(child.wait()?);
+        }
+        stdout_thread
+            .join()
+            .map_err(|_| io::Error::other("gate stdout collector panicked"))??;
+        stderr_thread
+            .join()
+            .map_err(|_| io::Error::other("gate stderr collector panicked"))??;
+        if exceeded.load(Ordering::Acquire) {
+            return Err(io::Error::other("gate output exceeded one MiB"));
+        }
+        if timed_out {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "gate timed out"));
+        }
+        let status = status.ok_or_else(|| io::Error::other("gate process has no outcome"))?;
+
+        Ok(GateExecution {
+            stdout: String::from_utf8_lossy(&stdout_bytes.lock().map_err(lock_error)?).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr_bytes.lock().map_err(lock_error)?).into_owned(),
+            exit_code: exit_code(status),
+            killed,
+        })
+    }
+}
+
+fn collect_output<R: Read + Send + 'static>(
+    mut reader: R,
+    total: Arc<AtomicUsize>,
+    exceeded: Arc<AtomicBool>,
+    output: Arc<Mutex<Vec<u8>>>,
+) -> thread::JoinHandle<io::Result<()>> {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                return Ok(());
+            }
+            let previous = total.fetch_add(count, Ordering::AcqRel);
+            if previous.saturating_add(count) > GATE_OUTPUT_LIMIT {
+                exceeded.store(true, Ordering::Release);
+                continue;
+            }
+            output
+                .lock()
+                .map_err(lock_error)?
+                .extend_from_slice(&buffer[..count]);
+        }
+    })
+}
+
+fn lock_error<T>(_error: std::sync::PoisonError<T>) -> io::Error {
+    io::Error::other("gate output collector lock was poisoned")
+}
+
+#[cfg(unix)]
+fn kill_process_group(child: &mut std::process::Child) {
+    if let Ok(pid) = i32::try_from(child.id()) {
+        // The child is the leader of the process group requested above.
+        // Killing the negative pid terminates descendants as well as the shell.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+}
+
+fn exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(128)
 }
 
 const SHELL_BUILTINS: &[&str] = &[
@@ -239,6 +615,7 @@ const ECOSYSTEM_EXECUTORS: &[&str] = &[
     "rustfmt",
     "swift",
     "swiftc",
+    "tmux",
     "uv",
     "yarn",
 ];
@@ -469,7 +846,16 @@ fn file_integrity(path: &Path) -> io::Result<String> {
     Ok(format!("sha256:{:x}", Sha256::digest(fs::read(path)?)))
 }
 
-fn manifest_digest(manifest: &Manifest) -> io::Result<String> {
+fn executor_digest(manifest: &Manifest) -> io::Result<String> {
+    // Plans and receipts bind the stable executable closure. The separate
+    // runtime digest below binds the random scratch path and exact inode
+    // without making equivalent interactive and headless plans diverge.
+    let bytes = serde_json::to_vec(&(manifest.version.as_str(), &manifest.entries))
+        .map_err(io::Error::other)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn runtime_manifest_digest(manifest: &Manifest) -> io::Result<String> {
     let bytes = serde_json::to_vec(manifest).map_err(io::Error::other)?;
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
@@ -490,6 +876,121 @@ mod tests {
             mutates: None,
             via: nopal_core::selection::Via::Default,
         }
+    }
+
+    #[test]
+    fn bounded_runner_uses_only_the_sanitized_gate_environment() {
+        if !cfg!(unix) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let run = tempfile::tempdir().unwrap();
+        let selected = gate(
+            "environment",
+            "test -z \"${NOPAL_ENFORCEMENT_CAPABILITY_FD:-}\" && printf clean",
+        );
+        let runtime = prepare(root.path(), run.path(), std::slice::from_ref(&selected)).unwrap();
+        assert!(runtime.tmp_dir.as_os_str().as_encoded_bytes().len() < 80);
+        let result = execute(root.path(), run.path(), &runtime, &selected).unwrap();
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(result.stdout, "clean");
+        assert!(!result.killed);
+        cleanup(&runtime).unwrap();
+    }
+
+    #[test]
+    fn bounded_runner_terminates_the_process_group_on_timeout() {
+        if !cfg!(unix) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let run = tempfile::tempdir().unwrap();
+        let selected = gate("timeout", "sleep 5");
+        let runtime = prepare(root.path(), run.path(), std::slice::from_ref(&selected)).unwrap();
+        let error = execute_with_timeout(
+            root.path(),
+            run.path(),
+            &runtime,
+            &selected,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        cleanup(&runtime).unwrap();
+    }
+
+    #[test]
+    fn bounded_runner_keeps_supervising_descendants_that_hold_output_pipes() {
+        if !cfg!(unix) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let run = tempfile::tempdir().unwrap();
+        let selected = gate("background-timeout", "true && sleep 5 &");
+        let runtime = prepare(root.path(), run.path(), std::slice::from_ref(&selected)).unwrap();
+        let started = Instant::now();
+        let error = execute_with_timeout(
+            root.path(),
+            run.path(),
+            &runtime,
+            &selected,
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        cleanup(&runtime).unwrap();
+    }
+
+    #[test]
+    fn bounded_runner_rejects_combined_output_over_one_mib() {
+        if !cfg!(unix) {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let run = tempfile::tempdir().unwrap();
+        let selected = gate("output", "yes x");
+        let runtime = prepare(root.path(), run.path(), std::slice::from_ref(&selected)).unwrap();
+        let error = execute(root.path(), run.path(), &runtime, &selected).unwrap_err();
+        assert!(error.to_string().contains("exceeded one MiB"));
+        cleanup(&runtime).unwrap();
+    }
+
+    #[test]
+    fn runtime_binding_rejects_a_substituted_scratch_directory() {
+        if !cfg!(unix) {
+            return;
+        }
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let run = tempfile::tempdir().unwrap();
+        let selected = gate("scratch", "true");
+        let runtime = prepare(root.path(), run.path(), std::slice::from_ref(&selected)).unwrap();
+        let replacement = tempfile::Builder::new()
+            .prefix("nopal-gate-replacement-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        fs::set_permissions(replacement.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let manifest_path = run.path().join(MANIFEST_RELATIVE);
+        let original = fs::read(&manifest_path).unwrap();
+        let mut manifest: Manifest = serde_json::from_slice(&original).unwrap();
+        let metadata = fs::symlink_metadata(replacement.path()).unwrap();
+        manifest.tmp_dir = replacement.path().to_path_buf();
+        manifest.tmp_device = metadata.dev();
+        manifest.tmp_inode = metadata.ino();
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let error = validate(run.path(), &runtime.digest, &runtime.runtime_digest).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        fs::write(&manifest_path, original).unwrap();
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o400)).unwrap();
+        cleanup(&runtime).unwrap();
     }
 
     #[test]
@@ -529,10 +1030,11 @@ mod tests {
             .env("CARGO_NET_OFFLINE", "true")
             .env("RUSTUP_HOME", runtime.home_dir.join("rustup"))
             .env("npm_config_cache", runtime.home_dir.join("npm-cache"))
-            .env("TMPDIR", runtime.home_dir.join("tmp"))
+            .env("TMPDIR", &runtime.tmp_dir)
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
-        validate(run.path(), &runtime.digest).unwrap();
+        validate(run.path(), &runtime.digest, &runtime.runtime_digest).unwrap();
+        cleanup(&runtime).unwrap();
     }
 }

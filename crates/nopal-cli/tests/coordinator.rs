@@ -3158,7 +3158,13 @@ fn production_cli_submits_deduplicates_and_observes_through_loopback_http() {
     ];
 
     let first = nopal(&submit_args);
-    assert_eq!(first.status.code(), Some(0), "stderr: {}", stderr(&first));
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&first.stdout),
+        stderr(&first)
+    );
     let first_doc = json(&first);
     assert_eq!(first_doc["ok"], true);
     assert_eq!(first_doc["submitted"], true);

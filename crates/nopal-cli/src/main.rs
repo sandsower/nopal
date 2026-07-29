@@ -31,6 +31,7 @@ use nopal_core::run_ledger_report as ledger;
 use nopal_core::run_ledger_store::InitArgs;
 use nopal_core::scaffold;
 use nopal_core::{gates::GateStage, policy};
+use sha2::{Digest as _, Sha256};
 
 mod coordinator;
 mod distribution_adapter;
@@ -40,6 +41,7 @@ mod gate_executor;
 mod herdr_bridge;
 mod info;
 mod launch;
+mod verification;
 
 #[derive(Parser)]
 #[command(
@@ -94,6 +96,12 @@ enum Cmd {
     Doctor,
     /// Validate the nopal.project/v1 manifest and profile-required modules
     Validate,
+    /// Verify the local pre-PR boundary without launching Pi or performing a push
+    Verify {
+        /// Verification ledger state root; beats BEISLID_STATE_DIR and the XDG default
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
     /// Inspect nopal.gates/v1 or generated v2 preflights
     Preflights {
         #[command(subcommand)]
@@ -387,6 +395,9 @@ enum LedgerCmd {
         /// Transcript summary; defaults to the redacted payload
         #[arg(long)]
         summary: Option<String>,
+        /// Stable caller identity for retrying an uncertain commit
+        #[arg(long)]
+        operation_id: Option<String>,
     },
     /// Write a named checkpoint and fold it into run.json
     Checkpoint {
@@ -400,6 +411,9 @@ enum LedgerCmd {
         json_file: Option<PathBuf>,
         #[arg(long)]
         resume_hint: Option<String>,
+        /// Stable caller identity for retrying an uncertain commit
+        #[arg(long)]
+        operation_id: Option<String>,
     },
     /// Record a gate attempt envelope with checkpoint and event
     Gate {
@@ -416,6 +430,9 @@ enum LedgerCmd {
         envelope_file: PathBuf,
         #[arg(long)]
         resume_hint: Option<String>,
+        /// Stable caller identity for retrying an uncertain commit
+        #[arg(long)]
+        operation_id: Option<String>,
     },
     /// Mark the run interrupted with a reason
     Interrupt {
@@ -427,6 +444,19 @@ enum LedgerCmd {
         reason: String,
         #[arg(long)]
         resume_hint: Option<String>,
+        /// Stable caller identity for retrying an uncertain commit
+        #[arg(long)]
+        operation_id: Option<String>,
+    },
+    /// Resume one exact interrupted run and require fresh verification
+    Continue {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        flow: Option<String>,
+        /// Stable caller identity for retrying an uncertain commit
+        #[arg(long)]
+        operation_id: Option<String>,
     },
     /// Set the final status (interrupted, failed, or completed)
     Finalize {
@@ -439,9 +469,15 @@ enum LedgerCmd {
         /// Markdown report copied to final-report.md
         #[arg(long)]
         report_file: Option<PathBuf>,
+        /// Stable caller identity for retrying an uncertain commit
+        #[arg(long)]
+        operation_id: Option<String>,
     },
     /// Show the most recently updated matching run
     Resume {
+        /// Exact run identity. Omitting it retains the legacy latest-match query.
+        #[arg(long, conflicts_with_all = ["ticket_id", "branch", "include_completed"])]
+        run_id: Option<String>,
         #[arg(long)]
         flow: Option<String>,
         #[arg(long)]
@@ -672,6 +708,12 @@ enum PolicyCmd {
 
 #[derive(Subcommand)]
 enum EnforcementCmd {
+    /// Prepare the complete run-private executor manifest for an exact testable run
+    PrepareRuntime(EnforcementArgs),
+    /// Drive one exact action through planning and evidence-only verification
+    VerifyEvidence(EnforcementArgs),
+    /// Drive one exact action through planning, gates, and one-shot release
+    Advance(EnforcementArgs),
     /// Decide an action and return every missing or stale required gate
     Plan(EnforcementArgs),
     /// Record one gate command executed by the trusted Pi adapter
@@ -680,6 +722,8 @@ enum EnforcementCmd {
     RecordApproval(RecordApprovalArgs),
     /// Consume one exact current authorization before releasing the Pi tool
     Authorize(AuthorizeArgs),
+    /// Remove the run-private short gate temporary directory at session end
+    CleanupRuntime(EnforcementArgs),
     /// Record the matching released tool's success, error, or interruption
     RecordOutcome(RecordOutcomeArgs),
 }
@@ -706,6 +750,8 @@ struct EnforcementArgs {
     input_digest: String,
     #[arg(long, default_value = "legacy-executor")]
     executor_digest: String,
+    #[arg(long, default_value = "legacy-runtime")]
+    runtime_digest: String,
     #[arg(long, default_value = "legacy")]
     target_digest: String,
     #[arg(long = "changed-file")]
@@ -971,6 +1017,7 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
                 || nopal_core::status::validation_toon(&report),
             )
         }
+        Some(Cmd::Verify { state_dir }) => run_headless_verify(cli, &root, state_dir.as_deref()),
         Some(Cmd::Preflights {
             command: PreflightsCmd::List,
         }) => {
@@ -1193,10 +1240,14 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
         }
         Some(Cmd::Enforcement { command }) => {
             let args = match command.as_ref() {
+                EnforcementCmd::PrepareRuntime(args) => args,
+                EnforcementCmd::VerifyEvidence(args) => args,
+                EnforcementCmd::Advance(args) => args,
                 EnforcementCmd::Plan(args) => args,
                 EnforcementCmd::RecordGate(args) => &args.enforcement,
                 EnforcementCmd::RecordApproval(args) => &args.enforcement,
                 EnforcementCmd::Authorize(args) => &args.enforcement,
+                EnforcementCmd::CleanupRuntime(args) => args,
                 EnforcementCmd::RecordOutcome(args) => &args.enforcement,
             };
             let ledger_env =
@@ -1217,6 +1268,39 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
                 ));
             }
             validate_project_pi_settings(&root)?;
+            if let EnforcementCmd::PrepareRuntime(_) = command.as_ref() {
+                let requirements =
+                    enforcement::gate_executor_requirements(&root, config_dir.as_deref())?;
+                let runtime = gate_executor::prepare(&root, &run_dir, &requirements)?;
+                let result = serde_json::json!({
+                    "kind": "nopal.enforcement.prepare_runtime/v1",
+                    "ok": true,
+                    "executor_digest": runtime.digest,
+                    "runtime_digest": runtime.runtime_digest,
+                });
+                return print_report_and_exit(
+                    true,
+                    cli.json,
+                    || serde_json::to_string_pretty(&result),
+                    || serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_owned()),
+                );
+            }
+            if let EnforcementCmd::CleanupRuntime(_) = command.as_ref() {
+                let runtime =
+                    gate_executor::load(&run_dir, &args.executor_digest, &args.runtime_digest)?;
+                gate_executor::cleanup(&runtime)?;
+                let result = serde_json::json!({
+                    "kind": "nopal.enforcement.cleanup_runtime/v1",
+                    "ok": true,
+                    "run_id": args.run_id,
+                });
+                return print_report_and_exit(
+                    true,
+                    cli.json,
+                    || serde_json::to_string_pretty(&result),
+                    || serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_owned()),
+                );
+            }
             if let EnforcementCmd::RecordOutcome(outcome) = command.as_ref() {
                 let evidence = enforcement::tool_outcome_evidence(
                     &outcome.enforcement.action,
@@ -1243,7 +1327,7 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
                 );
             }
             if !(cfg!(debug_assertions) && args.executor_digest == "legacy-executor") {
-                gate_executor::validate(&run_dir, &args.executor_digest)?;
+                gate_executor::validate(&run_dir, &args.executor_digest, &args.runtime_digest)?;
             }
             let request = enforcement::EnforcementRequest {
                 root: &root,
@@ -1273,6 +1357,36 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
                 mutates: args.mutates,
             };
             match command.as_ref() {
+                EnforcementCmd::VerifyEvidence(_) | EnforcementCmd::Advance(_) => {
+                    let runtime =
+                        gate_executor::load(&run_dir, &args.executor_digest, &args.runtime_digest)?;
+                    let purpose = if matches!(command.as_ref(), EnforcementCmd::VerifyEvidence(_)) {
+                        verification::VerificationPurpose::EvidenceOnly
+                    } else {
+                        verification::VerificationPurpose::AuthorizeProtectedAction
+                    };
+                    let outcome = verification::advance(verification::VerificationRequest {
+                        root: &root,
+                        config_dir: config_dir.as_deref(),
+                        run_dir: &run_dir,
+                        mode: args.mode,
+                        action: &args.action,
+                        classes: &args.classes,
+                        receipt_key: receipt_key.as_bytes(),
+                        runtime: &runtime,
+                        intent,
+                        purpose,
+                    })?;
+                    print_report_and_exit(
+                        true,
+                        cli.json,
+                        || serde_json::to_string_pretty(&outcome),
+                        || {
+                            serde_json::to_string_pretty(&outcome)
+                                .unwrap_or_else(|_| "{}".to_owned())
+                        },
+                    )
+                }
                 EnforcementCmd::Plan(_) => {
                     let report = enforcement::plan_for_intent(request, intent)?;
                     enforcement_adapter::apply_evidence(
@@ -1379,6 +1493,12 @@ fn run(cli: &Cli) -> std::io::Result<ExitCode> {
                                 .unwrap_or_else(|_| "{}".to_owned())
                         },
                     )
+                }
+                EnforcementCmd::PrepareRuntime(_) => {
+                    unreachable!("runtime preparation returns before workspace observation")
+                }
+                EnforcementCmd::CleanupRuntime(_) => {
+                    unreachable!("runtime cleanup returns before workspace observation")
                 }
                 EnforcementCmd::RecordOutcome(_) => {
                     unreachable!("outcomes return before workspace observation")
@@ -1608,12 +1728,141 @@ fn run_import_cmd(cli: &Cli, root: &Path, command: &ImportCmd) -> std::io::Resul
     }
 }
 
+fn run_headless_verify(
+    cli: &Cli,
+    root: &Path,
+    state_dir: Option<&Path>,
+) -> std::io::Result<ExitCode> {
+    const FLOW: &str = "verification";
+    const ACTION: &str = "git.push";
+    const CLASSES: [policy::ActionClass; 1] = [policy::ActionClass::GitRemote];
+
+    let ledger_env = nopal_core::run_ledger_store::LedgerEnv::discover(root, state_dir);
+    let initialized = nopal_core::run_ledger_store::init_run(
+        &ledger_env,
+        &InitArgs {
+            skill: "verify",
+            flow: Some(FLOW),
+            ticket_id: "none",
+            ticket_title: "Headless pre-PR verification",
+            ticket_url: "",
+            branch: None,
+            run_id: None,
+        },
+    )
+    .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+    let run_dir = initialized.run_dir;
+    let config_dir = resolve_config_dir();
+    let executor_requirements =
+        enforcement::gate_executor_requirements(root, config_dir.as_deref())?;
+    let runtime = gate_executor::prepare(root, &run_dir, &executor_requirements)?;
+
+    let mut receipt_key = [0u8; 32];
+    getrandom::fill(&mut receipt_key)
+        .map_err(|error| std::io::Error::other(format!("receipt entropy failed: {error}")))?;
+    let invocation = format!("headless:{}", initialized.run_id);
+    let input_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(b"nopal.verify.pre_pr/v1:git.push:git_remote")
+    );
+    let canonical_root = root.canonicalize()?;
+    let target_digest = format!(
+        "sha256:{:x}",
+        Sha256::digest(canonical_root.as_os_str().as_encoded_bytes())
+    );
+    let request = verification::VerificationRequest {
+        root,
+        config_dir: config_dir.as_deref(),
+        run_dir: &run_dir,
+        mode: policy::Mode::SupervisedAuto,
+        action: ACTION,
+        classes: &CLASSES,
+        receipt_key: &receipt_key,
+        runtime: &runtime,
+        intent: enforcement::EnforcementIntent {
+            kind: enforcement::ENFORCEMENT_INTENT_KIND.to_owned(),
+            launch_id: invocation.clone(),
+            session_id: invocation.clone(),
+            tool_call_id: invocation,
+            tool_name: "headless_verify".to_owned(),
+            input_digest,
+            target_digest,
+            executor_digest: runtime.digest.clone(),
+            changed_files: Vec::new(),
+            workspace_fingerprint: None,
+            mutates: true,
+        },
+        purpose: verification::VerificationPurpose::EvidenceOnly,
+    };
+
+    let outcome = match verification::advance(request) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let _ = gate_executor::cleanup(&runtime);
+            let _ = nopal_core::run_ledger_store::record_interrupt(
+                &run_dir,
+                &format!("headless verification infrastructure failed: {error}"),
+                Some("repair the reported infrastructure failure and run nopal verify again"),
+            );
+            return Err(error);
+        }
+    };
+    if let Err(error) = gate_executor::cleanup(&runtime) {
+        let _ = nopal_core::run_ledger_store::record_interrupt(
+            &run_dir,
+            &format!("headless verification cleanup failed: {error}"),
+            Some("inspect the run-private gate temporary directory before retrying"),
+        );
+        return Err(error);
+    }
+    let verified = matches!(&outcome, verification::VerificationOutcome::Verified { .. });
+    let approval_required = matches!(
+        &outcome,
+        verification::VerificationOutcome::ApprovalRequired { .. }
+    );
+    if approval_required {
+        nopal_core::run_ledger_store::record_interrupt(
+            &run_dir,
+            "headless verification requires interactive policy approval",
+            Some("rerun the protected action through an interactive Nopal-launched Pi session"),
+        )
+        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+    } else {
+        nopal_core::run_ledger_store::record_finalize(
+            &run_dir,
+            if verified { "completed" } else { "failed" },
+            None,
+        )
+        .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+    }
+
+    let report = serde_json::json!({
+        "kind": "nopal.verification/v1",
+        "ok": verified,
+        "run_id": initialized.run_id,
+        "flow": initialized.flow,
+        "outcome": outcome,
+    });
+    print_report_and_exit(
+        verified,
+        cli.json,
+        || serde_json::to_string_pretty(&report),
+        || serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned()),
+    )
+}
+
 /// Python `load_payload`: no file means an empty object payload.
 fn load_payload(path: Option<&std::path::Path>) -> std::io::Result<ledger_core::JsonValue> {
     match path {
         None => Ok(nopal_ledger_json::json!({})),
         Some(path) => {
-            let text = std::fs::read_to_string(path)?;
+            let bytes = nopal_core::run_ledger_store::read_bounded_regular_file(
+                path,
+                ledger_core::DOCUMENT_LIMIT,
+                "ledger payload",
+            )?;
+            let text = String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
             nopal_ledger_json::from_str(&text).map_err(std::io::Error::other)
         }
     }
@@ -1673,6 +1922,7 @@ fn run_ledger_cmd(
             event_type,
             json_file,
             summary,
+            operation_id,
         } => {
             let payload = load_payload(json_file.as_deref())?;
             let report = ledger::ledger_event(
@@ -1684,6 +1934,7 @@ fn run_ledger_cmd(
                     event_type,
                     payload,
                     summary: summary.as_deref(),
+                    operation_id: operation_id.as_deref(),
                 },
             )?;
             print_report_and_exit(
@@ -1699,6 +1950,7 @@ fn run_ledger_cmd(
             name,
             json_file,
             resume_hint,
+            operation_id,
         } => {
             let payload = load_payload(json_file.as_deref())?;
             let report = ledger::ledger_checkpoint(
@@ -1710,6 +1962,7 @@ fn run_ledger_cmd(
                     name,
                     payload,
                     resume_hint: resume_hint.as_deref(),
+                    operation_id: operation_id.as_deref(),
                 },
             )?;
             print_report_and_exit(
@@ -1726,6 +1979,7 @@ fn run_ledger_cmd(
             scope,
             envelope_file,
             resume_hint,
+            operation_id,
         } => {
             let envelope = load_payload(Some(envelope_file))?;
             let report = ledger::ledger_gate(
@@ -1738,6 +1992,7 @@ fn run_ledger_cmd(
                     scope: scope.as_deref(),
                     envelope,
                     resume_hint: resume_hint.as_deref(),
+                    operation_id: operation_id.as_deref(),
                 },
             )?;
             print_report_and_exit(
@@ -1752,6 +2007,7 @@ fn run_ledger_cmd(
             flow,
             reason,
             resume_hint,
+            operation_id,
         } => {
             let report = ledger::ledger_interrupt(
                 root,
@@ -1760,6 +2016,26 @@ fn run_ledger_cmd(
                 flow.as_deref(),
                 reason,
                 resume_hint.as_deref(),
+                operation_id.as_deref(),
+            )?;
+            print_report_and_exit(
+                report.ok,
+                cli.json,
+                || serde_json::to_string_pretty(&report),
+                || ledger::mutation_toon(&report),
+            )
+        }
+        LedgerCmd::Continue {
+            run_id,
+            flow,
+            operation_id,
+        } => {
+            let report = ledger::ledger_continue(
+                root,
+                state_dir,
+                run_id,
+                flow.as_deref(),
+                operation_id.as_deref(),
             )?;
             print_report_and_exit(
                 report.ok,
@@ -1773,6 +2049,7 @@ fn run_ledger_cmd(
             flow,
             status,
             report_file,
+            operation_id,
         } => {
             let report = ledger::ledger_finalize(
                 root,
@@ -1781,6 +2058,7 @@ fn run_ledger_cmd(
                 flow.as_deref(),
                 status,
                 report_file.as_deref(),
+                operation_id.as_deref(),
             )?;
             print_report_and_exit(
                 report.ok,
@@ -1790,6 +2068,7 @@ fn run_ledger_cmd(
             )
         }
         LedgerCmd::Resume {
+            run_id,
             flow,
             ticket_id,
             branch,
@@ -1799,6 +2078,7 @@ fn run_ledger_cmd(
                 root,
                 state_dir,
                 &ledger::ResumeArgs {
+                    run_id: run_id.as_deref(),
                     flow: flow.as_deref(),
                     ticket_id: ticket_id.as_deref(),
                     branch: branch.as_deref(),
@@ -2285,6 +2565,7 @@ fn dispatch_launch(
         gate_executor_bin: &gate_runtime.bin_dir,
         gate_home: &gate_runtime.home_dir,
         gate_executor_digest: &gate_runtime.digest,
+        gate_runtime_digest: &gate_runtime.runtime_digest,
     };
     let pi_binary = resolve_pi_binary()?;
     let pi_node = resolve_pi_node()?;
@@ -2642,6 +2923,7 @@ struct EnforcementLaunchEnv<'a> {
     gate_executor_bin: &'a std::path::Path,
     gate_home: &'a std::path::Path,
     gate_executor_digest: &'a str,
+    gate_runtime_digest: &'a str,
 }
 
 #[cfg(unix)]
@@ -3337,6 +3619,7 @@ fn probe_pi_runtime(
             "NOPAL_GATE_EXECUTOR_DIGEST",
             enforcement.gate_executor_digest,
         )
+        .env("NOPAL_GATE_RUNTIME_DIGEST", enforcement.gate_runtime_digest)
         .env("NOPAL_ENFORCEMENT_PROBE", "1")
         .env("NOPAL_ENFORCEMENT_PROBE_ACK", &acknowledgement)
         .env("NOPAL_ENFORCEMENT_PROBE_TOKEN", &token);
@@ -3421,7 +3704,8 @@ fn exec_pi(
         .env(
             "NOPAL_GATE_EXECUTOR_DIGEST",
             enforcement.gate_executor_digest,
-        );
+        )
+        .env("NOPAL_GATE_RUNTIME_DIGEST", enforcement.gate_runtime_digest);
     if let Some(config_dir) = enforcement.config_dir {
         command.env("NOPAL_ENFORCEMENT_CONFIG_DIR", config_dir);
     }

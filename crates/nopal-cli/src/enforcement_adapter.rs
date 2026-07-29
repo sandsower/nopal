@@ -5,11 +5,23 @@
 //! Core never executes a command or searches `PATH` while deciding.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
+
+const GIT_OUTPUT_LIMIT: usize = 16 * 1024 * 1024;
+const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+const WORKSPACE_FILE_LIMIT: usize = 100_000;
+const WORKSPACE_FILE_BYTE_LIMIT: u64 = 16 * 1024 * 1024;
+const WORKSPACE_TOTAL_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
+const EVIDENCE_FILE_BYTE_LIMIT: u64 = 64 * 1024 * 1024;
+const EVIDENCE_TOTAL_BYTE_LIMIT: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceObservation {
@@ -22,62 +34,41 @@ pub fn apply_evidence(
     directive: nopal_core::enforcement::EvidenceDirective,
 ) -> io::Result<()> {
     use nopal_core::enforcement::EvidenceEffect;
+    use nopal_core::run_ledger_store::DurableEffect;
 
-    for effect in directive.effects {
-        match effect {
+    let effects = directive
+        .effects
+        .into_iter()
+        .map(|effect| match effect {
             EvidenceEffect::AppendEvent { event, payload } => {
-                nopal_core::run_ledger_store::append_event(run_dir, &event, &payload, None)
-                    .map_err(|error| io::Error::other(format!("{error:?}")))?;
+                DurableEffect::AppendEvent { event, payload }
             }
             EvidenceEffect::WriteJson {
                 relative_path,
                 payload,
-            } => {
-                nopal_core::run_ledger_store::write_json_durable(
-                    &run_dir.join(relative_path),
-                    &payload,
-                )?;
-            }
+            } => DurableEffect::WriteJson {
+                relative_path,
+                payload,
+            },
             EvidenceEffect::CreateJson {
                 relative_path,
                 payload,
-            } => create_json_once(&run_dir.join(relative_path), &payload)?,
+            } => DurableEffect::CreateJson {
+                relative_path,
+                payload,
+            },
             EvidenceEffect::RemoveFile {
                 relative_path,
                 ignore_missing,
-            } => {
-                if let Err(error) = fs::remove_file(run_dir.join(relative_path))
-                    && !(ignore_missing && error.kind() == io::ErrorKind::NotFound)
-                {
-                    return Err(error);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn create_json_once(path: &Path, payload: &nopal_ledger_json::Value) -> io::Result<()> {
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("evidence path has no parent"))?;
-    fs::create_dir_all(parent)?;
-    let mut options = fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(path)?;
-    serde_json::to_writer_pretty(&mut file, payload).map_err(io::Error::other)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    if let Ok(directory) = fs::File::open(parent) {
-        let _ = directory.sync_all();
-    }
-    Ok(())
+            } => DurableEffect::RemoveFile {
+                relative_path,
+                ignore_missing,
+            },
+        })
+        .collect::<Vec<_>>();
+    nopal_core::run_ledger_store::commit_effect_batch(run_dir, &effects)
+        .map(|_| ())
+        .map_err(|error| io::Error::other(format!("{error:?}")))
 }
 
 pub fn observe(root: &Path) -> io::Result<WorkspaceObservation> {
@@ -119,6 +110,15 @@ pub fn observe(root: &Path) -> io::Result<WorkspaceObservation> {
     );
     changed_files.sort();
     changed_files.dedup();
+    if changed_files.len() > WORKSPACE_FILE_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "workspace has {} changed files; limit is {WORKSPACE_FILE_LIMIT}",
+                changed_files.len()
+            ),
+        ));
+    }
 
     let mut hasher = Sha256::new();
     frame(
@@ -126,40 +126,87 @@ pub fn observe(root: &Path) -> io::Result<WorkspaceObservation> {
         b"git-executable-path",
         git_executable.as_os_str().as_encoded_bytes(),
     );
-    frame(
+    let mut observed_files = 0usize;
+    let mut evidence_file_bytes = 0u64;
+    hash_bounded_file_frame(
         &mut hasher,
         b"git-executable-bytes",
-        &fs::read(&git_executable)?,
-    );
-    for (path, bytes) in credential_helpers.into_iter().chain(configured_pagers) {
+        &git_executable,
+        &mut evidence_file_bytes,
+        EVIDENCE_FILE_BYTE_LIMIT,
+        EVIDENCE_TOTAL_BYTE_LIMIT,
+        "workspace evidence",
+    )?;
+    for path in credential_helpers.into_iter().chain(configured_pagers) {
+        observed_files = observed_files.saturating_add(1);
+        if observed_files > WORKSPACE_FILE_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("workspace evidence has more than {WORKSPACE_FILE_LIMIT} files"),
+            ));
+        }
         frame(
             &mut hasher,
             b"git-helper-path",
             path.as_os_str().as_encoded_bytes(),
         );
-        frame(&mut hasher, b"git-helper-bytes", &bytes);
+        hash_bounded_file_frame(
+            &mut hasher,
+            b"git-helper-bytes",
+            &path,
+            &mut evidence_file_bytes,
+            EVIDENCE_FILE_BYTE_LIMIT,
+            EVIDENCE_TOTAL_BYTE_LIMIT,
+            "workspace evidence",
+        )?;
     }
     frame(&mut hasher, b"head", &head);
     frame(&mut hasher, b"diff", &diff);
     let config = git(root, &["config", "--list", "--show-origin"])?;
     frame(&mut hasher, b"git-config", &config);
-    hash_hooks(root, &mut hasher)?;
+    hash_hooks(
+        root,
+        &mut hasher,
+        &mut observed_files,
+        &mut evidence_file_bytes,
+    )?;
+    let mut observed_file_bytes = 0u64;
     for path_bytes in untracked
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
     {
+        observed_files = observed_files.saturating_add(1);
+        if observed_files > WORKSPACE_FILE_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("workspace has more than {WORKSPACE_FILE_LIMIT} untracked files"),
+            ));
+        }
         frame(&mut hasher, b"untracked-path", path_bytes);
         let relative = String::from_utf8_lossy(path_bytes);
         let full_path = root.join(relative.as_ref());
         match fs::symlink_metadata(&full_path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
-                frame(
-                    &mut hasher,
-                    b"untracked-symlink",
-                    fs::read_link(full_path)?.to_string_lossy().as_bytes(),
-                );
+                let target = fs::read_link(full_path)?;
+                let target = target.as_os_str().as_encoded_bytes();
+                account_workspace_bytes(&mut observed_file_bytes, target.len() as u64)?;
+                frame(&mut hasher, b"untracked-symlink", target);
             }
-            Ok(_) => frame(&mut hasher, b"untracked-content", &fs::read(full_path)?),
+            Ok(metadata) if metadata.file_type().is_file() => hash_file_frame(
+                &mut hasher,
+                b"untracked-content",
+                &full_path,
+                &mut observed_file_bytes,
+            )?,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "untracked path {} is not a regular file or symlink",
+                        full_path.display()
+                    ),
+                ));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 frame(&mut hasher, b"untracked-missing", b"");
             }
@@ -303,7 +350,7 @@ fn reject_git_code_carriers(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn credential_helper_evidence(root: &Path) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
+fn credential_helper_evidence(root: &Path) -> io::Result<Vec<PathBuf>> {
     let helpers = git_optional(
         root,
         &[
@@ -335,8 +382,8 @@ fn credential_helper_evidence(root: &Path) -> io::Result<Vec<(PathBuf, Vec<u8>)>
         if helper == "!/usr/bin/env gh auth git-credential" {
             let env = PathBuf::from("/usr/bin/env").canonicalize()?;
             let gh = resolve_trusted_executable("gh")?;
-            evidence.push((env.clone(), fs::read(env)?));
-            evidence.push((gh.clone(), fs::read(gh)?));
+            evidence.push(env);
+            evidence.push(gh);
             continue;
         }
         if !helper
@@ -363,12 +410,12 @@ fn credential_helper_evidence(root: &Path) -> io::Result<Vec<(PathBuf, Vec<u8>)>
                 format!("Git credential helper {helper:?} is outside the trusted Git exec path"),
             ));
         }
-        evidence.push((executable.clone(), fs::read(executable)?));
+        evidence.push(executable);
     }
     Ok(evidence)
 }
 
-fn configured_pager_evidence(root: &Path) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
+fn configured_pager_evidence(root: &Path) -> io::Result<Vec<PathBuf>> {
     let pagers = git_optional(
         root,
         &[
@@ -397,7 +444,7 @@ fn configured_pager_evidence(root: &Path) -> io::Result<Vec<(PathBuf, Vec<u8>)>>
             ));
         }
         let executable = resolve_trusted_executable(pager)?;
-        evidence.push((executable.clone(), fs::read(executable)?));
+        evidence.push(executable);
     }
     Ok(evidence)
 }
@@ -457,19 +504,142 @@ fn git_executable() -> io::Result<PathBuf> {
     resolve_trusted_executable("git")
 }
 
+#[derive(Debug)]
+struct BoundedOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn collect_bounded_output<R: Read + Send + 'static>(
+    mut reader: R,
+    total: Arc<AtomicUsize>,
+    exceeded: Arc<AtomicBool>,
+    output: Arc<Mutex<Vec<u8>>>,
+) -> thread::JoinHandle<io::Result<()>> {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 8192];
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                return Ok(());
+            }
+            let previous = total.fetch_add(count, Ordering::AcqRel);
+            if previous.saturating_add(count) > GIT_OUTPUT_LIMIT {
+                exceeded.store(true, Ordering::Release);
+                continue;
+            }
+            output
+                .lock()
+                .map_err(|_| io::Error::other("Git output lock was poisoned"))?
+                .extend_from_slice(&buffer[..count]);
+        }
+    })
+}
+
+fn command_output_bounded(command: &mut Command) -> io::Result<BoundedOutput> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("Git stdout pipe is unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("Git stderr pipe is unavailable"))?;
+    let total = Arc::new(AtomicUsize::new(0));
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_bytes = Arc::new(Mutex::new(Vec::new()));
+    let stderr_bytes = Arc::new(Mutex::new(Vec::new()));
+    let stdout_thread = collect_bounded_output(
+        stdout,
+        Arc::clone(&total),
+        Arc::clone(&exceeded),
+        Arc::clone(&stdout_bytes),
+    );
+    let stderr_thread = collect_bounded_output(
+        stderr,
+        Arc::clone(&total),
+        Arc::clone(&exceeded),
+        Arc::clone(&stderr_bytes),
+    );
+    let started = Instant::now();
+    let mut status = None;
+    let mut timed_out = false;
+    loop {
+        if exceeded.load(Ordering::Acquire) || started.elapsed() >= GIT_TIMEOUT {
+            timed_out = started.elapsed() >= GIT_TIMEOUT;
+            #[cfg(unix)]
+            if let Ok(pid) = i32::try_from(child.id()) {
+                // SAFETY: a negative pid addresses the process group created above.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+            break;
+        }
+        if status.is_none() {
+            status = child.try_wait()?;
+        }
+        if status.is_some() && stdout_thread.is_finished() && stderr_thread.is_finished() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    if status.is_none() {
+        status = Some(child.wait()?);
+    }
+    stdout_thread
+        .join()
+        .map_err(|_| io::Error::other("Git stdout collector panicked"))??;
+    stderr_thread
+        .join()
+        .map_err(|_| io::Error::other("Git stderr collector panicked"))??;
+    if exceeded.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Git evidence output exceeds {GIT_OUTPUT_LIMIT} bytes"),
+        ));
+    }
+    if timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Git evidence collection timed out",
+        ));
+    }
+    let stdout = Arc::try_unwrap(stdout_bytes)
+        .map_err(|_| io::Error::other("Git stdout remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("Git stdout lock was poisoned"))?;
+    let stderr = Arc::try_unwrap(stderr_bytes)
+        .map_err(|_| io::Error::other("Git stderr remained shared"))?
+        .into_inner()
+        .map_err(|_| io::Error::other("Git stderr lock was poisoned"))?;
+    Ok(BoundedOutput {
+        status: status.ok_or_else(|| io::Error::other("Git process has no outcome"))?,
+        stdout,
+        stderr,
+    })
+}
+
 fn git_optional(root: &Path, args: &[&str]) -> io::Result<Option<Vec<u8>>> {
-    let output = Command::new(git_executable()?)
-        .args(args)
-        .current_dir(root)
-        .output()?;
+    let mut command = Command::new(git_executable()?);
+    command.args(args).current_dir(root);
+    let output = command_output_bounded(&mut command)?;
     Ok(output.status.success().then_some(output.stdout))
 }
 
 fn git(root: &Path, args: &[&str]) -> io::Result<Vec<u8>> {
-    let output = Command::new(git_executable()?)
-        .args(args)
-        .current_dir(root)
-        .output()?;
+    let mut command = Command::new(git_executable()?);
+    command.args(args).current_dir(root);
+    let output = command_output_bounded(&mut command)?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "git {} failed while collecting enforcement evidence: {}",
@@ -490,13 +660,127 @@ fn lines(bytes: Vec<u8>) -> Vec<String> {
 }
 
 fn frame(hasher: &mut Sha256, label: &[u8], bytes: &[u8]) {
-    hasher.update((label.len() as u64).to_be_bytes());
-    hasher.update(label);
-    hasher.update((bytes.len() as u64).to_be_bytes());
+    frame_header(hasher, label, bytes.len() as u64);
     hasher.update(bytes);
 }
 
-fn hash_hooks(root: &Path, hasher: &mut Sha256) -> io::Result<()> {
+fn frame_header(hasher: &mut Sha256, label: &[u8], length: u64) {
+    hasher.update((label.len() as u64).to_be_bytes());
+    hasher.update(label);
+    hasher.update(length.to_be_bytes());
+}
+
+fn account_bounded_bytes(
+    total: &mut u64,
+    additional: u64,
+    file_limit: u64,
+    total_limit: u64,
+    surface: &str,
+) -> io::Result<()> {
+    if additional > file_limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{surface} file is {additional} bytes; limit is {file_limit}"),
+        ));
+    }
+    *total = total.checked_add(additional).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{surface} byte count overflowed"),
+        )
+    })?;
+    if *total > total_limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{surface} exceeds {total_limit} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn account_workspace_bytes(total: &mut u64, additional: u64) -> io::Result<()> {
+    account_bounded_bytes(
+        total,
+        additional,
+        WORKSPACE_FILE_BYTE_LIMIT,
+        WORKSPACE_TOTAL_BYTE_LIMIT,
+        "workspace untracked content",
+    )
+}
+
+fn hash_file_frame(
+    hasher: &mut Sha256,
+    label: &[u8],
+    path: &Path,
+    total: &mut u64,
+) -> io::Result<()> {
+    hash_bounded_file_frame(
+        hasher,
+        label,
+        path,
+        total,
+        WORKSPACE_FILE_BYTE_LIMIT,
+        WORKSPACE_TOTAL_BYTE_LIMIT,
+        "workspace untracked content",
+    )
+}
+
+fn hash_bounded_file_frame(
+    hasher: &mut Sha256,
+    label: &[u8],
+    path: &Path,
+    total: &mut u64,
+    file_limit: u64,
+    total_limit: u64,
+    surface: &str,
+) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("workspace path {} changed identity", path.display()),
+        ));
+    }
+    let length = metadata.len();
+    account_bounded_bytes(total, length, file_limit, total_limit, surface)?;
+    frame_header(hasher, label, length);
+    let mut remaining = length;
+    let mut buffer = [0u8; 8192];
+    while remaining > 0 {
+        let wanted = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let count = file.read(&mut buffer[..wanted])?;
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("workspace file {} changed while hashing", path.display()),
+            ));
+        }
+        hasher.update(&buffer[..count]);
+        remaining -= count as u64;
+    }
+    if file.read(&mut buffer[..1])? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("workspace file {} changed while hashing", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+fn hash_hooks(
+    root: &Path,
+    hasher: &mut Sha256,
+    observed_files: &mut usize,
+    observed_bytes: &mut u64,
+) -> io::Result<()> {
     let git_dir = git(root, &["rev-parse", "--absolute-git-dir"])?;
     let git_dir = PathBuf::from(String::from_utf8_lossy(&git_dir).trim());
     let hooks = git_dir.join("hooks");
@@ -511,22 +795,44 @@ fn hash_hooks(root: &Path, hasher: &mut Sha256) -> io::Result<()> {
         .collect::<Vec<_>>();
     entries.sort();
     for path in entries {
+        *observed_files = observed_files.saturating_add(1);
+        if *observed_files > WORKSPACE_FILE_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("workspace evidence has more than {WORKSPACE_FILE_LIMIT} files"),
+            ));
+        }
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("<non-utf8>");
         frame(hasher, b"hook-name", name.as_bytes());
-        frame(hasher, b"hook-content", &fs::read(path)?);
+        hash_bounded_file_frame(
+            hasher,
+            b"hook-content",
+            &path,
+            observed_bytes,
+            EVIDENCE_FILE_BYTE_LIMIT,
+            EVIDENCE_TOTAL_BYTE_LIMIT,
+            "workspace evidence",
+        )?;
     }
     Ok(())
 }
 
 fn reject_external_symlinks(root: &Path, nul_paths: &[u8]) -> io::Result<()> {
     let canonical_root = fs::canonicalize(root)?;
-    for path_bytes in nul_paths
+    for (index, path_bytes) in nul_paths
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
+        .enumerate()
     {
+        if index >= WORKSPACE_FILE_LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("workspace has more than {WORKSPACE_FILE_LIMIT} visible files"),
+            ));
+        }
         let relative = String::from_utf8_lossy(path_bytes);
         let path = root.join(relative.as_ref());
         let metadata = match fs::symlink_metadata(&path) {
@@ -555,9 +861,16 @@ fn reject_external_symlinks(root: &Path, nul_paths: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+    use std::process::Command;
 
-    use super::is_trusted_system_executable_path;
+    use sha2::Sha256;
+
+    use super::{
+        WORKSPACE_FILE_BYTE_LIMIT, command_output_bounded, hash_file_frame,
+        is_trusted_system_executable_path,
+    };
 
     #[test]
     fn executable_trust_excludes_user_writable_usr_local_prefixes() {
@@ -569,5 +882,29 @@ mod tests {
         assert!(!is_trusted_system_executable_path(Path::new(
             "/opt/homebrew/bin/git"
         )));
+    }
+
+    #[test]
+    fn subprocess_output_is_stopped_at_the_combined_limit() {
+        if !Path::new("/usr/bin/yes").is_file() {
+            return;
+        }
+        let mut command = Command::new("/usr/bin/yes");
+        let error = command_output_bounded(&mut command).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn untracked_file_hashing_rejects_one_file_over_the_bound_before_reading_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large.bin");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(WORKSPACE_FILE_BYTE_LIMIT + 1).unwrap();
+        let mut hasher = Sha256::default();
+        let mut total = 0;
+        let error = hash_file_frame(&mut hasher, b"content", &path, &mut total).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(total, 0);
     }
 }

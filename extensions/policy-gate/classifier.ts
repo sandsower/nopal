@@ -96,6 +96,7 @@ export type EnforcementAuthority = {
 	gateExecutorBin: string;
 	gateHome: string;
 	gateExecutorDigest: string;
+	gateRuntimeDigest: string;
 };
 
 function isWithin(candidate: string, root: string): boolean {

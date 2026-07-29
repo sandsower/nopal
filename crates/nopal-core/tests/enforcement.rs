@@ -9,7 +9,18 @@ use nopal_core::enforcement::{
 use nopal_core::policy::{ActionClass, Mode};
 use nopal_core::run_ledger_store::{self, InitArgs, LedgerEnv};
 
-const RECEIPT_KEY: &[u8] = b"0123456789abcdef0123456789abcdef";
+const RECEIPT_KEY: &[u8] = b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const CANONICAL_PROJECT_ROOT: &str = "tests/fixtures/enforcement/project";
+
+fn canonical_intent() -> EnforcementIntent {
+    serde_json::from_str(include_str!("fixtures/enforcement/canonical-intent.json")).unwrap()
+}
+
+fn pretty_json(value: &impl serde::Serialize) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec_pretty(value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
 
 fn write(path: &Path, text: &str) {
     if let Some(parent) = path.parent() {
@@ -92,6 +103,80 @@ fn project(root: &Path) {
           "version": "nopal.gates/v1",
           "gates": [{ "id": "proof", "stage": "pre_pr", "command": "true" }]
         }"#,
+    );
+}
+
+#[test]
+fn canonical_enforcement_artifacts_remain_byte_stable() {
+    let root = Path::new(CANONICAL_PROJECT_ROOT);
+    assert!(
+        root.is_dir(),
+        "missing canonical enforcement project fixture"
+    );
+    let exact_intent = canonical_intent();
+    assert_eq!(
+        pretty_json(&exact_intent),
+        include_bytes!("fixtures/enforcement/canonical-intent.json")
+    );
+
+    let request = || EnforcementRequest {
+        root,
+        config_dir: None,
+        mode: Mode::SupervisedAuto,
+        action: "git.push",
+        classes: &[ActionClass::GitRemote],
+        run_dir: None,
+        receipt_key: Some(RECEIPT_KEY),
+    };
+    let plan = enforcement::plan_for_intent(request(), exact_intent.clone()).unwrap();
+    assert_eq!(
+        pretty_json(&plan),
+        include_bytes!("fixtures/enforcement/canonical-plan.json")
+    );
+
+    let decision = enforcement::decision_evidence(&plan).unwrap();
+    assert_eq!(
+        pretty_json(&decision),
+        include_bytes!("fixtures/enforcement/canonical-decision-event.json")
+    );
+
+    let receipt = plan
+        .receipts
+        .iter()
+        .find(|receipt| receipt.gate_id == "proof")
+        .unwrap();
+    let evidence = enforcement::gate_evidence_for_intent(
+        request(),
+        exact_intent,
+        "proof",
+        0,
+        &enforcement::GateExecutionContext {
+            contract_digest: plan.contract_digest,
+            workspace_fingerprint: plan.workspace_fingerprint,
+            gate_definition_digest: receipt.gate_definition_digest.clone(),
+            authorization_binding: plan.authorization_binding,
+        },
+    )
+    .unwrap();
+    let (receipt_path, receipt_payload) = evidence
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            enforcement::EvidenceEffect::CreateJson {
+                relative_path,
+                payload,
+            } => Some((relative_path, payload)),
+            _ => None,
+        })
+        .unwrap();
+    let receipt_path = format!("{}\n", receipt_path.display());
+    assert_eq!(
+        receipt_path.as_bytes(),
+        include_bytes!("fixtures/enforcement/canonical-receipt-path.txt")
+    );
+    assert_eq!(
+        pretty_json(receipt_payload),
+        include_bytes!("fixtures/enforcement/canonical-receipt.json")
     );
 }
 

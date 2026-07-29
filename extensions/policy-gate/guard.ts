@@ -7,17 +7,16 @@ import {
 	classifyPiToolCall,
 	commandReferencesEnforcementAuthority,
 	isProtectedEnforcementPath,
-	redactSecrets,
 	redactToolContent,
 	shouldBlockProtectedCredentialPath,
 	type EnforcementAuthority,
 } from "./classifier.ts";
 import {
-	authorizeEnforcement,
+	advanceEnforcement,
+	cleanupEnforcementRuntime,
+	closeEnforcementRun,
 	planEnforcement,
-	reauthorizationIsCurrent,
 	recordEnforcementApproval,
-	recordEnforcementGate,
 	recordEnforcementOutcome,
 	type EnforcementGate,
 	type EnforcementParams,
@@ -146,47 +145,6 @@ function privateCoreExec(authority: EnforcementAuthority): ExecFn {
 			timeout: options.timeout ?? 10_000,
 		});
 	};
-}
-
-function gateWorkingDirectory(root: string, configured: string | undefined): string | undefined {
-	try {
-		const resolvedRoot = realpathSync(root);
-		const resolved = realpathSync(path.resolve(resolvedRoot, configured ?? "."));
-		return resolved === resolvedRoot || resolved.startsWith(`${resolvedRoot}${path.sep}`) ? resolved : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-async function executeGate(
-	_pi: ExtensionAPI,
-	gate: EnforcementGate,
-	root: string,
-	authority: EnforcementAuthority,
-) {
-	const cwd = gateWorkingDirectory(root, gate.cwd);
-	if (!cwd) return { stdout: "", stderr: "gate cwd escapes repository root", code: 2 };
-	const env: NodeJS.ProcessEnv = {
-		HOME: authority.gateHome,
-		CARGO_HOME: path.join(authority.gateHome, "cargo"),
-		CARGO_NET_OFFLINE: "true",
-		LANG: "C.UTF-8",
-		LC_ALL: "C.UTF-8",
-		npm_config_cache: path.join(authority.gateHome, "npm-cache"),
-		PATH: `${authority.gateExecutorBin}:/usr/bin:/bin`,
-		RUSTUP_HOME: path.join(authority.gateHome, "rustup"),
-		TMPDIR: path.join(authority.gateHome, "tmp"),
-	};
-	if ("command" in gate.run) {
-		return runBoundedProcess(
-			"/bin/bash",
-			["--noprofile", "--norc", "-c", gate.run.command],
-			{ cwd, env, timeout: 10 * 60_000 },
-		);
-	}
-	const [command, ...args] = gate.run.argv;
-	if (!command) return { stdout: "", stderr: "gate argv is empty", code: 2 };
-	return runBoundedProcess(command, args, { cwd, env, timeout: 10 * 60_000 });
 }
 
 function gateAllowsParallelRead(gate: EnforcementGate): boolean {
@@ -346,6 +304,7 @@ export function installPiActionGuard(
 				inputDigest: intent.inputDigest,
 				targetDigest: intent.targetDigest,
 				executorDigest: authority.gateExecutorDigest,
+				runtimeDigest: authority.gateRuntimeDigest,
 				changedFiles: intent.changedFiles,
 				mutates: intent.mutates,
 				cwd: ctx.cwd,
@@ -397,44 +356,35 @@ export function installPiActionGuard(
 				activeMutatingCallId = event.toolCallId;
 			}
 
-			for (const gate of result.requiredGates) {
-				const gateResult = await executeGate(pi, gate, result.root, authority);
-				const recorded = await recordEnforcementGate(
-					coreExec,
-					{
-						...params,
-						gateId: gate.id,
-						exitCode: gateResult.code,
-						contractDigest: result.contractDigest,
-						workspaceFingerprint: result.workspaceFingerprint,
-						gateDefinitionDigest: gate.definitionDigest,
-						authorizationBinding: result.authorizationBinding,
-					},
-				);
-				if (!recorded) {
+			let advanced = await advanceEnforcement(coreExec, params);
+			if (advanced.failClosed) {
+				stats.failClosed += 1;
+				stats.blocked += 1;
+				return { block: true, reason: advanced.reason ?? advanced.plan.explanation };
+			}
+			let current = advanced.plan;
+			try {
+				if (realpathSync(current.root) !== realpathSync(authority.projectRoot)) {
 					stats.failClosed += 1;
 					stats.blocked += 1;
-					return { block: true, reason: `Could not durably record gate ${gate.id}; authorization changed or evidence authentication failed` };
+					return { block: true, reason: "Verification transaction returned a foreign repository root" };
 				}
-				if (gateResult.code !== 0) {
-					stats.blocked += 1;
-					return { block: true, reason: `Required gate ${gate.id} failed: ${redactSecrets(gateResult.stderr)}` };
-				}
+			} catch {
+				stats.failClosed += 1;
+				stats.blocked += 1;
+				return { block: true, reason: "Verification transaction repository identity could not be verified" };
+			}
+			if (!placementIsSatisfied(current.placement, ctx, authority)) {
+				stats.blocked += 1;
+				return { block: true, reason: `${current.explanation}; required placement is not established for this run` };
+			}
+			if (advanced.state === "blocked") {
+				if (current.decision === "deny") stats.denied += 1;
+				stats.blocked += 1;
+				return { block: true, reason: advanced.reason ?? current.explanation };
 			}
 
-			let current = result;
-			if (result.requiredGates.length > 0) {
-				current = await planEnforcement(coreExec, params);
-				if (current.failClosed
-					|| current.authorizationBinding !== result.authorizationBinding
-					|| current.requiredGates.length > 0) {
-					stats.failClosed += 1;
-					stats.blocked += 1;
-					return { block: true, reason: "Gate receipts or the authorization context were not current after execution; blocking fail closed" };
-				}
-			}
-
-			if (current.decision === "ask") {
+			if (advanced.state === "approval_required") {
 				stats.asked += 1;
 				if (!ctx.hasUI) {
 					stats.blocked += 1;
@@ -454,31 +404,24 @@ export function installPiActionGuard(
 					return { block: true, reason: approved ? "Could not durably record approval" : "Blocked by user" };
 				}
 				stats.approved += 1;
-				const approvedPlan = await planEnforcement(coreExec, params);
-				if (!reauthorizationIsCurrent(current, approvedPlan, true)
-					|| !approvedPlan.approvalCurrent
-					|| !approvedPlan.authorized) {
+				advanced = await advanceEnforcement(coreExec, params);
+				current = advanced.plan;
+				if (advanced.failClosed
+					|| advanced.state !== "released"
+					|| !current.approvalCurrent
+					|| !current.authorized) {
 					stats.failClosed += 1;
 					stats.blocked += 1;
 					return { block: true, reason: "Durable approval did not match the current exact authorization subject" };
 				}
-				current = approvedPlan;
 			}
 
-			if (!current.authorized) {
+			if (advanced.state !== "released" || !advanced.releaseId || !current.authorized) {
 				stats.failClosed += 1;
 				stats.blocked += 1;
 				return { block: true, reason: "Core did not durably release this exact Pi tool call" };
 			}
-			const releaseId = await authorizeEnforcement(
-				coreExec,
-				{ ...params, authorizationBinding: current.authorizationBinding },
-			);
-			if (!releaseId) {
-				stats.failClosed += 1;
-				stats.blocked += 1;
-				return { block: true, reason: "Core did not durably release this exact Pi tool call" };
-			}
+			const releaseId = advanced.releaseId;
 			const active = activeCalls.get(event.toolCallId);
 			if (!active) {
 				stats.failClosed += 1;
@@ -544,6 +487,7 @@ export function installPiActionGuard(
 
 	pi.on("session_shutdown", async () => {
 		shuttingDown = true;
+		const runWasInterrupted = activeCalls.size > 0 || concurrencyPoisoned;
 		let interruptionRecorded = true;
 		for (const active of activeCalls.values()) {
 			const release = active.release;
@@ -556,6 +500,35 @@ export function installPiActionGuard(
 			})) {
 				interruptionRecorded = false;
 			}
+		}
+		if (interruptionRecorded && coreExec) {
+			interruptionRecorded = await cleanupEnforcementRuntime(coreExec, {
+				mode,
+				action: "fs.read",
+				class: "workspace_read",
+				runId: authority.runId,
+				nopalBin: authority.nopalBin,
+				adapterCapability: authority.adapterCapability,
+				launchId: authority.runId,
+				sessionId: "session-shutdown",
+				toolCallId: "session-shutdown",
+				toolName: "session_shutdown",
+				inputDigest: "session-shutdown",
+				targetDigest: "session-shutdown",
+				executorDigest: authority.gateExecutorDigest,
+				runtimeDigest: authority.gateRuntimeDigest,
+				cwd: authority.projectRoot,
+			});
+		}
+		if (interruptionRecorded && coreExec) {
+			interruptionRecorded = await closeEnforcementRun(
+				coreExec,
+				{ nopalBin: authority.nopalBin, runId: authority.runId, cwd: authority.projectRoot },
+				runWasInterrupted ? "interrupted" : "completed",
+				runWasInterrupted ? "Pi session shut down with unsettled protected calls" : "Pi session shut down",
+			);
+		} else {
+			interruptionRecorded = false;
 		}
 		if (interruptionRecorded) {
 			activeCalls.clear();

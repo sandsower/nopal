@@ -1,0 +1,10 @@
+{
+  "action": "git.push",
+  "authorization_binding": "426da1e5bfd11aaecf9f00b60f90fbfc7b2558991ce16b0857782e72de17d201",
+  "contract_digest": "4b6e74a1eea52cd9b61a067ec855aa5475944e3f249a61dddd6cd1c8641fb960",
+  "exit_code": 0,
+  "gate_definition_digest": "418dd1c8d3f68d3c4f17beff27bb8ad151d247235989485dd1ca1215260856cd",
+  "gate_id": "proof",
+  "signature": "9807d04510de8115332e343e52206d1c82d1b9abde5419c18589e9943d0198e4",
+  "workspace_fingerprint": "4444444444444444444444444444444444444444444444444444444444444444"
+}

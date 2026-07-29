@@ -1,0 +1,1 @@
+{"version":"nopal.gates/v1","gates":[{"id":"proof","stage":"pre_pr","argv":["cargo","test","--workspace"]}]}

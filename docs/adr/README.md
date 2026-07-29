@@ -8,3 +8,4 @@ These records describe durable Nopal architecture decisions.
 - [ADR 0013: Lock portable project distributions](0013-lock-portable-project-distributions.md)
 - [ADR 0014: Detect first-run gates from confined evidence](0014-detect-first-run-gates-from-confined-evidence.md)
 - [ADR 0015: Mediate every protected Pi tool call](0015-mediate-every-protected-pi-tool-call.md)
+- [ADR 0016: Journal workflow runs and share local verification](0016-journal-workflow-runs-and-share-local-verification.md)

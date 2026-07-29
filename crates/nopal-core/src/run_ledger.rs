@@ -22,11 +22,17 @@ pub type JsonValue = Value;
 pub const SCHEMA_VERSION: u64 = 1;
 pub const LEDGER_KIND: &str = "run-ledger-v1";
 pub const CHECKPOINT_KIND: &str = "run-ledger-checkpoint-v1";
+/// Immutable command journal record kind.
+pub const TRANSACTION_KIND: &str = "run-ledger-transaction-v1";
 
 /// Redacted strings are capped at this many characters.
 pub const TEXT_LIMIT: usize = 2000;
 /// Resume hints get a tighter cap.
 pub const HINT_LIMIT: usize = 500;
+/// Maximum canonical bytes accepted for one event or gate envelope.
+pub const EVENT_LIMIT: usize = 256 * 1024;
+/// Maximum bytes accepted for one checkpoint payload or final report.
+pub const DOCUMENT_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +41,64 @@ pub enum Status {
     Interrupted,
     Failed,
     Completed,
+}
+
+/// Structural command kinds are owned by Nopal. Workflow names remain open
+/// payload data and cannot bypass lifecycle validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKind {
+    Initialize,
+    Event,
+    Checkpoint,
+    Gate,
+    Evidence,
+    Interrupt,
+    Resume,
+    Finalize,
+}
+
+impl CommandKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommandKind::Initialize => "initialize",
+            CommandKind::Event => "event",
+            CommandKind::Checkpoint => "checkpoint",
+            CommandKind::Gate => "gate",
+            CommandKind::Evidence => "evidence",
+            CommandKind::Interrupt => "interrupt",
+            CommandKind::Resume => "resume",
+            CommandKind::Finalize => "finalize",
+        }
+    }
+}
+
+/// Typed structural command used by the pure transition validator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerCommand {
+    Initialize,
+    Event,
+    Checkpoint,
+    Gate,
+    Evidence,
+    Interrupt,
+    Resume,
+    Finalize(Status),
+}
+
+impl LedgerCommand {
+    pub fn kind(self) -> CommandKind {
+        match self {
+            LedgerCommand::Initialize => CommandKind::Initialize,
+            LedgerCommand::Event => CommandKind::Event,
+            LedgerCommand::Checkpoint => CommandKind::Checkpoint,
+            LedgerCommand::Gate => CommandKind::Gate,
+            LedgerCommand::Evidence => CommandKind::Evidence,
+            LedgerCommand::Interrupt => CommandKind::Interrupt,
+            LedgerCommand::Resume => CommandKind::Resume,
+            LedgerCommand::Finalize(_) => CommandKind::Finalize,
+        }
+    }
 }
 
 impl Status {
@@ -69,6 +133,32 @@ impl Status {
 
     pub fn is_incomplete(self) -> bool {
         self != Status::Completed
+    }
+}
+
+/// Validate one structural lifecycle transition and return its resulting
+/// state. Finalization from `interrupted` remains accepted for v1 projection
+/// compatibility, while ordinary mutations require `running`.
+pub fn transition(current: Option<Status>, command: LedgerCommand) -> Result<Status, &'static str> {
+    match (current, command) {
+        (None, LedgerCommand::Initialize) => Ok(Status::Running),
+        (
+            Some(Status::Running),
+            LedgerCommand::Event
+            | LedgerCommand::Checkpoint
+            | LedgerCommand::Gate
+            | LedgerCommand::Evidence,
+        ) => Ok(Status::Running),
+        (Some(Status::Running), LedgerCommand::Interrupt) => Ok(Status::Interrupted),
+        (Some(Status::Interrupted), LedgerCommand::Resume) => Ok(Status::Running),
+        (Some(Status::Running | Status::Interrupted), LedgerCommand::Finalize(status))
+            if Status::FINAL.contains(&status) =>
+        {
+            Ok(status)
+        }
+        (Some(Status::Failed | Status::Completed), _) => Err("terminal runs reject mutation"),
+        (None, _) => Err("only initialize may create a run"),
+        _ => Err("command is invalid for the current run state"),
     }
 }
 
@@ -240,6 +330,20 @@ fn env_re() -> &'static Regex {
     RE.get_or_init(|| fixed(r"(?i)\$\{?(TOKEN|SECRET|PASSWORD|API[_-]?KEY|AUTH|GITHUB_TOKEN)\}?"))
 }
 
+fn standalone_secret_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        fixed(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16})\b")
+    })
+}
+
+fn private_key_block_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        fixed(r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----")
+    })
+}
+
 fn json_key_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -263,8 +367,10 @@ pub fn redact_text(text: &str, limit: usize) -> String {
     let pass2 = assignment_re().replace_all(&pass1, |c: &regex::Captures| {
         format!("{}=[REDACTED]", &c[1])
     });
-    let pass3 = env_re().replace_all(&pass2, "[REDACTED]");
-    truncate_chars(&pass3, limit)
+    let pass3 = private_key_block_re().replace_all(&pass2, "[REDACTED PRIVATE KEY]");
+    let pass4 = standalone_secret_re().replace_all(&pass3, "[REDACTED]");
+    let pass5 = env_re().replace_all(&pass4, "[REDACTED]");
+    truncate_chars(&pass5, limit)
 }
 
 /// Recursive redaction: secret-looking object keys lose their whole value,
@@ -667,6 +773,15 @@ mod tests {
     }
 
     #[test]
+    fn standalone_credentials_and_private_keys_redact() {
+        let message = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456\nsk-abcdefgh12345678\nAKIA1234567890ABCDEF\n-----BEGIN PRIVATE KEY-----\nprivate material\n-----END PRIVATE KEY-----";
+        assert_eq!(
+            redact_text(message, TEXT_LIMIT),
+            "[REDACTED]\n[REDACTED]\n[REDACTED]\n[REDACTED PRIVATE KEY]"
+        );
+    }
+
+    #[test]
     fn non_secret_words_survive_redaction() {
         let text = "tokenizer and passwordless should remain visible";
         assert_eq!(redact_text(text, TEXT_LIMIT), text);
@@ -870,5 +985,23 @@ mod tests {
             assert_eq!(Status::parse(status.as_str()), Some(status));
         }
         assert_eq!(Status::parse("active"), None);
+    }
+
+    #[test]
+    fn typed_transitions_reject_terminal_and_require_explicit_resume() {
+        assert_eq!(
+            transition(None, LedgerCommand::Initialize),
+            Ok(Status::Running)
+        );
+        assert_eq!(
+            transition(Some(Status::Running), LedgerCommand::Interrupt),
+            Ok(Status::Interrupted)
+        );
+        assert!(transition(Some(Status::Interrupted), LedgerCommand::Event).is_err());
+        assert_eq!(
+            transition(Some(Status::Interrupted), LedgerCommand::Resume),
+            Ok(Status::Running)
+        );
+        assert!(transition(Some(Status::Completed), LedgerCommand::Event).is_err());
     }
 }

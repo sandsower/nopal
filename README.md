@@ -72,9 +72,11 @@ nopal sync --json
 nopal update --json
 nopal update --write --json
 nopal validate --json
+nopal verify --json
 nopal gates list --json
 nopal policy decide --mode supervised_auto --action git.push --class git_remote --json
-nopal ledger resume --flow enforcement --json
+nopal ledger resume --run-id <run-id> --flow enforcement --json
+nopal ledger continue --run-id <run-id> --flow enforcement --json
 ```
 
 The internal `nopal enforcement` machine API is hidden from public help and reserved for the trusted bundled Pi adapter.
@@ -131,8 +133,8 @@ For a protected Pi tool call, the bundled adapter:
 
 1. Classifies the complete shell envelope before execution.
 2. Rejects compound, dynamic, redirected, expanded, or otherwise unsupported shell syntax rather than authorizing only part of it.
-3. Requests an action plan from Nopal Core through the resolved launch binary.
-4. Executes each missing gate returned by Core in a canonical-root-confined, non-profile, output-bounded, process-group-bounded, capability-free subprocess.
+3. Sends the exact intent to one private verification transaction through the resolved launch binary.
+4. Lets the trusted CLI adapter execute each missing Core-selected gate in a canonical-root-confined, non-profile, output-bounded, process-group-bounded, capability-free subprocess.
 5. Resolves executors for every potentially applicable `continuous`, `per_edit`, `pre_commit`, and `pre_pr` gate before launch, independent of current policy, selectors, or changed files, pins canonical paths and bytes in a run-private alias directory, and revalidates that manifest before every private authorization transition.
 6. Uses a private gate home and cache paths so proof tools do not create authority or cache files in the repository.
 7. Records the observed exit code against the exact contract, workspace, executor identity, gate definition, and authorization binding.
@@ -147,7 +149,12 @@ Executable, symlinked, or multiply-linked project settings fail launch, and the 
 Executable Git and ripgrep environment or configuration carriers fail closed before protected effects.
 
 Nopal Core never executes gate commands.
-The Pi adapter is the execution boundary.
+The trusted CLI adapter owns gate execution and durable effects.
+The Pi adapter retains classification, concurrency leases, interactive approval, protected-call release, and exact result matching.
+
+`nopal verify` uses the same local verification transaction, policy compiler, gate selector, executor manifest, gate runner, receipt codec, and ledger publication path for the fixed `git.push` pre-PR boundary.
+It performs no push, launches no Pi process, contacts no remote service, and cannot approve an `ask` decision.
+An approval-required headless run stops as interrupted evidence and creates no release.
 
 Every executable Pi extension is verified against an identity embedded in the installed Nopal binary before Pi starts.
 The launch probe requires the complete audited `bash`, `edit`, `find`, `grep`, `ls`, `read`, and `write` catalog after the guard is installed.
@@ -186,7 +193,12 @@ ${BEISLID_STATE_DIR:-~/.local/state/beislid}/runs/enforcement/<repo_hash>/<run_i
 ```
 
 Independent read-only calls may remain in flight concurrently, but a mutator is exclusive against every other protected call.
-The ledger records action decisions, gate attempts, passing receipts, exact one-shot releases, and terminal success, error, cancellation, or interruption outcomes.
+The ledger records lifecycle transitions, workflow events, checkpoints, gate attempts, policy decisions, approvals, passing receipts, exact one-shot releases, and terminal success, error, cancellation, or interruption outcomes.
+Each mutation publishes one immutable revisioned transaction before updating its compatible `run.json`, `events.jsonl`, transcript, checkpoint, and artifact projections.
+A later process validates the digest chain and repairs only a projection that matches a committed boundary, without duplicating evidence.
+Exact resume queries return the journal revision, transaction digest, resume epoch, redacted continuation, expected next action, and whether all protected proof must be rerun.
+`ledger continue` is the only transition from interrupted back to running, increments the resume epoch, and records that re-verification is mandatory.
+All filesystem scans, payloads, reports, event counts, gate attempts, lock waits, and continuation fields are bounded.
 It is a bounded evidence surface, not a dashboard, session registry, or coordination product.
 
 ## Workspace
@@ -196,8 +208,8 @@ The active v0.3 path currently centers on:
 | Path | Responsibility |
 |---|---|
 | `crates/nopal-core` | Typed compilation, restrictive policy composition, gate selection, receipt validation, and ledger evidence |
-| `crates/nopal-cli` | Bare launch, fail-closed initialization, hidden adapter machine API, and Pi handoff |
-| `extensions/policy-gate` | Continuous Pi tool-call mediation and adapter-owned gate execution |
+| `crates/nopal-cli` | Bare launch, shared local verification transaction, confined gate execution, durable effects, hidden adapter machine API, and Pi handoff |
+| `extensions/policy-gate` | Continuous Pi tool-call classification, approval, lease, release, and outcome mediation |
 | `.nopal/` | Checked-in project, policy, gate, package, and exact distribution-lock contracts |
 | `docs/adr/0012-reset-nopal-to-an-enforced-pi-distribution.md` | v0.3 product and assurance-boundary decision |
 | `docs/adr/0013-lock-portable-project-distributions.md` | Offline launch and explicit package synchronization decision |
