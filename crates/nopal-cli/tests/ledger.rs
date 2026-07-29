@@ -271,6 +271,94 @@ fn ledger_lifecycle_roundtrip() {
 }
 
 #[test]
+fn exact_resume_returns_revision_stamped_bounded_continuation() {
+    let (_tmp, repo, state) = setup();
+    for run_id in ["r1", "r2"] {
+        let initialized = nopal(
+            &repo,
+            &state,
+            &["ledger", "init", "--skill", "resume", "--run-id", run_id],
+        );
+        assert_eq!(initialized.status.code(), Some(0));
+    }
+    let checkpoint = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger",
+            "checkpoint",
+            "--run-id",
+            "r1",
+            "--name",
+            "ready",
+            "--resume-hint",
+            "rerun exact local proof",
+        ],
+    );
+    assert_eq!(checkpoint.status.code(), Some(0));
+
+    let exact = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger", "resume", "--run-id", "r1", "--flow", "resume", "--json",
+        ],
+    );
+    assert_eq!(exact.status.code(), Some(0));
+    let body = json(&exact);
+    assert_eq!(body["run_id"], "r1");
+    assert_eq!(body["exact"], true);
+    assert!(body["revision"].as_u64().unwrap() >= 2);
+    assert!(body["transaction_digest"].as_str().is_some());
+    assert_eq!(body["resume_epoch"], 0);
+    assert_eq!(body["must_reverify"], true);
+    assert_eq!(
+        body["expected_next_action"],
+        "recover_interrupted_operation"
+    );
+    assert_eq!(body["resume_hint"], "rerun exact local proof");
+
+    let interrupted = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger",
+            "interrupt",
+            "--run-id",
+            "r1",
+            "--flow",
+            "resume",
+            "--reason",
+            "restart",
+        ],
+    );
+    assert_eq!(interrupted.status.code(), Some(0));
+    let continued = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger", "continue", "--run-id", "r1", "--flow", "resume", "--json",
+        ],
+    );
+    assert_eq!(continued.status.code(), Some(0));
+    assert_eq!(json(&continued)["status"], "running");
+    let resumed = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger", "resume", "--run-id", "r1", "--flow", "resume", "--json",
+        ],
+    );
+    let resumed = json(&resumed);
+    assert_eq!(resumed["resume_epoch"], 1);
+    assert_eq!(resumed["must_reverify"], true);
+    assert_eq!(
+        resumed["expected_next_action"],
+        "recover_interrupted_operation"
+    );
+}
+
+#[test]
 fn explicit_run_id_collision_exits_one_with_stable_code() {
     let (_tmp, repo, state) = setup();
     let first = nopal(
@@ -341,6 +429,289 @@ fn missing_run_and_bad_final_status_are_domain_failures() {
     assert_eq!(
         json(&bad_status)["diagnostics"][0]["code"],
         "ledger_status_invalid"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_or_hardlinked_transaction_authority_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let (_tmp, repo, state) = setup();
+    nopal(
+        &repo,
+        &state,
+        &["ledger", "init", "--skill", "s", "--run-id", "symlink"],
+    );
+    let run_dir = run_dir_of(&state, "s", "symlink");
+    let external = repo.join("external-transactions");
+    fs::create_dir(&external).unwrap();
+    fs::remove_dir_all(run_dir.join("transactions")).unwrap();
+    symlink(&external, run_dir.join("transactions")).unwrap();
+    let blocked = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger", "event", "--run-id", "symlink", "--type", "late", "--json",
+        ],
+    );
+    assert_eq!(blocked.status.code(), Some(1));
+    assert_eq!(
+        json(&blocked)["diagnostics"][0]["code"],
+        "ledger_entry_invalid"
+    );
+    assert_eq!(fs::read_dir(&external).unwrap().count(), 0);
+
+    nopal(
+        &repo,
+        &state,
+        &["ledger", "init", "--skill", "s", "--run-id", "hardlink"],
+    );
+    let run_dir = run_dir_of(&state, "s", "hardlink");
+    let first = run_dir.join("transactions/00000000000000000001.json");
+    let alias = run_dir.join("transactions/00000000000000000002.json");
+    fs::hard_link(first, alias).unwrap();
+    let blocked = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger", "event", "--run-id", "hardlink", "--type", "late", "--json",
+        ],
+    );
+    assert_eq!(blocked.status.code(), Some(1));
+    assert_eq!(
+        json(&blocked)["diagnostics"][0]["code"],
+        "ledger_entry_invalid"
+    );
+}
+
+#[test]
+fn terminal_runs_reject_every_mutation() {
+    let (_tmp, repo, state) = setup();
+    nopal(
+        &repo,
+        &state,
+        &["ledger", "init", "--skill", "s", "--run-id", "r1"],
+    );
+    let finalized = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger",
+            "finalize",
+            "--run-id",
+            "r1",
+            "--status",
+            "completed",
+            "--json",
+        ],
+    );
+    assert_eq!(finalized.status.code(), Some(0));
+
+    for command in [
+        vec![
+            "ledger", "event", "--run-id", "r1", "--type", "late", "--json",
+        ],
+        vec![
+            "ledger",
+            "checkpoint",
+            "--run-id",
+            "r1",
+            "--name",
+            "late",
+            "--json",
+        ],
+        vec![
+            "ledger",
+            "interrupt",
+            "--run-id",
+            "r1",
+            "--reason",
+            "late",
+            "--json",
+        ],
+        vec![
+            "ledger", "finalize", "--run-id", "r1", "--status", "failed", "--json",
+        ],
+    ] {
+        let out = nopal(&repo, &state, &command);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "terminal mutation unexpectedly succeeded: {command:?}"
+        );
+        assert_eq!(
+            json(&out)["diagnostics"][0]["code"],
+            "ledger_transition_invalid"
+        );
+    }
+}
+
+#[test]
+fn final_report_and_initial_metadata_are_redacted_before_persistence() {
+    let (_tmp, repo, state) = setup();
+    let init = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger",
+            "init",
+            "--skill",
+            "kickoff",
+            "--ticket-title",
+            "TOKEN=init-secret",
+            "--run-id",
+            "r1",
+            "--json",
+        ],
+    );
+    assert_eq!(init.status.code(), Some(0));
+
+    let report = repo.join("report.md");
+    write_file(
+        &report,
+        "# Result\n\nAuthorization: Bearer report-secret\nPASSWORD=hunter2\nghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456\nsk-abcdefgh12345678\nAKIA1234567890ABCDEF\n-----BEGIN PRIVATE KEY-----\nprivate material\n-----END PRIVATE KEY-----\n",
+    );
+    let finalized = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger",
+            "finalize",
+            "--run-id",
+            "r1",
+            "--status",
+            "completed",
+            "--report-file",
+            report.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(finalized.status.code(), Some(0));
+
+    let run_dir = run_dir_of(&state, "kickoff", "r1");
+    for entry in tree_files(&run_dir) {
+        let bytes = fs::read(run_dir.join(&entry)).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains("init-secret"), "secret in {entry}");
+        assert!(!text.contains("report-secret"), "secret in {entry}");
+        assert!(!text.contains("hunter2"), "secret in {entry}");
+        assert!(
+            !text.contains("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"),
+            "secret in {entry}"
+        );
+        assert!(!text.contains("sk-abcdefgh12345678"), "secret in {entry}");
+        assert!(!text.contains("AKIA1234567890ABCDEF"), "secret in {entry}");
+        assert!(!text.contains("private material"), "secret in {entry}");
+    }
+    assert!(
+        fs::read_to_string(run_dir.join("final-report.md"))
+            .unwrap()
+            .contains("[REDACTED]")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_state_flow_cannot_redirect_run_creation_outside_the_state_root() {
+    use std::os::unix::fs::symlink;
+
+    let (_tmp, repo, state) = setup();
+    let external = tempfile::tempdir().unwrap();
+    fs::create_dir_all(state.join("runs")).unwrap();
+    symlink(external.path(), state.join("runs/evil")).unwrap();
+
+    let blocked = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger", "init", "--skill", "s", "--flow", "evil", "--run-id", "r1", "--json",
+        ],
+    );
+    assert_ne!(blocked.status.code(), Some(0));
+    assert_eq!(fs::read_dir(external.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_final_report_is_rejected_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let (_tmp, repo, state) = setup();
+    nopal(
+        &repo,
+        &state,
+        &["ledger", "init", "--skill", "s", "--run-id", "r1"],
+    );
+    let target = repo.join("secret-report.md");
+    write_file(&target, "TOKEN=must-not-copy\n");
+    let alias = repo.join("report-link.md");
+    symlink(&target, &alias).unwrap();
+    let blocked = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger",
+            "finalize",
+            "--run-id",
+            "r1",
+            "--status",
+            "completed",
+            "--report-file",
+            alias.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(blocked.status.code(), Some(1));
+    assert_eq!(
+        json(&blocked)["diagnostics"][0]["code"],
+        "ledger_entry_invalid"
+    );
+    let run_dir = run_dir_of(&state, "s", "r1");
+    assert!(!run_dir.join("final-report.md").exists());
+}
+
+#[test]
+fn oversized_event_payload_fails_closed_without_mutating_the_run() {
+    let (_tmp, repo, state) = setup();
+    nopal(
+        &repo,
+        &state,
+        &["ledger", "init", "--skill", "s", "--run-id", "r1"],
+    );
+    let run_dir = run_dir_of(&state, "s", "r1");
+    let before_run = fs::read(run_dir.join("run.json")).unwrap();
+    let before_events = fs::read(run_dir.join("events.jsonl")).unwrap();
+    let payload = repo.join("oversized.json");
+    write_file(
+        &payload,
+        &serde_json::json!({ "payload": "x".repeat(256 * 1024) }).to_string(),
+    );
+
+    let out = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger",
+            "event",
+            "--run-id",
+            "r1",
+            "--type",
+            "oversized",
+            "--json-file",
+            payload.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        json(&out)["diagnostics"][0]["code"],
+        "ledger_limit_exceeded"
+    );
+    assert_eq!(fs::read(run_dir.join("run.json")).unwrap(), before_run);
+    assert_eq!(
+        fs::read(run_dir.join("events.jsonl")).unwrap(),
+        before_events
     );
 }
 
@@ -472,6 +843,118 @@ fn prune_apply_finalizes_and_the_run_disappears_from_field() {
 // Concurrency (ported from test_run_ledger_concurrency.py)
 // ---------------------------------------------------------------------------
 
+fn journal_files(run_dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = fs::read_dir(run_dir.join("transactions"))
+        .expect("transaction directory")
+        .map(|entry| entry.expect("transaction entry").path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect();
+    files.sort();
+    files
+}
+
+#[test]
+fn committed_event_repairs_torn_projections_exactly_once() {
+    let (_tmp, repo, state) = setup();
+    nopal(
+        &repo,
+        &state,
+        &["ledger", "init", "--skill", "repair", "--run-id", "r1"],
+    );
+    let run_dir = run_dir_of(&state, "repair", "r1");
+    let before = fs::read_to_string(run_dir.join("events.jsonl")).unwrap();
+
+    let torn = nopal_env(
+        &repo,
+        &state,
+        &[
+            "ledger",
+            "event",
+            "--run-id",
+            "r1",
+            "--type",
+            "committed",
+            "--json",
+        ],
+        &[("NOPAL_LEDGER_TEST_FAILPOINT", "after_commit")],
+    );
+    assert_eq!(torn.status.code(), Some(2));
+    assert_eq!(
+        fs::read_to_string(run_dir.join("events.jsonl")).unwrap(),
+        before,
+        "the failpoint must leave the committed projection unapplied"
+    );
+
+    let repair = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger", "event", "--run-id", "r1", "--type", "after", "--json",
+        ],
+    );
+    assert_eq!(repair.status.code(), Some(0));
+    let events = fs::read_to_string(run_dir.join("events.jsonl")).unwrap();
+    assert_eq!(events.matches("\"type\": \"committed\"").count(), 1);
+    assert_eq!(events.matches("\"type\": \"after\"").count(), 1);
+}
+
+#[test]
+fn caller_operation_identity_replays_an_uncertain_event_commit_exactly_once() {
+    let (_tmp, repo, state) = setup();
+    nopal(
+        &repo,
+        &state,
+        &["ledger", "init", "--skill", "retry", "--run-id", "r1"],
+    );
+    let run_dir = run_dir_of(&state, "retry", "r1");
+    let args = [
+        "ledger",
+        "event",
+        "--run-id",
+        "r1",
+        "--type",
+        "once",
+        "--operation-id",
+        "event-once-1",
+        "--json",
+    ];
+    let uncertain = nopal_env(
+        &repo,
+        &state,
+        &args,
+        &[("NOPAL_LEDGER_TEST_FAILPOINT", "after_commit")],
+    );
+    assert_eq!(uncertain.status.code(), Some(2));
+
+    let retried = nopal(&repo, &state, &args);
+    assert_eq!(retried.status.code(), Some(0), "{retried:?}");
+    let events = fs::read_to_string(run_dir.join("events.jsonl")).unwrap();
+    assert_eq!(events.matches("\"type\": \"once\"").count(), 1);
+    assert_eq!(journal_files(&run_dir).len(), 2);
+
+    let conflict = nopal(
+        &repo,
+        &state,
+        &[
+            "ledger",
+            "event",
+            "--run-id",
+            "r1",
+            "--type",
+            "different",
+            "--operation-id",
+            "event-once-1",
+            "--json",
+        ],
+    );
+    assert_eq!(conflict.status.code(), Some(1));
+    assert_eq!(
+        json(&conflict)["diagnostics"][0]["code"],
+        "ledger_entry_invalid"
+    );
+    assert_eq!(journal_files(&run_dir).len(), 2);
+}
+
 #[test]
 fn concurrent_event_appends_stay_consistent() {
     let (_tmp, repo, state) = setup();
@@ -514,6 +997,25 @@ fn concurrent_event_appends_stay_consistent() {
     assert_eq!(events.lines().count(), 21);
     let transcript = fs::read_to_string(run_dir.join("transcript.md")).unwrap();
     assert_eq!(transcript.matches("\n## ").count(), 21);
+
+    let transactions = journal_files(&run_dir);
+    assert_eq!(transactions.len(), 21);
+    for (index, path) in transactions.iter().enumerate() {
+        assert_eq!(
+            path.file_stem().and_then(|value| value.to_str()),
+            Some(format!("{:020}", index + 1).as_str())
+        );
+        let record: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(record["revision"], index + 1);
+        assert!(record["digest"].as_str().unwrap().starts_with("sha256:"));
+        if index > 0 {
+            let previous: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&transactions[index - 1]).unwrap())
+                    .unwrap();
+            assert_eq!(record["previous_digest"], previous["digest"]);
+        }
+    }
 }
 
 #[test]
@@ -773,8 +1275,17 @@ fn write_equivalence_with_python_reference() {
     let py_run = py_state.join("runs/kickoff/unknown-repo/eq-run");
     let rs_run = rs_state.join("runs/kickoff/unknown-repo/eq-run");
     let py_files = tree_files(&py_run);
-    let rs_files = tree_files(&rs_run);
-    assert_eq!(py_files, rs_files, "tree shapes differ");
+    let rs_files: Vec<String> = tree_files(&rs_run)
+        .into_iter()
+        .filter(|path| !path.starts_with("transactions/"))
+        .collect();
+    assert_eq!(py_files, rs_files, "legacy projection tree shapes differ");
+    assert!(
+        rs_run
+            .join("transactions/00000000000000000001.json")
+            .is_file(),
+        "native writes must add an authoritative journal"
+    );
 
     // Both tools embed the RESOLVED state roots, so normalize those out.
     let py_state_resolved = fs::canonicalize(&py_state).expect("py state resolves");

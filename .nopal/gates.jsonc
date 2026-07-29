@@ -12,7 +12,7 @@
       "stage": "pre_pr"
     },
     {
-      "argv": ["cargo", "test", "--workspace"],
+      "argv": ["scripts/test-workspace.sh"],
       "id": "test",
       "stage": "pre_pr"
     },

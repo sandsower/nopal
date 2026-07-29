@@ -1,0 +1,88 @@
+{
+  "effects": [
+    {
+      "effect": "append_event",
+      "event": "action_decision",
+      "payload": {
+        "action": "git.push",
+        "approval_current": false,
+        "authorization_binding": "426da1e5bfd11aaecf9f00b60f90fbfc7b2558991ce16b0857782e72de17d201",
+        "authorized": false,
+        "contract_digest": "4b6e74a1eea52cd9b61a067ec855aa5475944e3f249a61dddd6cd1c8641fb960",
+        "decision": "allow",
+        "decision_winners": [
+          "repository policy"
+        ],
+        "decisions": [
+          {
+            "decision": "allow",
+            "decision_source": "rule",
+            "explanation": [
+              "class git_remote: declared by caller"
+            ],
+            "matched_rules": [
+              {
+                "decision": "allow",
+                "id": "allow-push",
+                "via": "action git.push"
+              }
+            ],
+            "placement": "shared_user_runtime",
+            "placement_source": "builtin_default",
+            "source": "repository policy"
+          }
+        ],
+        "diagnostics": [],
+        "intent": {
+          "changed_files": [
+            "Cargo.toml",
+            "src/lib.rs"
+          ],
+          "executor_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+          "input_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+          "kind": "nopal.enforcement.intent/v1",
+          "launch_id": "launch-fixture",
+          "mutates": true,
+          "session_id": "session-fixture",
+          "target_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+          "tool_call_id": "call-fixture",
+          "tool_name": "bash",
+          "workspace_fingerprint": "4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        "kind": "nopal.enforcement.plan/v2",
+        "ok": true,
+        "placement": "shared_user_runtime",
+        "placement_winners": [
+          "repository policy"
+        ],
+        "receipts": [
+          {
+            "current": false,
+            "gate_definition_digest": "418dd1c8d3f68d3c4f17beff27bb8ad151d247235989485dd1ca1215260856cd",
+            "gate_id": "proof"
+          }
+        ],
+        "required_gates": [
+          {
+            "id": "proof",
+            "run": {
+              "argv": [
+                "cargo",
+                "test",
+                "--workspace"
+              ]
+            },
+            "stage": "pre_pr",
+            "via": "default"
+          }
+        ],
+        "required_stages": [
+          "continuous",
+          "pre_pr"
+        ],
+        "root": "tests/fixtures/enforcement/project",
+        "workspace_fingerprint": "4444444444444444444444444444444444444444444444444444444444444444"
+      }
+    }
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "kind": "nopal.enforcement.plan/v2",
+  "ok": true,
+  "root": "tests/fixtures/enforcement/project",
+  "action": "git.push",
+  "decision": "allow",
+  "decision_winners": [
+    "repository policy"
+  ],
+  "placement": "shared_user_runtime",
+  "placement_winners": [
+    "repository policy"
+  ],
+  "decisions": [
+    {
+      "source": "repository policy",
+      "decision": "allow",
+      "decision_source": "rule",
+      "placement": "shared_user_runtime",
+      "placement_source": "builtin_default",
+      "matched_rules": [
+        {
+          "id": "allow-push",
+          "via": "action git.push",
+          "decision": "allow"
+        }
+      ],
+      "explanation": [
+        "class git_remote: declared by caller"
+      ]
+    }
+  ],
+  "required_stages": [
+    "continuous",
+    "pre_pr"
+  ],
+  "required_gates": [
+    {
+      "id": "proof",
+      "stage": "pre_pr",
+      "run": {
+        "argv": [
+          "cargo",
+          "test",
+          "--workspace"
+        ]
+      },
+      "via": "default"
+    }
+  ],
+  "receipts": [
+    {
+      "gate_id": "proof",
+      "current": false,
+      "gate_definition_digest": "418dd1c8d3f68d3c4f17beff27bb8ad151d247235989485dd1ca1215260856cd"
+    }
+  ],
+  "contract_digest": "4b6e74a1eea52cd9b61a067ec855aa5475944e3f249a61dddd6cd1c8641fb960",
+  "workspace_fingerprint": "4444444444444444444444444444444444444444444444444444444444444444",
+  "authorization_binding": "426da1e5bfd11aaecf9f00b60f90fbfc7b2558991ce16b0857782e72de17d201",
+  "approval_current": false,
+  "authorized": false,
+  "intent": {
+    "kind": "nopal.enforcement.intent/v1",
+    "launch_id": "launch-fixture",
+    "session_id": "session-fixture",
+    "tool_call_id": "call-fixture",
+    "tool_name": "bash",
+    "input_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "target_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "executor_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+    "changed_files": [
+      "Cargo.toml",
+      "src/lib.rs"
+    ],
+    "workspace_fingerprint": "4444444444444444444444444444444444444444444444444444444444444444",
+    "mutates": true
+  },
+  "diagnostics": []
+}

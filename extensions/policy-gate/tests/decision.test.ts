@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
 	decidePolicy,
+	parseEnforcementAdvanceOutput,
 	parseEnforcementPlanOutput,
 	parsePolicyDecisionOutput,
 	planEnforcement,
@@ -45,6 +46,27 @@ function enforcementEnvelope(overrides: Record<string, unknown> = {}): string {
 		...overrides,
 	});
 }
+
+test("parseEnforcementAdvanceOutput: accepts an exact released plan", () => {
+	const result = parseEnforcementAdvanceOutput(JSON.stringify({
+		state: "released",
+		plan: JSON.parse(enforcementEnvelope()),
+		release_id: "release-1",
+	}), 0);
+	assert.equal(result.failClosed, false);
+	assert.equal(result.state, "released");
+	assert.equal(result.releaseId, "release-1");
+	assert.equal(result.plan.authorizationBinding, "binding");
+});
+
+test("parseEnforcementAdvanceOutput: malformed or nonzero results fail closed", () => {
+	assert.equal(parseEnforcementAdvanceOutput("{}", 0).failClosed, true);
+	assert.equal(parseEnforcementAdvanceOutput("", 2).failClosed, true);
+	assert.equal(parseEnforcementAdvanceOutput(JSON.stringify({
+		state: "released",
+		plan: JSON.parse(enforcementEnvelope()),
+	}), 0).failClosed, true);
+});
 
 test("resolvePolicyMode: defaults to supervised_auto", () => {
 	assert.equal(resolvePolicyMode({}), "supervised_auto");

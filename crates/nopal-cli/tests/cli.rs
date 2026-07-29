@@ -1818,6 +1818,7 @@ fn info_json_reports_version_and_capabilities() {
             "sync",
             "update",
             "validate",
+            "verify",
             "workflow",
         ]
     );

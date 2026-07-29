@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -46,16 +46,27 @@ function harness(
 	const calls: Array<{ command: string; args: string[] }> = [];
 	const outcomes: string[] = [];
 	let approvalRecorded = false;
-	const gateRecorded = new Set<string>();
 	const pi = {
 		on(name: string, handler: (event: any, ctx: any) => Promise<any>) {
 			handlers.set(name, [...(handlers.get(name) ?? []), handler]);
 		},
 		async exec(command: string, args: string[]) {
 			calls.push({ command, args });
-			if (args.includes("authorize")) {
+			if (args.includes("cleanup-runtime")) {
 				return {
-					stdout: JSON.stringify({ kind: "nopal.enforcement.authorization/v1", ok: true, release_id: "release-1" }),
+					stdout: JSON.stringify({ kind: "nopal.enforcement.cleanup_runtime/v1", ok: true }),
+					stderr: "",
+					code: 0,
+				};
+			}
+			if (args.includes("advance")) {
+				const state = decision === "ask" && !approvalRecorded ? "approval_required" : "released";
+				return {
+					stdout: JSON.stringify({
+						state,
+						plan: JSON.parse(envelope(root, decision, approvalRecorded, [])),
+						...(state === "released" ? { release_id: "release-1" } : {}),
+					}),
 					stderr: "",
 					code: 0,
 				};
@@ -69,16 +80,11 @@ function harness(
 					code: outcomeFails ? 2 : 0,
 				};
 			}
-			if (args.includes("record-gate")) {
-				gateRecorded.add(args[args.indexOf("--tool-call-id") + 1] ?? "missing");
-				return { stdout: JSON.stringify({ kind: "nopal.enforcement.record_gate/v2", ok: true }), stderr: "", code: 0 };
-			}
 			if (args.includes("record-approval")) {
 				approvalRecorded = args.includes("--approved");
 				return { stdout: JSON.stringify({ kind: "nopal.enforcement.record_approval/v1", ok: true }), stderr: "", code: 0 };
 			}
-			const toolCallId = args[args.indexOf("--tool-call-id") + 1] ?? "missing";
-			const requiredGates = gateCommand && !gateRecorded.has(toolCallId)
+			const requiredGates = gateCommand
 				? [{ id: "proof", run: { command: gateCommand }, ...gateMetadata }]
 				: [];
 			return { stdout: envelope(root, decision, approvalRecorded, requiredGates), stderr: "", code: 0 };
@@ -101,6 +107,7 @@ function harness(
 		gateExecutorBin,
 		gateHome: path.join(root, ".gate-home"),
 		gateExecutorDigest: "executor-test",
+		gateRuntimeDigest: "runtime-test",
 	}, "supervised_auto", stats, (command, args, options) => pi.exec(command, args, options));
 	return { handlers, calls, outcomes, ctx, stats };
 }
@@ -152,57 +159,20 @@ test("deny and unknown tool calls block before effects", async () => {
 	}
 });
 
-test("gate execution uses a bounded sanitized environment without enforcement authority", async () => {
+test("gate execution is delegated to the shared verification transaction", async () => {
 	const root = mkdtempSync(path.join(os.tmpdir(), "nopal-guard-"));
-	const capture = path.join(root, "gate-env.txt");
 	try {
-		process.env.NOPAL_ENFORCEMENT_CAPABILITY = "must-not-leak";
-		process.env.NOPAL_TEST_SECRET = "must-not-leak";
-		const command = `env > ${JSON.stringify(capture)}`;
-		const { handlers, ctx } = harness(root, "allow", false, command);
+		const { handlers, calls, ctx } = harness(root, "allow", false, "cargo --version");
 		const result = await handlers.get("tool_call")?.[0]({
 			toolName: "bash",
-			toolCallId: "gate-env",
+			toolCallId: "shared-gate",
 			input: { command: "git push origin HEAD:refs/heads/main" },
 		}, ctx);
 		assert.equal(result, undefined);
-		const captured = readFileSync(capture, "utf8");
-		assert.match(captured, /^HOME=/m);
-		assert.match(captured, /^PATH=\/trusted\/gate-bin:\/usr\/bin:\/bin$/m);
-		assert.doesNotMatch(captured, /NOPAL_ENFORCEMENT|NOPAL_TEST_SECRET|must-not-leak/);
+		assert.ok(calls.some(({ args }) => args.includes("advance")));
+		assert.equal(calls.some(({ args }) => args.includes("record-gate")), false);
+		assert.equal(calls.some(({ args }) => args.includes("authorize")), false);
 	} finally {
-		delete process.env.NOPAL_ENFORCEMENT_CAPABILITY;
-		delete process.env.NOPAL_TEST_SECRET;
-		rmSync(root, { recursive: true, force: true });
-	}
-});
-
-test("gate execution uses the run-private executor and ignores a writable ambient PATH shadow", async () => {
-	const root = mkdtempSync(path.join(os.tmpdir(), "nopal-guard-"));
-	const ambientBin = path.join(root, "ambient-bin");
-	const trustedBin = path.join(root, "trusted-bin");
-	const ambientMarker = path.join(root, "ambient-shadow-ran");
-	const trustedMarker = path.join(root, "trusted-executor-ran");
-	const originalPath = process.env.PATH;
-	try {
-		mkdirSync(ambientBin);
-		mkdirSync(trustedBin);
-		writeFileSync(path.join(ambientBin, "cargo"), `#!/bin/sh\ntouch ${JSON.stringify(ambientMarker)}\n`);
-		writeFileSync(path.join(trustedBin, "cargo"), `#!/bin/sh\ntouch ${JSON.stringify(trustedMarker)}\n`);
-		chmodSync(path.join(ambientBin, "cargo"), 0o755);
-		chmodSync(path.join(trustedBin, "cargo"), 0o755);
-		process.env.PATH = `${ambientBin}:${originalPath ?? ""}`;
-		const { handlers, ctx } = harness(root, "allow", false, "cargo --version", false, trustedBin);
-		const result = await handlers.get("tool_call")?.[0]({
-			toolName: "bash",
-			toolCallId: "shadow-gate",
-			input: { command: "git push origin HEAD:refs/heads/main" },
-		}, ctx);
-		assert.equal(result, undefined);
-		assert.equal(existsSync(trustedMarker), true);
-		assert.equal(existsSync(ambientMarker), false);
-	} finally {
-		process.env.PATH = originalPath;
 		rmSync(root, { recursive: true, force: true });
 	}
 });
@@ -220,7 +190,7 @@ test("ask approval is durably recorded and revalidated before release", async ()
 		assert.equal(stats.asked, 1);
 		assert.equal(stats.approved, 1);
 		assert.ok(calls.some(({ args }) => args.includes("record-approval") && args.includes("--approved")));
-		assert.ok(calls.some(({ args }) => args.includes("authorize")));
+		assert.ok(calls.some(({ args }) => args.includes("advance")));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}
@@ -297,6 +267,18 @@ test("tool success, error, and shutdown interruption are durably recorded by rel
 		}, interrupted.ctx);
 		await interrupted.handlers.get("session_shutdown")?.[0]({}, interrupted.ctx);
 		assert.deepEqual(interrupted.outcomes, ["interrupted"]);
+		assert.ok(interrupted.calls.some(({ args }) => args.includes("interrupt")));
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+});
+
+test("clean session shutdown durably finalizes the overall run", async () => {
+	const root = mkdtempSync(path.join(os.tmpdir(), "nopal-guard-"));
+	try {
+		const guarded = harness(root);
+		await guarded.handlers.get("session_shutdown")?.[0]({}, guarded.ctx);
+		assert.ok(guarded.calls.some(({ args }) => args.includes("finalize") && args.includes("completed")));
 	} finally {
 		rmSync(root, { recursive: true, force: true });
 	}

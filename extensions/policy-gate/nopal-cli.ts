@@ -153,6 +153,7 @@ export type EnforcementParams = {
 	inputDigest?: string;
 	targetDigest?: string;
 	executorDigest?: string;
+	runtimeDigest?: string;
 	changedFiles?: string[];
 	mutates?: boolean;
 	cwd?: string;
@@ -337,6 +338,7 @@ export async function planEnforcement(exec: ExecFn, params: EnforcementParams): 
 		"--input-digest", params.inputDigest ?? "legacy",
 		"--target-digest", params.targetDigest ?? "legacy",
 		"--executor-digest", params.executorDigest ?? "legacy-executor",
+		"--runtime-digest", params.runtimeDigest ?? "legacy-runtime",
 		...(params.changedFiles ?? []).flatMap((file) => ["--changed-file", file]),
 		...(params.mutates ? ["--mutates"] : []),
 	];
@@ -368,6 +370,123 @@ export async function planEnforcement(exec: ExecFn, params: EnforcementParams): 
 	}
 }
 
+export type EnforcementAdvanceResult = {
+	state: "blocked" | "approval_required" | "released";
+	plan: EnforcementPlanResult;
+	releaseId?: string;
+	reason?: string;
+	failClosed: boolean;
+};
+
+function advanceFailClosed(reason: string): EnforcementAdvanceResult {
+	return {
+		state: "blocked",
+		plan: {
+			...failClosed(reason),
+			ok: false,
+			root: "",
+			placement: "blocked",
+			decisionWinners: [],
+			placementWinners: [],
+			requiredStages: [],
+			requiredGates: [],
+			contractDigest: "",
+			workspaceFingerprint: "",
+			authorizationBinding: "",
+			approvalCurrent: false,
+			authorized: false,
+		},
+		reason,
+		failClosed: true,
+	};
+}
+
+export function parseEnforcementAdvanceOutput(stdout: string, code: number): EnforcementAdvanceResult {
+	if (code !== 0) return advanceFailClosed(`nopal enforcement advance exited with code ${code}`);
+	try {
+		const value = JSON.parse(stdout) as {
+			state?: unknown;
+			plan?: unknown;
+			release_id?: unknown;
+			reason?: unknown;
+		};
+		if (value.state !== "blocked" && value.state !== "approval_required" && value.state !== "released") {
+			throw new Error("invalid advance state");
+		}
+		const plan = parseEnforcementPlanOutput(JSON.stringify(value.plan), 0);
+		if (plan.failClosed) throw new Error("invalid advance plan");
+		if (value.state === "released" && typeof value.release_id !== "string") {
+			throw new Error("released advance is missing release id");
+		}
+		return {
+			state: value.state,
+			plan,
+			...(typeof value.release_id === "string" ? { releaseId: value.release_id } : {}),
+			...(typeof value.reason === "string" ? { reason: value.reason } : {}),
+			failClosed: false,
+		};
+	} catch {
+		return advanceFailClosed("nopal enforcement advance produced an invalid envelope");
+	}
+}
+
+export async function advanceEnforcement(
+	exec: ExecFn,
+	params: EnforcementParams,
+): Promise<EnforcementAdvanceResult> {
+	try {
+		const result = await exec(params.nopalBin, exactIntentArgs("advance", params), {
+			cwd: params.cwd,
+			timeout: 10 * 60_000,
+			input: adapterProof(params.adapterCapability),
+		});
+		return parseEnforcementAdvanceOutput(result.stdout, result.code);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return advanceFailClosed(`nopal binary could not advance enforcement (${message})`);
+	}
+}
+
+export async function cleanupEnforcementRuntime(
+	exec: ExecFn,
+	params: EnforcementParams,
+): Promise<boolean> {
+	try {
+		const result = await exec(params.nopalBin, exactIntentArgs("cleanup-runtime", params), {
+			cwd: params.cwd,
+			timeout: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+			input: adapterProof(params.adapterCapability),
+		});
+		if (result.code !== 0) return false;
+		const value = JSON.parse(result.stdout) as { kind?: unknown; ok?: unknown };
+		return value.kind === "nopal.enforcement.cleanup_runtime/v1" && value.ok === true;
+	} catch {
+		return false;
+	}
+}
+
+export async function closeEnforcementRun(
+	exec: ExecFn,
+	params: Pick<EnforcementParams, "nopalBin" | "runId" | "cwd" | "timeoutMs">,
+	status: "completed" | "interrupted",
+	reason = "Pi session shut down",
+): Promise<boolean> {
+	const args = status === "completed"
+		? ["--json", "ledger", "finalize", "--run-id", params.runId, "--flow", "enforcement", "--status", "completed"]
+		: ["--json", "ledger", "interrupt", "--run-id", params.runId, "--flow", "enforcement", "--reason", reason];
+	try {
+		const result = await exec(params.nopalBin, args, {
+			cwd: params.cwd,
+			timeout: params.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+		});
+		if (result.code !== 0) return false;
+		const value = JSON.parse(result.stdout) as { ok?: unknown };
+		return value.ok === true;
+	} catch {
+		return false;
+	}
+}
+
 export async function recordEnforcementGate(
 	exec: ExecFn,
 	params: EnforcementParams & {
@@ -389,6 +508,7 @@ export async function recordEnforcementGate(
 		"--input-digest", params.inputDigest ?? "legacy",
 		"--target-digest", params.targetDigest ?? "legacy",
 		"--executor-digest", params.executorDigest ?? "legacy-executor",
+		"--runtime-digest", params.runtimeDigest ?? "legacy-runtime",
 		...(params.changedFiles ?? []).flatMap((file) => ["--changed-file", file]),
 		...(params.mutates ? ["--mutates"] : []),
 		"--gate-id", params.gateId, "--exit-code", String(params.exitCode),
@@ -422,6 +542,7 @@ function exactIntentArgs(operation: string, params: EnforcementParams): string[]
 		"--input-digest", params.inputDigest ?? "legacy",
 		"--target-digest", params.targetDigest ?? "legacy",
 		"--executor-digest", params.executorDigest ?? "legacy-executor",
+		"--runtime-digest", params.runtimeDigest ?? "legacy-runtime",
 		...(params.changedFiles ?? []).flatMap((file) => ["--changed-file", file]),
 		...(params.mutates ? ["--mutates"] : []),
 	];

@@ -26,6 +26,7 @@ pub const LEDGER_EVENT_KIND: &str = "nopal.run_ledger.event/v1";
 pub const LEDGER_CHECKPOINT_KIND: &str = "nopal.run_ledger.checkpoint/v1";
 pub const LEDGER_GATE_KIND: &str = "nopal.run_ledger.gate/v1";
 pub const LEDGER_INTERRUPT_KIND: &str = "nopal.run_ledger.interrupt/v1";
+pub const LEDGER_CONTINUE_KIND: &str = "nopal.run_ledger.continue/v1";
 pub const LEDGER_FINALIZE_KIND: &str = "nopal.run_ledger.finalize/v1";
 pub const LEDGER_RESUME_KIND: &str = "nopal.run_ledger.resume/v1";
 pub const LEDGER_DASHBOARD_KIND: &str = "nopal.run_ledger.dashboard/v1";
@@ -161,6 +162,7 @@ pub struct EventArgs<'a> {
     pub event_type: &'a str,
     pub payload: Value,
     pub summary: Option<&'a str>,
+    pub operation_id: Option<&'a str>,
 }
 
 pub fn ledger_event(
@@ -174,7 +176,13 @@ pub fn ledger_event(
         Ok(run_dir) => run_dir,
         Err(err) => return report.fail(err),
     };
-    match store::append_event(&run_dir, args.event_type, &args.payload, args.summary) {
+    match store::append_event_with_operation_id(
+        &run_dir,
+        args.event_type,
+        &args.payload,
+        args.summary,
+        args.operation_id,
+    ) {
         Ok(_) => Ok(report),
         Err(err) => report.fail(err),
     }
@@ -186,6 +194,7 @@ pub struct CheckpointArgs<'a> {
     pub name: &'a str,
     pub payload: Value,
     pub resume_hint: Option<&'a str>,
+    pub operation_id: Option<&'a str>,
 }
 
 pub fn ledger_checkpoint(
@@ -198,31 +207,18 @@ pub fn ledger_checkpoint(
         Ok(run_dir) => run_dir,
         Err(err) => return report.fail(err),
     };
-    let checkpoint_path =
-        match store::record_checkpoint(&run_dir, args.name, &args.payload, args.resume_hint) {
-            Ok(path) => path,
-            Err(err) => return report.fail(err),
-        };
-    let mut event_payload = std::collections::BTreeMap::new();
-    event_payload.insert("name".to_owned(), Value::String(args.name.to_owned()));
-    event_payload.insert(
-        "path".to_owned(),
-        Value::String(checkpoint_path.display().to_string()),
-    );
-    event_payload.insert("payload".to_owned(), args.payload.clone());
-    event_payload.insert(
-        "resume_hint".to_owned(),
-        args.resume_hint
-            .map(|hint| Value::String(hint.to_owned()))
-            .unwrap_or(Value::Null),
-    );
-    let event_result =
-        store::append_event(&run_dir, "checkpoint", &Value::Object(event_payload), None);
+    let checkpoint_path = match store::record_checkpoint_with_operation_id(
+        &run_dir,
+        args.name,
+        &args.payload,
+        args.resume_hint,
+        args.operation_id,
+    ) {
+        Ok(path) => path,
+        Err(err) => return report.fail(err),
+    };
     report.checkpoint = Some(checkpoint_path.display().to_string());
-    match event_result {
-        Ok(_) => Ok(report),
-        Err(err) => report.fail(err),
-    }
+    Ok(report)
 }
 
 pub struct GateArgs<'a> {
@@ -232,6 +228,7 @@ pub struct GateArgs<'a> {
     pub scope: Option<&'a str>,
     pub envelope: Value,
     pub resume_hint: Option<&'a str>,
+    pub operation_id: Option<&'a str>,
 }
 
 pub fn ledger_gate(
@@ -244,12 +241,13 @@ pub fn ledger_gate(
         Ok(run_dir) => run_dir,
         Err(err) => return report.fail(err),
     };
-    match store::record_gate(
+    match store::record_gate_with_operation_id(
         &run_dir,
         args.name,
         args.scope,
         &args.envelope,
         args.resume_hint,
+        args.operation_id,
     ) {
         Ok(out) => {
             report.gate_log = Some(out.envelope_path.display().to_string());
@@ -267,16 +265,38 @@ pub fn ledger_interrupt(
     flow: Option<&str>,
     reason: &str,
     resume_hint: Option<&str>,
+    operation_id: Option<&str>,
 ) -> io::Result<MutationReport> {
     let mut report = MutationReport::new(LEDGER_INTERRUPT_KIND, run_id);
     let run_dir = match located_run(dir, state_dir, run_id, flow)? {
         Ok(run_dir) => run_dir,
         Err(err) => return report.fail(err),
     };
-    match store::record_interrupt(&run_dir, reason, resume_hint) {
+    match store::record_interrupt_with_operation_id(&run_dir, reason, resume_hint, operation_id) {
         Ok(checkpoint_path) => {
             report.status = Some(Status::Interrupted.as_str().to_owned());
             report.checkpoint = Some(checkpoint_path.display().to_string());
+            Ok(report)
+        }
+        Err(err) => report.fail(err),
+    }
+}
+
+pub fn ledger_continue(
+    dir: &Path,
+    state_dir: Option<&Path>,
+    run_id: &str,
+    flow: Option<&str>,
+    operation_id: Option<&str>,
+) -> io::Result<MutationReport> {
+    let mut report = MutationReport::new(LEDGER_CONTINUE_KIND, run_id);
+    let run_dir = match located_run(dir, state_dir, run_id, flow)? {
+        Ok(run_dir) => run_dir,
+        Err(err) => return report.fail(err),
+    };
+    match store::record_resume_with_operation_id(&run_dir, operation_id) {
+        Ok(_) => {
+            report.status = Some(Status::Running.as_str().to_owned());
             Ok(report)
         }
         Err(err) => report.fail(err),
@@ -290,6 +310,7 @@ pub fn ledger_finalize(
     flow: Option<&str>,
     status: &str,
     report_file: Option<&Path>,
+    operation_id: Option<&str>,
 ) -> io::Result<MutationReport> {
     let mut report = MutationReport::new(LEDGER_FINALIZE_KIND, run_id);
     report.status = Some(status.to_owned());
@@ -297,7 +318,7 @@ pub fn ledger_finalize(
         Ok(run_dir) => run_dir,
         Err(err) => return report.fail(err),
     };
-    match store::record_finalize(&run_dir, status, report_file) {
+    match store::record_finalize_with_operation_id(&run_dir, status, report_file, operation_id) {
         Ok(out) => {
             report.final_report = Some(
                 out.final_report
@@ -355,10 +376,17 @@ pub struct ResumeReport {
     pub latest_checkpoint: Option<Value>,
     pub last_checkpoint: Option<String>,
     pub resume_hint: Option<String>,
+    pub revision: Option<u64>,
+    pub transaction_digest: Option<String>,
+    pub resume_epoch: Option<u64>,
+    pub must_reverify: Option<bool>,
+    pub expected_next_action: Option<String>,
+    pub exact: bool,
     pub diagnostics: Vec<Diagnostic>,
 }
 
 pub struct ResumeArgs<'a> {
+    pub run_id: Option<&'a str>,
     pub flow: Option<&'a str>,
     pub ticket_id: Option<&'a str>,
     pub branch: Option<&'a str>,
@@ -380,6 +408,25 @@ pub fn ledger_resume(
     args: &ResumeArgs,
 ) -> io::Result<ResumeReport> {
     let env = LedgerEnv::discover(dir, state_dir);
+    if let Some(run_id) = args.run_id {
+        let run_dir = match store::find_run_dir(&env, run_id, args.flow) {
+            Ok(run_dir) => run_dir,
+            Err(StoreError::Io(err)) => return Err(err),
+            Err(StoreError::Domain(diag)) => return Ok(empty_resume(false, vec![diag])),
+        };
+        let snapshot = match store::read_run_snapshot(&run_dir) {
+            Ok(snapshot) => snapshot,
+            Err(StoreError::Io(err)) => return Err(err),
+            Err(StoreError::Domain(diag)) => return Ok(empty_resume(false, vec![diag])),
+        };
+        return Ok(resume_report(
+            snapshot.entry,
+            snapshot.revision,
+            snapshot.transaction_digest,
+            true,
+            Vec::new(),
+        ));
+    }
     let include_completed = args.include_completed;
     let scan = match store::scan_runs(&env, args.flow, move |status| {
         include_completed || status.is_incomplete()
@@ -425,25 +472,55 @@ pub fn ledger_resume(
     }
     candidates.sort_by_key(store::recency_key);
     let selected = candidates.remove(candidates.len() - 1);
+    Ok(resume_report(selected, 0, None, false, scan.warnings))
+}
+
+fn resume_report(
+    selected: Value,
+    revision: u64,
+    transaction_digest: Option<String>,
+    exact: bool,
+    diagnostics: Vec<Diagnostic>,
+) -> ResumeReport {
     let field = |key: &str| selected.get(key).and_then(Value::as_str).map(str::to_owned);
-    Ok(ResumeReport {
+    let status = field("status");
+    let expected_next_action = match status.as_deref() {
+        Some("running") => Some("recover_interrupted_operation".to_owned()),
+        Some("interrupted") => Some("reobserve_and_reverify".to_owned()),
+        Some("failed") => Some("inspect_failure".to_owned()),
+        Some("completed") => Some("none".to_owned()),
+        _ => None,
+    };
+    ResumeReport {
         kind: LEDGER_RESUME_KIND,
         ok: true,
         run_id: field("run_id"),
         flow: field("flow"),
         run_dir: selected
             .get("paths")
-            .and_then(|p| p.get("run_dir"))
+            .and_then(|paths| paths.get("run_dir"))
             .and_then(Value::as_str)
             .map(str::to_owned),
-        status: field("status"),
+        status: status.clone(),
         ticket: selected.get("ticket").cloned(),
         branch: field("branch"),
         latest_checkpoint: selected.get("latest_checkpoint").cloned(),
         last_checkpoint: field("last_checkpoint"),
         resume_hint: field("resume_hint"),
-        diagnostics: scan.warnings,
-    })
+        revision: exact.then_some(revision),
+        transaction_digest,
+        resume_epoch: Some(
+            selected
+                .get("resume_epoch")
+                .and_then(Value::as_i64)
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0),
+        ),
+        must_reverify: status.as_deref().map(|status| status != "completed"),
+        expected_next_action,
+        exact,
+        diagnostics,
+    }
 }
 
 fn empty_resume(ok: bool, diagnostics: Vec<Diagnostic>) -> ResumeReport {
@@ -459,6 +536,12 @@ fn empty_resume(ok: bool, diagnostics: Vec<Diagnostic>) -> ResumeReport {
         latest_checkpoint: None,
         last_checkpoint: None,
         resume_hint: None,
+        revision: None,
+        transaction_digest: None,
+        resume_epoch: None,
+        must_reverify: None,
+        expected_next_action: None,
+        exact: false,
         diagnostics,
     }
 }
@@ -487,6 +570,28 @@ pub fn resume_toon(report: &ResumeReport) -> String {
         ),
         ("last_checkpoint".into(), opt(&report.last_checkpoint)),
         ("resume_hint".into(), opt(&report.resume_hint)),
+        (
+            "revision".into(),
+            report.revision.map_or(Toon::Null, |value| {
+                Toon::Int(i64::try_from(value).unwrap_or(i64::MAX))
+            }),
+        ),
+        ("transaction_digest".into(), opt(&report.transaction_digest)),
+        (
+            "resume_epoch".into(),
+            report.resume_epoch.map_or(Toon::Null, |value| {
+                Toon::Int(i64::try_from(value).unwrap_or(i64::MAX))
+            }),
+        ),
+        (
+            "must_reverify".into(),
+            report.must_reverify.map_or(Toon::Null, Toon::Bool),
+        ),
+        (
+            "expected_next_action".into(),
+            opt(&report.expected_next_action),
+        ),
+        ("exact".into(), Toon::Bool(report.exact)),
         (
             "diagnostics".into(),
             crate::diagnostics::toon_table(&report.diagnostics),
@@ -1120,8 +1225,12 @@ mod tests {
 
     fn temp_setup() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
-        let state = tmp.path().join("state");
-        let repo = tmp.path().join("repo");
+        let root = tmp
+            .path()
+            .canonicalize()
+            .unwrap_or_else(|_| tmp.path().to_path_buf());
+        let state = root.join("state");
+        let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         (tmp, state, repo)
     }
@@ -1185,6 +1294,7 @@ mod tests {
                 event_type: "step",
                 payload: ledger_json::json!({"n": 1}),
                 summary: Some("did a step"),
+                operation_id: None,
             },
         )
         .unwrap();
@@ -1199,6 +1309,7 @@ mod tests {
                 name: "mid",
                 payload: ledger_json::json!({}),
                 resume_hint: Some("resume mid"),
+                operation_id: None,
             },
         )
         .unwrap();
@@ -1215,6 +1326,7 @@ mod tests {
                 scope: None,
                 envelope: ledger_json::json!({"status": "pass", "gate": {"name": "fmt", "timestamp": "T"}}),
                 resume_hint: None,
+                operation_id: None,
             },
         )
         .unwrap();
@@ -1229,6 +1341,7 @@ mod tests {
             &repo,
             Some(&state),
             &ResumeArgs {
+                run_id: None,
                 flow: None,
                 ticket_id: Some("TASK-19"),
                 branch: Some("feature/x"),
@@ -1246,11 +1359,12 @@ mod tests {
         );
 
         let interrupt =
-            ledger_interrupt(&repo, Some(&state), "r1", None, "pause", Some("hint")).unwrap();
+            ledger_interrupt(&repo, Some(&state), "r1", None, "pause", Some("hint"), None).unwrap();
         assert!(interrupt.ok);
         assert_eq!(interrupt.status.as_deref(), Some("interrupted"));
 
-        let finalize = ledger_finalize(&repo, Some(&state), "r1", None, "completed", None).unwrap();
+        let finalize =
+            ledger_finalize(&repo, Some(&state), "r1", None, "completed", None, None).unwrap();
         assert!(finalize.ok);
         assert_eq!(finalize.final_report, Some(Value::Null));
 
@@ -1259,6 +1373,7 @@ mod tests {
             &repo,
             Some(&state),
             &ResumeArgs {
+                run_id: None,
                 flow: None,
                 ticket_id: None,
                 branch: None,
@@ -1272,6 +1387,7 @@ mod tests {
             &repo,
             Some(&state),
             &ResumeArgs {
+                run_id: None,
                 flow: None,
                 ticket_id: None,
                 branch: None,
@@ -1295,6 +1411,7 @@ mod tests {
                 event_type: "x",
                 payload: Value::Null,
                 summary: None,
+                operation_id: None,
             },
         )
         .unwrap();
@@ -1325,6 +1442,7 @@ mod tests {
                     "gate": {"name": "clippy", "timestamp": "T2"},
                 }),
                 resume_hint: None,
+                operation_id: None,
             },
         )
         .unwrap();
@@ -1525,6 +1643,9 @@ mod tests {
             );
         }
         store::write_json_durable(&path, &value).unwrap();
+        // The helper intentionally creates a pre-journal v1 run so changing
+        // its timestamp does not forge a native transaction boundary.
+        std::fs::remove_dir_all(run_dir.join("transactions")).unwrap();
         run_dir
     }
 

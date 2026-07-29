@@ -1,0 +1,1 @@
+{"version":"nopal.policy/v1","modes":{"supervised_auto":{"rules":[{"id":"allow-push","actions":["git.push"],"decision":"allow"}]}}}

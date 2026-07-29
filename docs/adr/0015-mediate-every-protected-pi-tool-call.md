@@ -41,7 +41,7 @@ Every protected action requires the continuous stage.
 Workspace writes also require `per_edit`, commits require `pre_commit`, and normal pushes and pull-request mutation require `pre_pr`.
 Direct tool invocation therefore cannot bypass workflow prerequisites by avoiding a Beislið skill.
 
-The trusted adapter executes only Core-selected gates.
+The shared trusted CLI verification transaction executes only Core-selected gates for both the Pi adapter and local headless verification.
 Before Pi starts, the CLI resolves every top-level executor that any `continuous`, `per_edit`, `pre_commit`, or `pre_pr` definition may require, independent of current policy, selectors, and changed files.
 It rejects repository and temporary shadows, creates a run-private alias manifest over canonical executable paths and bytes, and proves required executors are available.
 Gate processes use that private alias directory plus the operating-system path, a canonical working directory beneath the project root, a private home and cache surface, non-profile Bash, bounded time, bounded captured output, process-group termination, and no inherited enforcement capability.
@@ -53,7 +53,7 @@ Executable, symlinked, or multiply-linked project settings fail launch, remain p
 Executable Git and ripgrep configuration carriers are rejected or bound to exact trusted helper bytes.
 Core returns authenticated evidence directives only when the exact contract, workspace, gate definition, and authorization binding remain current.
 Each passing receipt is immutably keyed by both gate identity and exact authorization binding, preventing concurrent calls from replacing each other's proof.
-The CLI adapter alone publishes those directives to durable run state.
+The CLI adapter alone publishes each complete directive as one revisioned durable run transaction.
 
 An `ask` decision uses Pi's UI.
 The response is recorded as authenticated durable evidence for the exact authorization binding.
@@ -76,7 +76,8 @@ Every present isolation field is type-checked exactly, so malformed recognized v
 
 Authorization now follows the exact effect rather than a launch-time approximation.
 Relevant source, command, selector, policy, workflow, target, worktree, distribution, placement, or run drift invalidates prior evidence.
-The Core remains deterministic and effect-free while the CLI and trusted Pi adapter retain filesystem, Git, process, prompt, and ledger effects.
+The Core remains deterministic and effect-free.
+The CLI retains filesystem, Git, gate-process, and ledger effects, while the trusted Pi adapter retains classification, leases, prompts, protected-call release, and result matching.
 
 Supporting another Pi tool requires a reviewed classifier codec and matching Core action-class vocabulary.
 This deliberate closed-world cost is preferable to silently trusting ambient custom tools.

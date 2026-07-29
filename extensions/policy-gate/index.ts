@@ -36,6 +36,7 @@ function loadBootstrap(): EnforcementBootstrap | undefined {
 	const gateExecutorBin = process.env.NOPAL_GATE_EXECUTOR_BIN;
 	const gateHome = process.env.NOPAL_GATE_HOME;
 	const gateExecutorDigest = process.env.NOPAL_GATE_EXECUTOR_DIGEST;
+	const gateRuntimeDigest = process.env.NOPAL_GATE_RUNTIME_DIGEST;
 	const capabilityFd = Number(capabilityFdText);
 	let adapterCapability: string | undefined;
 	if (Number.isSafeInteger(capabilityFd) && capabilityFd >= 3 && capabilityFd <= 1024) {
@@ -60,9 +61,10 @@ function loadBootstrap(): EnforcementBootstrap | undefined {
 	delete process.env.NOPAL_GATE_EXECUTOR_BIN;
 	delete process.env.NOPAL_GATE_HOME;
 	delete process.env.NOPAL_GATE_EXECUTOR_DIGEST;
+	delete process.env.NOPAL_GATE_RUNTIME_DIGEST;
 	delete process.env.NOPAL_POLICY_MODE;
 	if (!runId || !projectRoot || !stateDir || !adapterDir || !nopalBin || !adapterCapability
-		|| !gateExecutorBin || !gateHome || !gateExecutorDigest
+		|| !gateExecutorBin || !gateHome || !gateExecutorDigest || !gateRuntimeDigest
 		|| !Number.isSafeInteger(capabilityFd)) return undefined;
 
 	const bootstrap: EnforcementBootstrap = {
@@ -76,6 +78,7 @@ function loadBootstrap(): EnforcementBootstrap | undefined {
 			gateExecutorBin,
 			gateHome,
 			gateExecutorDigest,
+			gateRuntimeDigest,
 			...(configDir ? { configDir } : {}),
 		},
 		mode,

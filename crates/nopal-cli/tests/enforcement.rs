@@ -8,6 +8,10 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+use nopal_core::enforcement::{
+    self, EnforcementIntent, EnforcementRequest, EvidenceEffect, GateExecutionContext,
+};
+use nopal_core::policy::{ActionClass, Mode};
 use serde_json::Value;
 
 const RECEIPT_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -109,6 +113,521 @@ fn json(output: &Output) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+fn exact_enforcement_args<'a>(
+    operation: &'a str,
+    digest: &'a str,
+    runtime_digest: &'a str,
+) -> Vec<&'a str> {
+    vec![
+        "enforcement",
+        operation,
+        "--mode",
+        "supervised_auto",
+        "--action",
+        "git.push",
+        "--class",
+        "git_remote",
+        "--run-id",
+        "parity-run",
+        "--launch-id",
+        "launch-parity",
+        "--session-id",
+        "session-parity",
+        "--tool-call-id",
+        "call-parity",
+        "--tool-name",
+        "bash",
+        "--input-digest",
+        "input-parity",
+        "--target-digest",
+        "target-parity",
+        "--executor-digest",
+        digest,
+        "--runtime-digest",
+        runtime_digest,
+        "--mutates",
+    ]
+}
+
+fn events(run_root: &Path) -> Vec<Value> {
+    fs::read_to_string(run_root.join("events.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[test]
+fn public_verify_runs_the_local_pre_pr_boundary_without_pi_or_network() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fixture(temp.path());
+    let initialized_git = Command::new("git")
+        .arg("init")
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert!(initialized_git.status.success(), "{initialized_git:?}");
+    let poisoned_pi = temp.path().join("pi-must-not-run");
+    write(&poisoned_pi, "#!/bin/sh\nexit 97\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args([
+            "--dir",
+            temp.path().to_str().unwrap(),
+            "--json",
+            "verify",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+        ])
+        .env("PI_CODING_AGENT_BIN", &poisoned_pi)
+        .env("PROOF_GIT_BIN", git_executable())
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
+        .env("HOME", state.path().join("home"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("NOPAL_TEST_CLEAN_GIT_CONFIG", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = json(&output);
+    assert_eq!(report["kind"], "nopal.verification/v1");
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["outcome"]["state"], "verified");
+
+    let run_id = report["run_id"].as_str().unwrap();
+    let run_dir = state
+        .path()
+        .join("runs/verification/unknown-repo")
+        .join(run_id);
+    assert!(run_dir.join("events.jsonl").is_file());
+    assert!(
+        run_dir
+            .join("artifacts/enforcement/receipts/proof")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    let run: Value = serde_json::from_slice(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
+    assert_eq!(run["status"], "completed");
+}
+
+#[test]
+fn public_verify_cannot_approve_an_ask_or_create_a_release() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    fixture(temp.path());
+    write(
+        &temp.path().join(".nopal/policy.jsonc"),
+        r#"{
+          "version": "nopal.policy/v1",
+          "modes": { "supervised_auto": { "rules": [
+            { "id": "ask-push", "actions": ["git.push"], "decision": "ask" }
+          ] } }
+        }"#,
+    );
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .current_dir(temp.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_nopal"))
+        .args([
+            "--dir",
+            temp.path().to_str().unwrap(),
+            "--json",
+            "verify",
+            "--state-dir",
+            state.path().to_str().unwrap(),
+        ])
+        .env("HOME", state.path().join("home"))
+        .env("PROOF_GIT_BIN", git_executable())
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("NOPAL_TEST_CLEAN_GIT_CONFIG", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let report = json(&output);
+    assert_eq!(report["outcome"]["state"], "approval_required");
+    let run_id = report["run_id"].as_str().unwrap();
+    let run_dir = state
+        .path()
+        .join("runs/verification/unknown-repo")
+        .join(run_id);
+    assert!(!run_dir.join("artifacts/enforcement/releases").exists());
+    let run: Value = serde_json::from_slice(&fs::read(run_dir.join("run.json")).unwrap()).unwrap();
+    assert_eq!(run["status"], "interrupted");
+}
+
+fn receipt_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let receipts = root.join("artifacts/enforcement/receipts");
+    let mut files = Vec::new();
+    let mut stack = vec![receipts.clone()];
+    while let Some(directory) = stack.pop() {
+        if !directory.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.push((
+                    path.strip_prefix(&receipts)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    fs::read(path).unwrap(),
+                ));
+            }
+        }
+    }
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
+#[test]
+fn evidence_only_and_interactive_transactions_emit_identical_plans_and_receipts() {
+    let root = tempfile::tempdir().unwrap();
+    let headless_state = tempfile::tempdir().unwrap();
+    let interactive_state = tempfile::tempdir().unwrap();
+    fixture(root.path());
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .current_dir(root.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let initialize = |state: &Path| {
+        let initialized = run(
+            root.path(),
+            state,
+            &[
+                "ledger",
+                "init",
+                "--skill",
+                "nopal",
+                "--flow",
+                "enforcement",
+                "--run-id",
+                "parity-run",
+            ],
+        );
+        assert!(initialized.status.success(), "{initialized:?}");
+        let run_root = Path::new(json(&initialized)["run_dir"].as_str().unwrap()).to_path_buf();
+        let prepared = run(
+            root.path(),
+            state,
+            &[
+                "enforcement",
+                "prepare-runtime",
+                "--mode",
+                "supervised_auto",
+                "--action",
+                "git.push",
+                "--class",
+                "git_remote",
+                "--run-id",
+                "parity-run",
+            ],
+        );
+        assert!(prepared.status.success(), "{prepared:?}");
+        let prepared = json(&prepared);
+        let digest = prepared["executor_digest"].as_str().unwrap().to_owned();
+        let runtime_digest = prepared["runtime_digest"].as_str().unwrap().to_owned();
+        (run_root, digest, runtime_digest)
+    };
+    let (headless_run, headless_digest, headless_runtime_digest) =
+        initialize(headless_state.path());
+    let (interactive_run, interactive_digest, interactive_runtime_digest) =
+        initialize(interactive_state.path());
+    assert_eq!(headless_digest, interactive_digest);
+
+    let evidence = run(
+        root.path(),
+        headless_state.path(),
+        &exact_enforcement_args(
+            "verify-evidence",
+            &headless_digest,
+            &headless_runtime_digest,
+        ),
+    );
+    let interactive = run(
+        root.path(),
+        interactive_state.path(),
+        &exact_enforcement_args("advance", &interactive_digest, &interactive_runtime_digest),
+    );
+    assert!(evidence.status.success(), "{evidence:?}");
+    assert!(interactive.status.success(), "{interactive:?}");
+    let evidence = json(&evidence);
+    let interactive = json(&interactive);
+    assert_eq!(evidence["state"], "verified");
+    assert_eq!(interactive["state"], "released");
+    assert_eq!(evidence["plan"], interactive["plan"]);
+    assert_eq!(
+        receipt_files(&headless_run),
+        receipt_files(&interactive_run)
+    );
+    assert!(!receipt_files(&headless_run).is_empty());
+
+    for (state, digest, runtime_digest) in [
+        (
+            headless_state.path(),
+            headless_digest.as_str(),
+            headless_runtime_digest.as_str(),
+        ),
+        (
+            interactive_state.path(),
+            interactive_digest.as_str(),
+            interactive_runtime_digest.as_str(),
+        ),
+    ] {
+        let cleaned = run(
+            root.path(),
+            state,
+            &exact_enforcement_args("cleanup-runtime", digest, runtime_digest),
+        );
+        assert!(cleaned.status.success(), "{cleaned:?}");
+    }
+}
+
+#[test]
+fn cli_publication_preserves_core_plan_event_path_and_receipt_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    write(
+        &temp.path().join(".nopal/policy.jsonc"),
+        include_str!("../../nopal-core/tests/fixtures/enforcement/project/.nopal/policy.jsonc"),
+    );
+    write(
+        &temp.path().join(".nopal/gates.jsonc"),
+        include_str!("../../nopal-core/tests/fixtures/enforcement/project/.nopal/gates.jsonc"),
+    );
+    write(&temp.path().join("source.txt"), "adapter fixture\n");
+    let initialized_git = Command::new("git")
+        .arg("init")
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert!(initialized_git.status.success(), "{initialized_git:?}");
+
+    let initialized = run(
+        temp.path(),
+        state.path(),
+        &[
+            "ledger",
+            "init",
+            "--skill",
+            "nopal",
+            "--flow",
+            "enforcement",
+            "--run-id",
+            "adapter-parity",
+        ],
+    );
+    assert!(initialized.status.success(), "{initialized:?}");
+    let run_root = Path::new(json(&initialized)["run_dir"].as_str().unwrap()).to_path_buf();
+
+    let mut exact_intent: EnforcementIntent = serde_json::from_str(include_str!(
+        "../../nopal-core/tests/fixtures/enforcement/canonical-intent.json"
+    ))
+    .unwrap();
+    // Debug integration tests use the compatibility executor identity because
+    // only the private launch path can mint a run-private executor manifest.
+    exact_intent.executor_digest = "legacy-executor".to_owned();
+    exact_intent.workspace_fingerprint = None;
+    let plan_args = [
+        "enforcement",
+        "plan",
+        "--mode",
+        "supervised_auto",
+        "--action",
+        "git.push",
+        "--class",
+        "git_remote",
+        "--run-id",
+        "adapter-parity",
+        "--launch-id",
+        &exact_intent.launch_id,
+        "--session-id",
+        &exact_intent.session_id,
+        "--tool-call-id",
+        &exact_intent.tool_call_id,
+        "--tool-name",
+        &exact_intent.tool_name,
+        "--input-digest",
+        &exact_intent.input_digest,
+        "--target-digest",
+        &exact_intent.target_digest,
+        "--executor-digest",
+        &exact_intent.executor_digest,
+        "--changed-file",
+        &exact_intent.changed_files[0],
+        "--changed-file",
+        &exact_intent.changed_files[1],
+        "--mutates",
+    ];
+    let published_plan = run(temp.path(), state.path(), &plan_args);
+    assert!(published_plan.status.success(), "{published_plan:?}");
+    let published_plan_json = json(&published_plan);
+    exact_intent.workspace_fingerprint = Some(
+        published_plan_json["workspace_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    );
+    let config_dir = state.path().join("config");
+    let canonical_root = std::path::PathBuf::from(published_plan_json["root"].as_str().unwrap());
+    let core_request = || EnforcementRequest {
+        root: &canonical_root,
+        config_dir: Some(&config_dir),
+        mode: Mode::SupervisedAuto,
+        action: "git.push",
+        classes: &[ActionClass::GitRemote],
+        run_dir: Some(&run_root),
+        receipt_key: Some(RECEIPT_KEY.as_bytes()),
+    };
+    let core_plan = enforcement::plan_for_intent(core_request(), exact_intent.clone()).unwrap();
+    let mut core_plan_bytes = serde_json::to_vec_pretty(&core_plan).unwrap();
+    core_plan_bytes.push(b'\n');
+    assert_eq!(published_plan.stdout, core_plan_bytes);
+    let decision_directive = enforcement::decision_evidence(&core_plan).unwrap();
+    let decision_payload = decision_directive
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EvidenceEffect::AppendEvent { event, payload } if event == "action_decision" => {
+                Some(nopal_core::run_ledger::redact_json(payload))
+            }
+            _ => None,
+        })
+        .unwrap();
+    let decision_event = events(&run_root)
+        .into_iter()
+        .find(|event| event["type"] == "action_decision")
+        .unwrap();
+    assert_eq!(
+        decision_event["payload"],
+        serde_json::to_value(decision_payload).unwrap()
+    );
+
+    let receipt_status = core_plan
+        .receipts
+        .iter()
+        .find(|receipt| receipt.gate_id == "proof")
+        .unwrap();
+    let context = GateExecutionContext {
+        contract_digest: core_plan.contract_digest.clone(),
+        workspace_fingerprint: core_plan.workspace_fingerprint.clone(),
+        gate_definition_digest: receipt_status.gate_definition_digest.clone(),
+        authorization_binding: core_plan.authorization_binding.clone(),
+    };
+    let record_intent = exact_intent.clone();
+    let core_evidence =
+        enforcement::gate_evidence_for_intent(core_request(), exact_intent, "proof", 0, &context)
+            .unwrap();
+    let (receipt_path, receipt_payload) = core_evidence
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EvidenceEffect::CreateJson {
+                relative_path,
+                payload,
+            } => Some((relative_path.clone(), payload.clone())),
+            _ => None,
+        })
+        .unwrap();
+
+    let recorded = run(
+        temp.path(),
+        state.path(),
+        &[
+            "enforcement",
+            "record-gate",
+            "--mode",
+            "supervised_auto",
+            "--action",
+            "git.push",
+            "--class",
+            "git_remote",
+            "--run-id",
+            "adapter-parity",
+            "--launch-id",
+            &record_intent.launch_id,
+            "--session-id",
+            &record_intent.session_id,
+            "--tool-call-id",
+            &record_intent.tool_call_id,
+            "--tool-name",
+            &record_intent.tool_name,
+            "--input-digest",
+            &record_intent.input_digest,
+            "--target-digest",
+            &record_intent.target_digest,
+            "--executor-digest",
+            &record_intent.executor_digest,
+            "--changed-file",
+            &record_intent.changed_files[0],
+            "--changed-file",
+            &record_intent.changed_files[1],
+            "--mutates",
+            "--gate-id",
+            "proof",
+            "--exit-code",
+            "0",
+            "--contract-digest",
+            &context.contract_digest,
+            "--workspace-fingerprint",
+            &context.workspace_fingerprint,
+            "--gate-definition-digest",
+            &context.gate_definition_digest,
+            "--authorization-binding",
+            &context.authorization_binding,
+        ],
+    );
+    assert!(recorded.status.success(), "{recorded:?}");
+
+    let mut receipt_bytes = serde_json::to_vec_pretty(&receipt_payload).unwrap();
+    receipt_bytes.push(b'\n');
+    assert_eq!(
+        fs::read(run_root.join(&receipt_path)).unwrap(),
+        receipt_bytes
+    );
+    let expected_gate_receipt = core_evidence
+        .effects
+        .iter()
+        .find_map(|effect| match effect {
+            EvidenceEffect::AppendEvent { event, payload } if event == "gate_receipt" => {
+                Some(nopal_core::run_ledger::redact_json(payload))
+            }
+            _ => None,
+        })
+        .unwrap();
+    let gate_receipt_event = events(&run_root)
+        .into_iter()
+        .find(|event| event["type"] == "gate_receipt")
+        .unwrap();
+    assert_eq!(
+        gate_receipt_event["payload"],
+        serde_json::to_value(expected_gate_receipt).unwrap()
+    );
 }
 
 #[test]
