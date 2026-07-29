@@ -14,6 +14,8 @@ Installation, intentional update, rollback, and offline launch need direct and i
 ## Decision
 
 Each supported platform receives one deterministic `tar.gz` archive containing the Nopal CLI, official Node.js `22.22.0`, exact Pi `0.80.6` and its complete dependency tree, the Nopal policy adapter, pinned Beislið skills, licenses, provenance, and installer material.
+Pi's pinned runtime owns built-in prompts, themes, and host defaults, while Beislið owns the curated prose skills and Nopal owns deterministic project defaults.
+Nopal deliberately ships no separate prompt or theme resources because they would create a second interaction layer outside Pi's ownership.
 The x86-64 GNU/Linux archive targets glibc 2.35 or newer, is built on Ubuntu 22.04, and must launch successfully on the pinned Debian 12 compatibility image before publication.
 The archive contains no former management UI, native desktop runtime, coordination protocol, compatibility executable, or unrelated Pi extension.
 
