@@ -242,7 +242,7 @@ fn current_branch(repo: &Path) -> String {
 // ---------------------------------------------------------------------------
 
 fn open_directory_nofollow(path: &Path, create: bool) -> io::Result<Dir> {
-    let mut absolute = if path.is_absolute() {
+    let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
@@ -251,16 +251,20 @@ fn open_directory_nofollow(path: &Path, create: bool) -> io::Result<Dir> {
     // Normalize only the fixed platform aliases before enforcing no-follow
     // traversal for every caller-controlled state component.
     #[cfg(target_os = "macos")]
-    for (alias, canonical) in [
-        (Path::new("/var"), Path::new("/private/var")),
-        (Path::new("/tmp"), Path::new("/private/tmp")),
-        (Path::new("/etc"), Path::new("/private/etc")),
-    ] {
-        if let Ok(relative) = absolute.strip_prefix(alias) {
-            absolute = canonical.join(relative);
-            break;
+    let absolute = {
+        let mut normalized = absolute;
+        for (alias, canonical) in [
+            (Path::new("/var"), Path::new("/private/var")),
+            (Path::new("/tmp"), Path::new("/private/tmp")),
+            (Path::new("/etc"), Path::new("/private/etc")),
+        ] {
+            if let Ok(relative) = normalized.strip_prefix(alias) {
+                normalized = canonical.join(relative);
+                break;
+            }
         }
-    }
+        normalized
+    };
     let mut current = Dir::open_ambient_dir(Path::new("/"), ambient_authority())?;
     for component in absolute.components() {
         let Component::Normal(name) = component else {
