@@ -17,7 +17,7 @@ nopal-core = { path = "crates/nopal-core" }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-jsonc-parser = { version = "0.26", features = ["serde"] }
+jsonc-parser = { version = "0.33", features = ["serde"] }
 globset = "0.4"
 regex = "1"
 toml = "0.9"
